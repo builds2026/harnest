@@ -1,0 +1,37 @@
+{
+  "manifestVersion": "1",
+  "id": "demo.release-check",
+  "label": "Release check",
+  "description": "Checks that a candidate release statement contains required terms.",
+  "category": "Testing",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "candidate": { "type": "string", "minLength": 1, "maxLength": 4000 },
+      "requiredTerms": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+      }
+    },
+    "required": ["candidate", "requiredTerms"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "passed": { "type": "boolean" },
+      "matched": { "type": "array", "items": { "type": "string" } },
+      "missing": { "type": "array", "items": { "type": "string" } },
+      "score": { "type": "number", "minimum": 0, "maximum": 1 },
+      "recommendation": { "type": "string" }
+    },
+    "required": ["passed", "matched", "missing", "score", "recommendation"],
+    "additionalProperties": false
+  },
+  "kind": "typescript-module",
+  "source": "module",
+  "module": "./tools/release-check.mjs",
+  "timeoutMs": 5000
+}

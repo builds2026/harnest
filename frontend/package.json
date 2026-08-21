@@ -11,6 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@harnest/adapter-anthropic": "0.1.0",
+    "@harnest/adapter-gemini": "0.1.0",
+    "@harnest/adapter-local": "0.1.0",
+    "@harnest/adapter-openai": "0.1.0",
     "@harnest/core": "0.1.0",
     "@xyflow/react": "^12.11.3",
     "next": "^16.3.1",

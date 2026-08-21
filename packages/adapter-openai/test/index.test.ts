@@ -94,4 +94,56 @@ describe("OpenAI-compatible adapter", () => {
       code: "invalid_stream",
     });
   });
+
+  it("normalizes streamed Tool calls and encodes Tool results", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response([
+        'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"sum","arguments":"{\\"a\\":"}}]}}]}',
+        'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+    }));
+    const events = await collect(createOpenAICompatibleAdapter().run({
+      ...request,
+      messages: [
+        { role: "assistant", content: "", toolCalls: [{ id: "previous", name: "sum", input: { a: 1 } }] },
+        { role: "tool", content: "1", toolCallId: "previous", name: "sum" },
+      ],
+      tools: [{ name: "sum", description: "Add", inputSchema: { type: "object" } }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+
+    expect(events).toEqual([
+      { type: "tool-call", call: { id: "call_1", name: "sum", input: { a: 2 } } },
+      { type: "finish", reason: "tool", model: "gpt-test" },
+    ]);
+    expect(body).toMatchObject({
+      tools: [{ type: "function", function: { name: "sum", parameters: { type: "object" } } }],
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "previous", function: { name: "sum", arguments: '{"a":1}' } }] },
+        { role: "tool", tool_call_id: "previous", content: "1" },
+      ],
+    });
+  });
+
+  it("rejects a Provider response that buffers too many Tool calls", async () => {
+    const calls = Array.from({ length: 129 }, (_, index) => ({
+      index,
+      id: `call_${index}`,
+      function: { name: "sum", arguments: "{}" },
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`,
+    )));
+
+    await expect(collect(createOpenAICompatibleAdapter().run(request, {
+      signal: new AbortController().signal,
+      resolveSecret: () => "secret",
+    }))).rejects.toMatchObject({
+      adapterId: "openai",
+      code: "provider_response_limit",
+    });
+  });
 });

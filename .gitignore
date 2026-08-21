@@ -5,4 +5,12 @@ dist/
 .env
 .firecrawl/
 .harnest/
+!examples/gemini-full-stack/.harnest/
+examples/gemini-full-stack/.harnest/*
+!examples/gemini-full-stack/.harnest/tools/
+!examples/gemini-full-stack/.harnest/tools/demo.fixture-check.json
+!examples/gemini-full-stack/.harnest/tools/demo.release-check.json
+!examples/gemini-full-stack/.harnest/skills/
+!examples/gemini-full-stack/.harnest/skills/traceable-review/
+!examples/gemini-full-stack/.harnest/skills/traceable-review/**
 coverage/

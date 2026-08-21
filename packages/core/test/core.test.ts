@@ -11,6 +11,7 @@ import {
   parseNdjson,
   parseSpec,
   parseSse,
+  readBoundedResponseText,
   runHarnessTests,
   stringifySpec,
   validateCandidateConnection,
@@ -266,6 +267,24 @@ describe("stream parsers", () => {
     const records = [];
     for await (const record of parseNdjson(stream('{"a":', "1}\n\n", '{"b":2}'))) records.push(record);
     expect(records).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+
+  it("bounds provider stream lines, SSE events, total bytes, and error bodies", async () => {
+    const drain = async (iterable: AsyncIterable<unknown>) => {
+      for await (const value of iterable) {
+        // Drain until the parser rejects the hostile input.
+        void value;
+      }
+    };
+
+    await expect(drain(parseNdjson(stream('{"long":true}\n'), { maxLineBytes: 8 })))
+      .rejects.toThrow("line exceeds");
+    await expect(drain(parseSse(stream("data: a\ndata: b\n\n"), { maxEventBytes: 12 })))
+      .rejects.toThrow("SSE event exceeds");
+    await expect(drain(parseNdjson(stream("{\"a\":1}\n"), { maxTotalBytes: 4 })))
+      .rejects.toThrow("total limit");
+    await expect(readBoundedResponseText(new Response("oversize"), 4))
+      .rejects.toThrow("total limit");
   });
 });
 

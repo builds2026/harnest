@@ -7,6 +7,7 @@ export interface StudioCapabilityPolicy {
   readonly contextRoots: readonly string[];
   readonly processCommands: readonly string[];
   readonly networkHosts: readonly string[];
+  readonly approvedToolIds: readonly string[];
 }
 
 const commaList = (value: string | undefined) => value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
@@ -20,6 +21,7 @@ export function studioCapabilityPolicy(
     contextRoots: commaList(env.HARNEST_CONTEXT_ROOTS),
     processCommands: commaList(env.HARNEST_ALLOW_PROCESS),
     networkHosts: commaList(env.HARNEST_ALLOW_NETWORK).map((host) => host.toLocaleLowerCase()),
+    approvedToolIds: commaList(env.HARNEST_APPROVE_TOOLS),
   };
 }
 
@@ -128,31 +130,18 @@ export function runtimeServiceOptionsFor(
   policy: StudioCapabilityPolicy = studioCapabilityPolicy({}),
 ): NodeRuntimeServiceOptions {
   const contextPaths = new Set<string>();
-  const processCommands = new Set<string>();
-  const networkHosts = new Set<string>();
   for (const component of allComponents(spec)) {
     if (component.type === "context" && component.config.source !== "text" && typeof component.config.path === "string") {
       contextPaths.add(component.config.path);
     }
-    if (component.type !== "mcp-tool") continue;
-    if (component.config.transport === "stdio" && typeof component.config.command === "string") {
-      processCommands.add(component.config.command);
-    }
-    if (component.config.transport === "http" && typeof component.config.url === "string") {
-      try {
-        networkHosts.add(new URL(component.config.url).host.toLocaleLowerCase());
-      } catch {
-        // Config validation reports malformed URLs; permissions stay closed.
-      }
-    }
   }
-  const allowedCommands = [...processCommands].filter((command) => policy.processCommands.includes(command));
-  const allowedHosts = [...networkHosts].filter((host) => policy.networkHosts.includes(host));
   return {
-    ...(policy.allowFiles && contextPaths.size
+    ...(policy.allowFiles
       ? { allowFileSystem: true as const, allowedContextRoots: policy.contextRoots.length ? policy.contextRoots : [...contextPaths] }
       : {}),
-    ...(allowedCommands.length ? { allowProcessCommands: allowedCommands } : {}),
-    ...(allowedHosts.length ? { allowNetworkHosts: allowedHosts } : {}),
+    ...(policy.allowModules ? { allowModuleExecution: true as const } : {}),
+    ...(policy.processCommands.length ? { allowProcessCommands: policy.processCommands } : {}),
+    ...(policy.networkHosts.length ? { allowNetworkHosts: policy.networkHosts } : {}),
+    ...(policy.approvedToolIds.length ? { approvedToolIds: policy.approvedToolIds } : {}),
   };
 }

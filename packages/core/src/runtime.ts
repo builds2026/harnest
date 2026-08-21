@@ -62,7 +62,27 @@ export type RunEvent =
     metadata?: Readonly<Record<string, unknown>>;
     iteration: number;
   })
-  | (RunEventBase & { type: "tool-call"; nodeId: string; tool: string; input: unknown; iteration: number })
+  | (RunEventBase & {
+    type: "tool-call";
+    nodeId: string;
+    tool: string;
+    input: unknown;
+    iteration: number;
+    callId?: string;
+    turn?: number;
+    risk?: string;
+  })
+  | (RunEventBase & {
+    type: "tool-approval";
+    nodeId: string;
+    tool: string;
+    callId: string;
+    turn: number;
+    approved: boolean;
+    source?: string;
+    reason?: string;
+    iteration: number;
+  })
   | (RunEventBase & {
     type: "tool-result";
     nodeId: string;
@@ -71,6 +91,16 @@ export type RunEvent =
     output?: unknown;
     error?: string;
     durationMs: number;
+    iteration: number;
+    callId?: string;
+    turn?: number;
+  })
+  | (RunEventBase & {
+    type: "skill-use";
+    nodeId: string;
+    skill: string;
+    resources?: readonly string[];
+    trusted?: boolean;
     iteration: number;
   })
   | (RunEventBase & {
@@ -186,6 +216,7 @@ interface RunContext {
   readonly metrics: RuntimeMetrics;
   readonly emit: (event: RunEvent) => void;
   readonly resolveSecret: (reference: string) => string | undefined;
+  readonly redact: (value: unknown) => unknown;
 }
 
 interface PreparedNode {
@@ -267,7 +298,9 @@ function sanitize(
 ): unknown {
   if (typeof value === "string") {
     let result = value;
-    for (const secret of secrets) if (secret) result = result.replaceAll(secret, "[REDACTED]");
+    for (const secret of [...secrets].filter(Boolean).sort((left, right) => right.length - left.length)) {
+      result = result.replaceAll(secret, "[REDACTED]");
+    }
     return result.length > maxStringLength ? `${result.slice(0, maxStringLength)}…[truncated]` : result;
   }
   if (value === null || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
@@ -354,7 +387,8 @@ export class HarnessRuntime {
     this.#eventSink = options.eventSink;
     const env = options.env ?? defaultEnvironment();
     this.#resolveConfiguredSecret = options.resolveSecret ?? ((reference) =>
-      reference.startsWith("env:") ? env[reference.slice(4)] : reference);
+      options.services?.resolveSecret?.(reference)
+      ?? (reference.startsWith("env:") ? env[reference.slice(4)] : reference));
     const validation = validateSpec(spec, { registry, components: this.#components, tools: this.#tools, env });
     if (!validation.ok) throw new DiagnosticError("HarnessSpec is invalid", validation.diagnostics);
     const compiled = compileSpec(spec, { registry, components: this.#components, tools: this.#tools, env });
@@ -416,8 +450,9 @@ export class HarnessRuntime {
       }
     }
     for (const reference of declaredReferences) resolveSecret(reference);
+    const redact = (value: unknown) => sanitize(value, secrets, new WeakSet<object>(), 0, 64_000);
     const emit = (event: RunEvent) => queue.push(sanitizeEvent(event, secrets));
-    const context: RunContext = { runId, signal, secrets, metrics, emit, resolveSecret };
+    const context: RunContext = { runId, signal, secrets, metrics, emit, resolveSecret, redact };
     const startEvent = sanitizeEvent({
       type: "run-start",
       runId,
@@ -499,6 +534,7 @@ export class HarnessRuntime {
         }, secrets);
         await this.#publish(cancelEvent);
       }
+      await this.#services.releaseRun?.(runId);
     }
   }
 
@@ -729,6 +765,7 @@ export class HarnessRuntime {
           metrics: run.metrics,
           ...(responseSchema ? { responseSchema } : {}),
           resolveSecret: run.resolveSecret,
+          redact: run.redact,
           emit: (event) => {
             if (event.type === "text-delta" || event.type === "tool-call" || event.type === "tool-result") emittedOutput = true;
             if (event.type === "usage") {
@@ -824,8 +861,26 @@ export class HarnessRuntime {
     else if (event.type === "context-use") run.emit({ ...base, type: "context-use", source: event.source, ...(event.metadata ? { metadata: event.metadata } : {}) });
     else if (event.type === "tool-call") {
       run.metrics.toolCalls.set(event.tool, (run.metrics.toolCalls.get(event.tool) ?? 0) + 1);
-      run.emit({ ...base, type: "tool-call", tool: event.tool, input: event.input });
-    } else if (event.type === "tool-result") run.emit({
+      run.emit({
+        ...base,
+        type: "tool-call",
+        tool: event.tool,
+        input: event.input,
+        ...(event.callId === undefined ? {} : { callId: event.callId }),
+        ...(event.turn === undefined ? {} : { turn: event.turn }),
+        ...(event.risk === undefined ? {} : { risk: event.risk }),
+      });
+    } else if (event.type === "tool-approval") run.emit({
+      ...base,
+      type: "tool-approval",
+      tool: event.tool,
+      callId: event.callId,
+      turn: event.turn,
+      approved: event.approved,
+      ...(event.source === undefined ? {} : { source: event.source }),
+      ...(event.reason === undefined ? {} : { reason: event.reason }),
+    });
+    else if (event.type === "tool-result") run.emit({
       ...base,
       type: "tool-result",
       tool: event.tool,
@@ -833,6 +888,15 @@ export class HarnessRuntime {
       ...(event.output === undefined ? {} : { output: event.output }),
       ...(event.error === undefined ? {} : { error: event.error }),
       durationMs: event.durationMs,
+      ...(event.callId === undefined ? {} : { callId: event.callId }),
+      ...(event.turn === undefined ? {} : { turn: event.turn }),
+    });
+    else if (event.type === "skill-use") run.emit({
+      ...base,
+      type: "skill-use",
+      skill: event.skill,
+      ...(event.resources === undefined ? {} : { resources: event.resources }),
+      ...(event.trusted === undefined ? {} : { trusted: event.trusted }),
     });
     else if (event.type === "evaluation") run.emit({
       ...base,

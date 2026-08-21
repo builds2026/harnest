@@ -549,6 +549,7 @@ describe("v1.1 tools, evaluators, cost, and cancellation", () => {
       id: "sum",
       label: "Sum",
       description: "Adds a and b",
+      risk: "read",
       inputSchema: {
         type: "object",
         properties: { a: { type: "number" }, b: { type: "number" } },

@@ -1,5 +1,5 @@
-import { spawn, execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { cp, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -14,6 +14,7 @@ import {
   FileRunStore,
   loadRuntimeModules,
   NodeRuntimeServices,
+  NodeToolStore,
 } from "@harnest/core/node";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -42,6 +43,87 @@ afterAll(async () => {
 async function project(name: string): Promise<string> {
   const directory = join(testRoot, name);
   await mkdir(directory, { recursive: true });
+  return directory;
+}
+
+async function cliToolProject(
+  name: string,
+  risk: "read" | "external",
+  toolId = "custom.city",
+): Promise<string> {
+  const directory = await project(name);
+  await writeFile(join(directory, "runtime.mjs"), `
+    const adapter = {
+      id: "cli-tool-agent",
+      capabilities: { streaming: true, json: false, cancellation: true, tools: true },
+      async *run(request, context) {
+        context.signal.throwIfAborted();
+        const result = [...request.messages].reverse().find((message) => message.role === "tool");
+        if (!result) {
+          const selected = request.tools?.[0];
+          if (!selected) throw new Error("CLI did not register the connected Tool before execution");
+          yield { type: "tool-call", call: { id: "city-call", name: selected.name, input: { city: "Seoul" } } };
+          yield { type: "finish", reason: "tool" };
+          return;
+        }
+        yield { type: "text-delta", text: "CLI Tool result: " + result.content };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    export const tool = {
+      id: "custom.city",
+      label: "City lookup",
+      description: "Return a deterministic city record",
+      risk: ${JSON.stringify(risk)},
+      source: "module",
+      inputSchema: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+        additionalProperties: false,
+      },
+      execute(input) { return { city: input.city, country: "South Korea" }; },
+    };
+    export default adapter;
+  `, "utf8");
+  await writeFile(join(directory, "harnest.yaml"), `
+version: "0.2"
+components:
+  - id: city
+    type: tool
+    config: { tool: ${toolId}, source: module }
+  - id: model
+    type: model
+    config: { adapter: cli-tool-agent, model: deterministic }
+  - id: prompt
+    type: prompt
+    config: { template: "Use the connected Tool: {{input}}" }
+  - id: agent
+    type: agent
+    config: {}
+  - id: output
+    type: output
+    config: { format: text }
+connections:
+  - from: { component: city, port: tool }
+    to: { component: agent, port: tools }
+  - from: { component: model, port: model }
+    to: { component: agent, port: model }
+  - from: { component: prompt, port: prompt }
+    to: { component: agent, port: prompt }
+  - from: { component: agent, port: response }
+    to: { component: output, port: value }
+entrypoint: output
+runtime:
+  adapters: [./runtime.mjs]
+  modules: [./runtime.mjs]
+tests:
+  - id: city-tool
+    input: Find Seoul
+    assertions:
+      - { type: includes, value: South Korea }
+      - { type: tool-called, tool: ${toolId}, minCalls: 1, maxCalls: 1 }
+`, "utf8");
   return directory;
 }
 
@@ -156,6 +238,78 @@ describe("Node runtime integration", () => {
     ]);
   });
 
+  it("bounds run trace reads and skips unsafe or corrupt traces", async () => {
+    const directory = await project("bounded-runs");
+    const store = new FileRunStore(directory);
+    await store.append({
+      type: "run-start",
+      runId: "valid",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      input: "safe",
+      specVersion: "0.2",
+    });
+    const runs = join(directory, ".harnest", "runs");
+    const event = (runId: string, payload = "") => JSON.stringify({
+      type: "run-start",
+      runId,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      payload,
+    });
+    await writeFile(join(runs, "corrupt.ndjson"), "not-json\n", "utf8");
+    await writeFile(join(runs, "long-line.ndjson"), `${event("long-line", "x".repeat(65_536))}\n`, "utf8");
+    await writeFile(
+      join(runs, "too-many.ndjson"),
+      `${Array.from({ length: 10_001 }, () => event("too-many")).join("\n")}\n`,
+      "utf8",
+    );
+    await writeFile(join(runs, "oversize.ndjson"), Buffer.alloc(8 * 1_048_576 + 1));
+    const outside = await project("linked-run-outside");
+    await symlink(outside, join(runs, "linked.ndjson"), process.platform === "win32" ? "junction" : "dir");
+    const appendEvent = (runId: string, input: unknown = "safe") => store.append({
+      type: "run-start",
+      runId,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      input,
+      specVersion: "0.2",
+    });
+
+    await expect(store.read("long-line")).rejects.toThrow("64 KiB");
+    await expect(store.read("too-many")).rejects.toThrow("10,000 event");
+    await expect(store.read("oversize")).rejects.toThrow("8 MiB");
+    await expect(store.read("linked")).rejects.toThrow("regular");
+    const oversizeBytes = (await stat(join(runs, "oversize.ndjson"))).size;
+    await expect(appendEvent("corrupt")).rejects.toThrow("Invalid run trace");
+    await expect(appendEvent("long-line")).rejects.toThrow("64 KiB");
+    await expect(appendEvent("too-many")).rejects.toThrow("10,000 event");
+    await expect(appendEvent("oversize")).rejects.toThrow("8 MiB");
+    await expect(appendEvent("linked")).rejects.toThrow("regular");
+    await expect(appendEvent("append-long", { ["x".repeat(65_536)]: true })).rejects.toThrow("64 KiB");
+    expect((await stat(join(runs, "oversize.ndjson"))).size).toBe(oversizeBytes);
+    await expect(readdir(outside)).resolves.toEqual([]);
+    expect(await readdir(runs)).not.toContain("append-long.ndjson");
+    await expect(store.list()).resolves.toEqual([
+      expect.objectContaining({ runId: "valid", eventCount: 1 }),
+    ]);
+    await writeFile(
+      join(runs, "event-limit.ndjson"),
+      `${Array.from({ length: 10_000 }, () => event("event-limit")).join("\n")}\n`,
+      "utf8",
+    );
+    await writeFile(join(runs, "byte-limit.ndjson"), Buffer.alloc(8 * 1_048_576));
+    const eventLimitBytes = (await stat(join(runs, "event-limit.ndjson"))).size;
+    const byteLimitBytes = (await stat(join(runs, "byte-limit.ndjson"))).size;
+    await expect(appendEvent("event-limit")).rejects.toThrow("10,000 event");
+    await expect(appendEvent("byte-limit")).rejects.toThrow("8 MiB");
+    expect((await stat(join(runs, "event-limit.ndjson"))).size).toBe(eventLimitBytes);
+    expect((await stat(join(runs, "byte-limit.ndjson"))).size).toBe(byteLimitBytes);
+
+    const linkedProject = await project("linked-storage");
+    const linkedOutside = await project("linked-storage-outside");
+    await symlink(linkedOutside, join(linkedProject, ".harnest"), process.platform === "win32" ? "junction" : "dir");
+    await expect(new FileRunStore(linkedProject).list()).rejects.toThrow("unsafe link");
+    await expect(readdir(linkedOutside)).resolves.toEqual([]);
+  });
+
   it("loads custom tools only through the gated, project-bounded runtime module loader", async () => {
     const directory = await project("modules");
     const outside = await project("outside-modules");
@@ -251,112 +405,61 @@ runtime:
     });
   });
 
-  it("discovers and calls a real MCP stdio server with an exact command allowlist", async () => {
-    const denied = new NodeRuntimeServices(mcpDirectory);
-    await expect(denied.callMcpTool(
-      {
-        transport: "stdio",
-        protocol: "legacy",
-        command: process.execPath,
-        args: ["server.mjs"],
-        tool: "lookup-city",
-      },
-      { city: "Seoul" },
-      context("stdio-denied"),
-    )).rejects.toThrow("not explicitly allowed");
-
+  it("executes reviewed raw stdio MCP and keeps raw HTTP host-gated", async () => {
     const services = new NodeRuntimeServices(mcpDirectory, {
-      allowProcessCommands: [process.execPath],
+      allowProcessCommands: ["node"],
     });
     try {
       await expect(services.callMcpTool(
         {
           transport: "stdio",
           protocol: "legacy",
-          command: process.execPath,
+          command: "node",
           args: ["server.mjs"],
           tool: "lookup-city",
         },
         { city: "Seoul" },
-        context("stdio-success"),
-      )).resolves.toMatchObject({
-        value: { city: "Seoul", country: "South Korea" },
-        metadata: { transport: "stdio", tool: "lookup-city", isError: false },
-      });
-      await expect(services.callMcpTool(
-        {
-          transport: "stdio",
-          protocol: "legacy",
-          command: process.execPath,
-          args: ["server.mjs"],
-          tool: "fail-city",
-        },
-        {},
-        context("stdio-error"),
-      )).rejects.toThrow("returned an error result");
+        context("stdio-raw"),
+      )).resolves.toMatchObject({ value: { city: "Seoul", country: "South Korea" } });
     } finally {
       await services.close();
     }
-  });
-
-  it("discovers and calls a real modern MCP Streamable HTTP server behind a host allowlist", async () => {
-    const child = spawn(process.execPath, [join(mcpDirectory, "http-server.mjs")], {
-      cwd: mcpDirectory,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const port = await new Promise<number>((resolvePort, reject) => {
-      const timeout = setTimeout(() => reject(new Error("HTTP MCP fixture did not start")), 10_000);
-      let output = "";
-      child.stdout?.on("data", (chunk: Buffer) => {
-        output += chunk.toString("utf8");
-        const match = /PORT (\d+)/u.exec(output);
-        if (match?.[1]) {
-          clearTimeout(timeout);
-          resolvePort(Number(match[1]));
-        }
-      });
-      child.once("error", reject);
-      child.once("exit", (code) => reject(new Error(`HTTP MCP fixture exited with ${code}`)));
-    });
-    const url = `http://127.0.0.1:${port}/mcp`;
     const denied = new NodeRuntimeServices(mcpDirectory);
-    await expect(denied.callMcpTool(
-      { transport: "http", protocol: "2026-07-28", url, tool: "lookup-city" },
-      { city: "Seoul" },
-      context("http-denied"),
-    )).rejects.toThrow("not explicitly allowed");
-
-    const services = new NodeRuntimeServices(mcpDirectory, {
-      allowNetworkHosts: [`127.0.0.1:${port}`],
-    });
     try {
-      await expect(services.callMcpTool(
-        {
-          transport: "http",
-          protocol: "2026-07-28",
-          url,
-          tool: "lookup-city",
-          headers: { authorization: "Bearer literal-secret" },
-        },
+      await expect(denied.callMcpTool(
+        { transport: "http", protocol: "2026-07-28", url: "http://127.0.0.1:12345/mcp", tool: "lookup-city" },
         { city: "Seoul" },
-        context("http-literal-header"),
-      )).rejects.toThrow("env:NAME secret reference");
-      await expect(services.callMcpTool(
-        { transport: "http", protocol: "2026-07-28", url, tool: "lookup-city" },
-        { city: "Seoul" },
-        context("http-success"),
-      )).resolves.toMatchObject({
-        value: { city: "Seoul", country: "South Korea" },
-        metadata: { transport: "http", protocol: "2026-07-28", isError: false },
-      });
+        context("http-raw"),
+      )).rejects.toThrow("not explicitly allowed");
     } finally {
-      await services.close();
-      child.kill();
+      await denied.close();
     }
   });
 });
 
 describe("harnest CLI", () => {
+  it("does not validate a graph whose saved Connection is missing", async () => {
+    const directory = await project("cli-missing-connection");
+    const spec = join(directory, "harnest.yaml");
+    await writeFile(spec, `
+version: "0.2"
+components:
+  - { id: model, type: model, config: { connectionId: missing_provider } }
+  - { id: prompt, type: prompt, config: { template: "{{input}}" } }
+  - { id: agent, type: agent, config: {} }
+  - { id: output, type: output, config: {} }
+connections:
+  - { from: { component: model, port: model }, to: { component: agent, port: model } }
+  - { from: { component: prompt, port: prompt }, to: { component: agent, port: prompt } }
+  - { from: { component: agent, port: response }, to: { component: output, port: value } }
+entrypoint: output
+`, "utf8");
+    await expect(exec(process.execPath, [cli, "validate", spec], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("CONNECTION_NOT_FOUND"),
+    });
+  });
+
   it("validates, runs, lists, and reads a persisted trace", async () => {
     const directory = await project("cli");
     await cp(join(root, "examples", "custom-adapter", "echo-adapter.mjs"), join(directory, "echo-adapter.mjs"));
@@ -388,13 +491,14 @@ describe("harnest CLI", () => {
     ]));
   });
 
-  it("runs the RAG, MCP Tool Agent, and evaluation Loop examples end to end", async () => {
+  it("runs the RAG, v1.1 MCP, safe custom Tool, and evaluation Loop examples end to end", async () => {
     const examples = await project("examples");
     const rag = join(examples, "rag");
     const mcp = join(examples, "mcp-tool-agent");
+    const tool = await cliToolProject("examples-read-tool", "read");
     const loop = join(examples, "evaluation-loop");
     await cp(join(root, "examples", "rag"), rag, { recursive: true });
-    await cp(mcpDirectory, mcp, { recursive: true });
+    await cp(join(root, "examples", "mcp-tool-agent"), mcp, { recursive: true });
     await cp(join(root, "examples", "evaluation-loop"), loop, { recursive: true });
 
     const ragRun = await exec(process.execPath, [
@@ -415,12 +519,28 @@ describe("harnest CLI", () => {
       "run",
       join(mcp, "harnest.yaml"),
       "--input",
-      "ignored",
+      "Which country contains the configured city?",
       "--allow-process",
       "node",
       "--allow-modules",
+      "--approve-tool",
+      "lookup-city",
     ], { cwd: root });
     expect(mcpRun.stdout).toContain("South Korea");
+    const mcpTest = await exec(process.execPath, [
+      cli, "test", join(mcp, "harnest.yaml"), "--allow-process", "node", "--allow-modules", "--approve-tool", "lookup-city",
+    ], { cwd: root });
+    expect(mcpTest.stdout).toContain("PASS finds-seoul");
+
+    const toolRun = await exec(process.execPath, [
+      cli,
+      "run",
+      join(tool, "harnest.yaml"),
+      "--input",
+      "Find Seoul",
+      "--allow-modules",
+    ], { cwd: root });
+    expect(toolRun.stdout).toContain("South Korea");
 
     const loopRun = await exec(process.execPath, [
       cli,
@@ -432,6 +552,89 @@ describe("harnest CLI", () => {
     ], { cwd: root });
     expect(loopRun.stdout).toContain("[PASS]");
     expect(loopRun.stdout).toContain("iterations 2");
+  });
+
+  it("denies risky Tools in non-TTY runs unless the exact id is pre-approved", async () => {
+    const directory = await cliToolProject("cli-tool-approval", "external");
+    const spec = join(directory, "harnest.yaml");
+    const denied = await exec(process.execPath, [
+      cli, "run", spec, "--input", "Find Seoul", "--allow-modules",
+    ], { cwd: root });
+    expect(denied.stdout).toContain("requires explicit approval");
+    expect(denied.stdout).not.toContain("South Korea");
+
+    const wrongId = await exec(process.execPath, [
+      cli, "run", spec, "--input", "Find Seoul", "--allow-modules", "--approve-tool", "custom.other",
+    ], { cwd: root });
+    expect(wrongId.stdout).toContain("requires explicit approval");
+    expect(wrongId.stdout).not.toContain("South Korea");
+
+    const approved = await exec(process.execPath, [
+      cli, "run", spec, "--input", "Find Seoul", "--allow-modules", "--approve-tool", "custom.city",
+    ], { cwd: root });
+    expect(approved.stdout).toContain("South Korea");
+
+    const tested = await exec(process.execPath, [
+      cli, "test", spec, "--allow-modules", "--approve-tool", "custom.city",
+    ], { cwd: root });
+    expect(tested.stdout).toContain("PASS city-tool");
+    expect(tested.stdout).toContain("1 passed, 0 failed");
+
+    await expect(exec(process.execPath, [
+      cli, "run", spec, "--input", "Find Seoul", "--allow-modules", "--approve-tool", "*",
+    ], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("requires an exact Tool id"),
+    });
+  });
+
+  it("registers stored Tool definitions for validation and reuses the module-enabled Node service", async () => {
+    const directory = await cliToolProject("cli-stored-tool", "read", "custom.stored-city");
+    await writeFile(join(directory, "stored-tool.mjs"), `
+      export default function storedCity(input) {
+        return { city: input.city, country: "South Korea", source: "stored Tool" };
+      }
+    `, "utf8");
+    await new NodeToolStore({ projectDirectory: directory }).save({
+      manifestVersion: "1",
+      id: "custom.stored-city",
+      label: "Stored city lookup",
+      description: "Execute a reviewed project TypeScript Tool",
+      inputSchema: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+        additionalProperties: false,
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          city: { type: "string" },
+          country: { type: "string" },
+          source: { type: "string" },
+        },
+        required: ["city", "country", "source"],
+        additionalProperties: false,
+      },
+      risk: "destructive",
+      kind: "typescript-module",
+      source: "module",
+      module: "./stored-tool.mjs",
+      exportName: "default",
+    });
+    const spec = join(directory, "harnest.yaml");
+    const executed = await exec(process.execPath, [
+      cli,
+      "run",
+      spec,
+      "--input",
+      "Find Seoul",
+      "--allow-modules",
+      "--approve-tool",
+      "custom.stored-city",
+    ], { cwd: root });
+    expect(executed.stdout).toContain("South Korea");
+    expect(executed.stdout).toContain("stored Tool");
   });
 
   it("returns a failure for an invalid graph", async () => {

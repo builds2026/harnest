@@ -10,10 +10,12 @@ function PortRow({
   direction,
   name,
   definition,
+  onAdd,
 }: {
   direction: "input" | "output";
   name: string;
   definition: PortDefinition;
+  onAdd?: () => void;
 }) {
   const color = colorFor(definition.type);
   const style = { "--port-color": color } as CSSProperties;
@@ -31,6 +33,7 @@ function PortRow({
         />
       )}
       <span>{input ? `${name}:${definition.type}` : ""}</span>
+      {input && onAdd && <button className="port-add nodrag nopan" type="button" aria-label={`Add compatible ${name}`} title={`Add compatible ${name}`} onClick={onAdd}>+</button>}
       <span>{input ? "" : `${name}:${definition.type}`}</span>
       {!input && (
         <Handle
@@ -77,8 +80,24 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
       </div>
       <div className="node-body">
         {inputs.map(([name, definition]) => (
-          <PortRow key={`input-${name}`} direction="input" name={name} definition={definition} />
+          <PortRow
+            key={`input-${name}`}
+            direction="input"
+            name={name}
+            definition={definition}
+            onAdd={manifest.type === "agent" && /tool/i.test(name)
+              ? () => data.onAddAttachment?.(component.id, "tools")
+              : manifest.type === "agent" && /skill/i.test(name)
+                ? () => data.onAddAttachment?.(component.id, "skills")
+                : undefined}
+          />
         ))}
+        {manifest.type === "agent" && !inputs.some(([name]) => /skill/i.test(name)) && (
+          <div className="agent-attachment-row">
+            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "tools")}>+ Tool</button>
+            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "skills")}>+ Skill</button>
+          </div>
+        )}
         <div className="node-summary" title={componentSummary(component, manifest)}>{componentSummary(component, manifest)}</div>
         {outputs.map(([name, definition]) => (
           <PortRow key={`output-${name}`} direction="output" name={name} definition={definition} />

@@ -30,7 +30,7 @@ npm run harnest -- run examples/rag/harnest.yaml -- \
 # Real MCP stdio discovery and tool call, followed by an Agent response
 npm run harnest -- run examples/mcp-tool-agent/harnest.yaml -- \
   --input "Which country contains the configured city?" \
-  --allow-process node --allow-modules
+  --allow-process node --allow-modules --approve-tool lookup-city
 
 # Generate → evaluate → improve until /evaluation/passed is true
 npm run harnest -- run examples/evaluation-loop/harnest.yaml -- \
@@ -41,9 +41,11 @@ Their declared tests use the same graphs:
 
 ```bash
 npm run harnest -- test examples/rag/harnest.yaml -- --allow-files --context-root knowledge --allow-modules
-npm run harnest -- test examples/mcp-tool-agent/harnest.yaml -- --allow-process node --allow-modules
+npm run harnest -- test examples/mcp-tool-agent/harnest.yaml -- --allow-process node --allow-modules --approve-tool lookup-city
 npm run harnest -- test examples/evaluation-loop/harnest.yaml -- --allow-modules
 ```
+
+The MCP example deliberately exercises the v1.1-compatible raw `mcp-tool` path. New Studio graphs normally use a saved MCP Connection and a Tool discovered from that Connection; both paths use the official stdio or Streamable HTTP client transports.
 
 ## Capabilities and safety
 
@@ -51,8 +53,8 @@ Runtime capabilities are denied by default. Grant only what a reviewed spec need
 
 - `--allow-modules` enables adapter, component, and tool modules after review. Even `validate` and `inspect` refuse to execute a listed module without this flag.
 - `--allow-files` enables file or directory Context inside the project. `--context-root <path>` can further restrict it and is repeatable. Hidden metadata, `.harnest`, private-key files, and common credential files remain blocked.
-- `--allow-process <command>` allows one exact MCP stdio executable and is repeatable. Child processes receive the MCP SDK's minimal safe environment, not the full parent environment.
-- `--allow-network <host[:port]>` allows one exact MCP Streamable HTTP host and is repeatable. Redirects, URL credentials, and non-HTTP schemes are rejected. Header values must be `env:NAME` references.
+- `--allow-process <command>` allows one exact MCP stdio or local Tool command and is repeatable. On the raw MCP compatibility path, `node` resolves to the current canonical Node executable; other commands must already be absolute canonical non-link regular files. MCP child processes receive the SDK's minimal safe environment, not the full parent environment.
+- `--allow-network <host[:port]>` allows one exact MCP Streamable HTTP or HTTP Tool host and is repeatable. Remote endpoints require HTTPS; plain HTTP is limited to literal `127.0.0.1` or `[::1]`. Redirects and URL credentials are rejected, and raw MCP header values must be `env:NAME` references.
 
 File paths and executable modules are checked with their canonical real paths, including symlinks and Windows junctions. Adapter and runtime modules must be npm package specifiers or project-relative paths. SDK callers must pass `{ allowModuleExecution: true }`; the CLI does this only after a user has explicitly invoked it on a project. Review third-party Harness projects before validating or running them.
 
@@ -67,6 +69,8 @@ npm run harnest -- trace <run-id> examples/rag/harnest.yaml -- --json
 ```
 
 Trace storage preserves bounded node inputs, outputs, state changes, iterations, tool calls, evaluations, usage, and cost. Secret-shaped keys are redacted and large strings/collections are truncated.
+
+Provider ingress is bounded before accumulation: the shared SSE/NDJSON parser limits total, line, and event bytes; adapters bound error bodies, Tool-call count, and Tool arguments; the Agent separately enforces configured turn/Tool/token/cost limits and an 8 MiB text limit per provider turn.
 
 ## HarnessSpec v0.2
 
@@ -108,6 +112,7 @@ packages/cli                validate, inspect, run, test, runs, trace, studio
 frontend                    Next.js Web Studio
 examples                    RAG, MCP Tool Agent, Loop, provider, and extension specs
 docs/v1/v1.1                v1.1 research, decisions, and verification notes
+docs/v1/v1.2                v1.2 implementation, security, run, and verification notes
 ```
 
 ## Development checks
@@ -119,4 +124,4 @@ npm run lint
 npm run build
 ```
 
-See the [v1.1 implementation and verification report](./docs/v1/v1.1/implementation.md) and [research notes](./docs/v1/v1.1/research.md).
+See the [v1.2 implementation report](./docs/v1/v1.2/implementation.md), [security boundary](./docs/v1/v1.2/security.md), and [verification report](./docs/v1/v1.2/tests.md).

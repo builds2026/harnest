@@ -1,117 +1,78 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
 import type { ServiceExecutionContext } from "../src/index.js";
-
-interface MockMcpResult {
-  readonly content: unknown[];
-  readonly isError?: boolean;
-  readonly structuredContent?: unknown;
-}
-
-type MockFunction = ReturnType<typeof vi.fn>;
-
-const mcp = vi.hoisted(() => ({
-  clients: [] as Array<{ readonly callTool: MockFunction; readonly close: MockFunction }>,
-  outcomes: [] as Array<Error | MockMcpResult>,
-}));
-
-vi.mock("@modelcontextprotocol/client", () => {
-  class StreamableHTTPClientTransport {
-    sessionId?: string;
-    readonly terminateSession = vi.fn(async () => undefined);
-  }
-
-  class Client {
-    readonly callTool = vi.fn(async () => {
-      const outcome = mcp.outcomes.shift();
-      if (!outcome) throw new Error("Missing mocked MCP outcome");
-      if (outcome instanceof Error) throw outcome;
-      return outcome;
-    });
-    readonly close = vi.fn(async () => undefined);
-    readonly connect = vi.fn(async () => undefined);
-    readonly listTools = vi.fn(async () => ({ tools: [{ name: "fixture-tool" }] }));
-    readonly getNegotiatedProtocolVersion = vi.fn(() => "test-protocol");
-
-    constructor() {
-      mcp.clients.push(this);
-    }
-  }
-
-  return { Client, StreamableHTTPClientTransport };
-});
-
-vi.mock("@modelcontextprotocol/client/stdio", () => ({
-  getDefaultEnvironment: () => ({}),
-  StdioClientTransport: class StdioClientTransport {},
-}));
-
 import { NodeRuntimeServices } from "../src/node.js";
-
-const config = {
-  transport: "stdio",
-  command: "fixture-command",
-  tool: "fixture-tool",
-} as const;
 
 const context: ServiceExecutionContext = {
   signal: new AbortController().signal,
-  runId: "mcp-cache-test",
+  runId: "raw-mcp-test",
   nodeId: "mcp-node",
   iteration: 0,
   resolveSecret: () => undefined,
 };
 
-const success = (value: unknown): MockMcpResult => ({ content: [], structuredContent: value });
-
-describe("NodeRuntimeServices MCP connection cache", () => {
-  beforeEach(() => {
-    mcp.clients.length = 0;
-    mcp.outcomes.length = 0;
-  });
-
-  it("closes and evicts a connection when callTool throws, then reconnects without retrying", async () => {
-    mcp.outcomes.push(new Error("transport dropped"), success({ recovered: true }));
-    const services = new NodeRuntimeServices(process.cwd(), {
-      allowProcessCommands: [config.command],
-    });
-
+describe("NodeRuntimeServices MCP boundary", () => {
+  it("preserves reviewed v1.1 raw stdio MCP behind an exact process allowlist", async () => {
+    const project = fileURLToPath(new URL("../../../examples/mcp-tool-agent/", import.meta.url));
+    const services = new NodeRuntimeServices(project, { allowProcessCommands: ["node"] });
     try {
-      await expect(services.callMcpTool(config, {}, context)).rejects.toThrow("transport dropped");
-      expect(mcp.clients).toHaveLength(1);
-      expect(mcp.clients[0]?.callTool).toHaveBeenCalledTimes(1);
-      expect(mcp.clients[0]?.close).toHaveBeenCalledTimes(1);
-
-      await expect(services.callMcpTool(config, {}, context)).resolves.toMatchObject({
-        value: { recovered: true },
+      await expect(services.callMcpTool({
+        transport: "stdio",
+        protocol: "legacy",
+        command: "node",
+        args: ["server.mjs"],
+        tool: "lookup-city",
+      }, { city: "Seoul" }, context)).resolves.toMatchObject({
+        value: { city: "Seoul", country: "South Korea" },
+        metadata: { transport: "stdio", tool: "lookup-city", isError: false },
       });
-      expect(mcp.clients).toHaveLength(2);
-      expect(mcp.clients[1]?.callTool).toHaveBeenCalledTimes(1);
     } finally {
       await services.close();
     }
   });
 
-  it("keeps the connection cached for a normal MCP isError result", async () => {
-    mcp.outcomes.push(
-      { content: [], isError: true },
-      success({ reused: true }),
-    );
-    const services = new NodeRuntimeServices(process.cwd(), {
-      allowProcessCommands: [config.command],
+  it("preserves reviewed v1.1 raw Streamable HTTP behind an exact host allowlist", async () => {
+    const project = fileURLToPath(new URL("../../../examples/mcp-tool-agent/", import.meta.url));
+    const child = spawn(process.execPath, [join(project, "http-server.mjs")], {
+      cwd: project,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
-
-    try {
-      await expect(services.callMcpTool(config, {}, context)).rejects.toThrow("returned an error result");
-      expect(mcp.clients).toHaveLength(1);
-      expect(mcp.clients[0]?.close).not.toHaveBeenCalled();
-
-      await expect(services.callMcpTool(config, {}, context)).resolves.toMatchObject({
-        value: { reused: true },
+    const port = await new Promise<number>((resolvePort, reject) => {
+      const timer = setTimeout(() => reject(new Error("Raw HTTP MCP fixture did not start")), 10_000);
+      let output = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        output += chunk.toString("utf8");
+        const match = /PORT (\d+)/.exec(output);
+        if (match) {
+          clearTimeout(timer);
+          resolvePort(Number(match[1]));
+        }
       });
-      expect(mcp.clients).toHaveLength(1);
-      expect(mcp.clients[0]?.callTool).toHaveBeenCalledTimes(2);
+      child.once("error", reject);
+      child.once("exit", (code) => reject(new Error(`Raw HTTP MCP fixture exited with ${code}`)));
+    });
+    const host = `127.0.0.1:${port}`;
+    const services = new NodeRuntimeServices(project, { allowNetworkHosts: [host] });
+    try {
+      await expect(services.callMcpTool({
+        transport: "http",
+        protocol: "2026-07-28",
+        url: `http://${host}/mcp`,
+        tool: "lookup-city",
+      }, { city: "Seoul" }, { ...context, nodeId: "mcp-http-node" })).resolves.toMatchObject({
+        value: { city: "Seoul", country: "South Korea" },
+        metadata: { transport: "http", tool: "lookup-city", isError: false },
+      });
     } finally {
       await services.close();
+      if (child.exitCode === null) {
+        const exited = new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+        child.kill();
+        await exited;
+      }
     }
-  });
+  }, 30_000);
 });

@@ -2,6 +2,10 @@ import "server-only";
 
 import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import anthropicAdapter from "@harnest/adapter-anthropic";
+import geminiAdapter from "@harnest/adapter-gemini";
+import ollamaAdapter from "@harnest/adapter-local";
+import openAIAdapter from "@harnest/adapter-openai";
 import {
   AdapterRegistry,
   ToolRegistry,
@@ -9,6 +13,9 @@ import {
   type Diagnostic,
   type HarnessSpec,
   type RuntimeOptions,
+  type RuntimeServices,
+  type ToolApprovalRequest,
+  type ToolApprovalDecision,
 } from "@harnest/core";
 import {
   FileRunStore,
@@ -36,36 +43,59 @@ export async function fileExists(filePath: string) {
   }
 }
 
-export async function runtimeResourcesFor(spec: HarnessSpec) {
+export async function runtimeResourcesFor(spec: HarnessSpec, options: {
+  readonly requestToolApproval?: RuntimeServices["requestToolApproval"];
+} = {}) {
   const adapters = new AdapterRegistry();
   const components = createBuiltinComponentRegistry();
   const tools = new ToolRegistry();
   const projectDirectory = dirname(harnessFile());
   const capabilityPolicy = studioCapabilityPolicy(process.env);
-  const adapterLoad = await loadAdapterModules(
-    spec,
-    adapters,
-    projectDirectory,
-    capabilityPolicy.allowModules ? { allowModuleExecution: true } : undefined,
-  );
-  const runtimeLoad = await loadRuntimeModules(
-    spec,
-    { adapters, components, tools },
-    projectDirectory,
-    capabilityPolicy.allowModules ? { allowModuleExecution: true } : undefined,
-  );
-  const services = new NodeRuntimeServices(projectDirectory, runtimeServiceOptionsFor(spec, capabilityPolicy));
-  const runs = new FileRunStore(projectDirectory);
-  const diagnostics = [...adapterLoad.diagnostics, ...runtimeLoad.diagnostics, ...hostCapabilityDiagnosticsFor(spec, capabilityPolicy)]
-    .filter((diagnostic, index, all) => all.findIndex((item) => item.code === diagnostic.code && item.path === diagnostic.path) === index);
-  return {
-    adapters,
-    components,
-    tools,
-    services,
-    runs,
-    diagnostics,
-  };
+  const services = new NodeRuntimeServices(projectDirectory, {
+    ...runtimeServiceOptionsFor(spec, capabilityPolicy),
+    ...(options.requestToolApproval ? { requestToolApproval: options.requestToolApproval as (
+      request: ToolApprovalRequest,
+      context: Parameters<NonNullable<RuntimeServices["requestToolApproval"]>>[1],
+    ) => ToolApprovalDecision | Promise<ToolApprovalDecision> } : {}),
+  });
+  try {
+    for (const definition of await services.toolDefinitions()) if (!tools.has(definition.id)) tools.register(definition);
+    const adapterLoad = await loadAdapterModules(
+      spec,
+      adapters,
+      projectDirectory,
+      capabilityPolicy.allowModules ? { allowModuleExecution: true } : undefined,
+    );
+    const runtimeLoad = await loadRuntimeModules(
+      spec,
+      { adapters, components, tools },
+      projectDirectory,
+      capabilityPolicy.allowModules ? { allowModuleExecution: true } : undefined,
+    );
+    for (const adapter of [openAIAdapter, anthropicAdapter, geminiAdapter, ollamaAdapter]) {
+      if (!adapters.has(adapter.id)) adapters.register(adapter);
+    }
+    const runs = new FileRunStore(projectDirectory);
+    const diagnostics = [
+      ...adapterLoad.diagnostics,
+      ...runtimeLoad.diagnostics,
+      ...hostCapabilityDiagnosticsFor(spec, capabilityPolicy),
+      ...await services.connectionDiagnostics(spec, tools),
+    ]
+      .filter((diagnostic, index, all) => all.findIndex((item) => item.code === diagnostic.code && item.path === diagnostic.path) === index);
+    return {
+      adapters,
+      components,
+      tools,
+      toolStore: services.toolStore,
+      services,
+      runs,
+      diagnostics,
+    };
+  } catch (error) {
+    await services.close();
+    throw error;
+  }
 }
 
 export type RuntimeResources = Awaited<ReturnType<typeof runtimeResourcesFor>>;

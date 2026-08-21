@@ -2,11 +2,30 @@ export interface AdapterCapabilities {
   streaming: boolean;
   json: boolean;
   cancellation: boolean;
+  /** Provider-native function/tool calling. Omitted by legacy adapters. */
+  tools?: boolean;
+}
+
+export interface ModelToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly input: unknown;
+  /** Opaque, bounded state that an Adapter must receive unchanged on the next model turn. */
+  readonly providerMetadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface ModelToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
 }
 
 export interface ModelMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  toolCalls?: readonly ModelToolCall[];
+  toolCallId?: string;
+  name?: string;
 }
 
 export interface ModelRequest {
@@ -17,6 +36,7 @@ export interface ModelRequest {
   temperature?: number;
   maxTokens?: number;
   responseSchema?: Readonly<Record<string, unknown>>;
+  tools?: readonly ModelToolDefinition[];
 }
 
 export interface AdapterContext {
@@ -34,6 +54,7 @@ export type FinishReason = "stop" | "length" | "tool" | "error" | "unknown";
 
 export type ModelEvent =
   | { type: "text-delta"; text: string }
+  | { type: "tool-call"; call: ModelToolCall }
   | { type: "usage"; usage: TokenUsage }
   | { type: "finish"; reason: FinishReason; model?: string };
 

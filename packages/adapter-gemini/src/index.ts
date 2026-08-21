@@ -1,4 +1,4 @@
-import { AdapterError, parseSse } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
 import type {
   AdapterContext,
   ModelAdapter,
@@ -9,6 +9,8 @@ import type {
 
 const DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/";
 const DEFAULT_API_KEY = "env:GEMINI_API_KEY";
+const MAX_PROVIDER_TOOL_CALLS = 128;
+const MAX_TOOL_ARGUMENT_BYTES = 1_048_576;
 
 export interface GeminiAdapterOptions {
   readonly id?: string;
@@ -73,12 +75,32 @@ function errorDetails(value: unknown): { message?: string; code?: string } {
   };
 }
 
+function boundedToolInput(value: unknown, adapterId: string): unknown {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (cause) {
+    throw new AdapterError("Gemini returned non-serializable Tool arguments", {
+      adapterId,
+      code: "invalid_tool_call",
+      cause,
+    });
+  }
+  if (serialized === undefined || new TextEncoder().encode(serialized).byteLength > MAX_TOOL_ARGUMENT_BYTES) {
+    throw new AdapterError(`Gemini Tool arguments exceed the ${MAX_TOOL_ARGUMENT_BYTES}-byte limit`, {
+      adapterId,
+      code: "provider_response_limit",
+    });
+  }
+  return value;
+}
+
 async function throwHttpError(response: Response, adapterId: string): Promise<never> {
   const requestId = response.headers.get("x-request-id") ?? undefined;
   let message = `${adapterId} request failed with HTTP ${response.status}`;
   let code = `http_${response.status}`;
   try {
-    const details = errorDetails(JSON.parse(await response.text()) as unknown);
+    const details = errorDetails(JSON.parse(await readBoundedResponseText(response)) as unknown);
     message = details.message ?? message;
     code = details.code ?? code;
   } catch {
@@ -101,26 +123,55 @@ function requireBody(response: Response, adapterId: string): ReadableStream<Uint
   });
 }
 
+function providerContents(request: ModelRequest): unknown[] {
+  return request.messages
+    .filter((message) => message.role !== "system")
+    .map((message) => {
+      if (message.role === "tool") return {
+        role: "user",
+        parts: [{
+          functionResponse: {
+            ...(message.toolCallId ? { id: message.toolCallId } : {}),
+            name: message.name,
+            response: { output: message.content },
+          },
+        }],
+      };
+      return {
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [
+          ...(message.content ? [{ text: message.content }] : []),
+          ...(message.role === "assistant" ? (message.toolCalls ?? []).map((call) => {
+            const metadata = asRecord(call.providerMetadata);
+            return {
+              functionCall: { id: call.id, name: call.name, args: call.input },
+              ...(typeof metadata?.thoughtSignature === "string"
+                ? { thoughtSignature: metadata.thoughtSignature }
+                : {}),
+            };
+          }) : []),
+        ],
+      };
+    });
+}
+
 export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAdapter {
   const id = options.id ?? "gemini";
   const credential = options.apiKey ?? DEFAULT_API_KEY;
+  let requestSequence = 0;
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true },
+    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
+      const requestId = requestSequence += 1;
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
       const system = request.messages
         .filter((message) => message.role === "system")
         .map((message) => message.content)
         .join("\n\n");
-      const contents = request.messages
-        .filter((message) => message.role !== "system")
-        .map((message) => ({
-          role: message.role === "assistant" ? "model" : "user",
-          parts: [{ text: message.content }],
-        }));
+      const contents = providerContents(request);
       const generationConfig = {
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
         ...(request.maxTokens === undefined ? {} : { maxOutputTokens: request.maxTokens }),
@@ -130,6 +181,13 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
       };
       const body = {
         contents,
+        ...(request.tools?.length ? {
+          tools: [{ functionDeclarations: request.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            parametersJsonSchema: tool.inputSchema,
+          })) }],
+        } : {}),
         ...(system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } }),
         ...(Object.keys(generationConfig).length === 0 ? {} : { generationConfig }),
       };
@@ -164,6 +222,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
 
       let reason: (ModelEvent & { type: "finish" }) | undefined;
       let finalUsage: TokenUsage | undefined;
+      const toolCalls = new Map<string, { id: string; name: string; input: unknown }>();
       for await (const event of parseSse(requireBody(response, id))) {
         let payload: unknown;
         try {
@@ -189,10 +248,27 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
           const candidate = asRecord(candidateValue);
           const content = asRecord(candidate?.content);
           const parts = Array.isArray(content?.parts) ? content.parts : [];
-          for (const partValue of parts) {
+          for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+            const partValue = parts[partIndex];
             const part = asRecord(partValue);
             if (typeof part?.text === "string" && part.text.length > 0) {
               yield { type: "text-delta", text: part.text };
+            }
+            const call = asRecord(part?.functionCall);
+            if (typeof call?.name === "string") {
+              const key = typeof call.id === "string" ? call.id : `${candidates.indexOf(candidateValue)}:${partIndex}:${call.name}`;
+              if (!toolCalls.has(key) && toolCalls.size >= MAX_PROVIDER_TOOL_CALLS) throw new AdapterError(
+                `Gemini exceeded the ${MAX_PROVIDER_TOOL_CALLS} Tool-call limit`,
+                { adapterId: id, code: "provider_response_limit" },
+              );
+              toolCalls.set(key, {
+                id: typeof call.id === "string" ? call.id : `gemini-${requestId}-${key}`,
+                name: call.name,
+                input: boundedToolInput(call.args ?? {}, id),
+                ...(typeof part?.thoughtSignature === "string"
+                  ? { providerMetadata: boundedToolInput({ thoughtSignature: part.thoughtSignature }, id) as Readonly<Record<string, unknown>> }
+                  : {}),
+              });
             }
           }
           if (candidate?.finishReason !== undefined) reason = mapFinishReason(candidate.finishReason);
@@ -205,6 +281,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
         adapterId: id,
         code: "invalid_stream",
       });
+      for (const call of toolCalls.values()) yield { type: "tool-call", call };
       yield { ...reason, model: request.model };
     },
   };

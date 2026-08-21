@@ -9,6 +9,13 @@ import type {
   HarnessEdge,
   HarnessNode,
 } from "@/lib/studio-state";
+import {
+  connectionCanRun,
+  connectionKindLabel,
+  type ConnectionKind,
+  type ConnectionSummary,
+} from "@/lib/connections";
+import type { ToolCatalogItem } from "@/lib/studio-catalog";
 
 type EdgeCondition = { source?: string; path?: string; op?: string; value?: unknown };
 type EdgeState = { key?: string; merge?: string };
@@ -145,6 +152,82 @@ function ConfigField({
   );
 }
 
+const connectionKindsFor = (
+  component: HarnessComponent,
+  tools: readonly ToolCatalogItem[] = [],
+): readonly ConnectionKind[] => {
+  if (component.type === "model") return ["provider"];
+  if (component.type === "mcp-tool") return component.config.transport === "stdio"
+    ? ["mcp-stdio"]
+    : component.config.transport === "http"
+      ? ["mcp-http"]
+      : ["mcp-http", "mcp-stdio"];
+  if (component.type === "local-tool") return ["tool-service", "http-api", "local-runtime"];
+  if (component.type === "tool") {
+    const toolId = typeof component.config.tool === "string" ? component.config.tool : "";
+    const catalogKinds = tools.find((tool) => tool.id === toolId)?.connectionKinds;
+    if (catalogKinds?.length) return catalogKinds;
+    if (component.config.source === "mcp") return ["mcp-http", "mcp-stdio"];
+    if (["builtin.code-runner", "builtin.file", "builtin.shell"].includes(toolId)) return ["local-runtime"];
+    if (toolId === "builtin.web-search") return ["tool-service"];
+    if (toolId === "builtin.http") return ["http-api"];
+    return ["tool-service", "http-api", "local-runtime"];
+  }
+  return [];
+};
+
+const advancedField = (component: HarnessComponent, field: InspectorField) => {
+  if (component.type === "model") return ["adapter", "baseUrl", "inputCostPerMillion", "outputCostPerMillion"].includes(field.path);
+  if (component.type === "mcp-tool") return ["transport", "protocol", "command", "args", "url", "headers", "timeoutMs"].includes(field.path);
+  if (component.type === "tool") return ["tool", "action", "source", "inputSchema", "outputSchema"].includes(field.path);
+  return field.control === "json" && (field.path === "schema" || field.path === "inputSchema" || field.path === "outputSchema");
+};
+
+function ConnectionField({
+  component,
+  connections,
+  tools,
+  locked,
+  onChange,
+  onConnect,
+}: {
+  component: HarnessComponent;
+  connections: readonly ConnectionSummary[];
+  tools: readonly ToolCatalogItem[];
+  locked: boolean;
+  onChange: (component: HarnessComponent) => void;
+  onConnect: (kind?: ConnectionKind) => void;
+}) {
+  const kinds = connectionKindsFor(component, tools);
+  if (!kinds.length) return null;
+  const config = component.config as Record<string, unknown>;
+  const selectedId = typeof config.connectionId === "string" ? config.connectionId : "";
+  const compatible = connections.filter((connection) => kinds.includes(connection.kind));
+  const selected = connections.find((connection) => connection.id === selectedId);
+  const preferred = kinds[0];
+  const update = (connectionId: string) => onChange({
+    ...component,
+    config: withConfigValue(config, "connectionId", connectionId || undefined),
+  } as HarnessComponent);
+
+  return (
+    <div className="connection-field">
+      <div className="field-section">Connection</div>
+      <div className="field">
+        <label htmlFor={`connection-${component.id}`}>Reusable connection</label>
+        <select id={`connection-${component.id}`} disabled={locked} value={selectedId} onChange={(event) => update(event.target.value)}>
+          <option value="">Choose a connection</option>
+          {compatible.map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionKindLabel(connection.kind)} · {connection.status.replaceAll("_", " ")}</option>)}
+        </select>
+        {selected
+          ? <span className={`field-help connection-inline-status is-${selected.status}`}>{selected.status.replaceAll("_", " ")}</span>
+          : <span className="field-help">Credentials stay in the local store; only this ID is saved in harnest.yaml.</span>}
+      </div>
+      <button type="button" className="button" disabled={locked} onClick={() => onConnect(preferred)}>{compatible.length ? "Manage connections" : "Connect"}</button>
+    </div>
+  );
+}
+
 function EdgeInspector({
   edge,
   locked,
@@ -205,6 +288,9 @@ export function Inspector({
   onSetEntrypoint,
   onOpenSubgraph,
   subgraphs,
+  connections,
+  tools,
+  onOpenConnections,
 }: {
   node?: HarnessNode;
   edge?: HarnessEdge;
@@ -218,6 +304,9 @@ export function Inspector({
   onSetEntrypoint: () => void;
   onOpenSubgraph?: (name: string) => void;
   subgraphs?: readonly string[];
+  connections?: readonly ConnectionSummary[];
+  tools?: readonly ToolCatalogItem[];
+  onOpenConnections?: (kind?: ConnectionKind) => void;
 }) {
   if (edge) return <EdgeInspector edge={edge} locked={locked} onChange={onEdgeChange} onDelete={onDeleteEdge} />;
   if (!node) return <div className="inspector-empty">Select a component or connection to configure its runtime contract.</div>;
@@ -228,15 +317,22 @@ export function Inspector({
   const subgraph = component.type === "subgraph" || component.type === "loop"
     ? [config.subgraph, config.ref, config.name].find((value): value is string => typeof value === "string" && Boolean(value))
     : undefined;
+  const hasConnectionField = connectionKindsFor(component, tools).length > 0;
+  const editableFields = manifest.inspector.filter((field) => field.path !== "connectionId" && field.path !== "apiKey");
+  const primaryFields = editableFields.filter((field) => !advancedField(component, field));
+  const advancedFields = editableFields.filter((field) => advancedField(component, field));
 
   return (
     <div className="inspector-body">
       <div className="component-id"><span>{component.id}</span><span>{manifest.label}{entrypoint === component.id ? " · entrypoint" : ""}</span></div>
       <fieldset disabled={locked} className="inspector-fieldset">
         <div className="field-grid">
-          {manifest.inspector.length
-            ? manifest.inspector.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
+          {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
+          {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">This legacy Model contains a plaintext API key. Move it to a write-only Provider Connection, then remove it in Advanced YAML.</div>}
+          {primaryFields.length
+            ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
             : <div className="field-help">This component has no editable configuration.</div>}
+          {advancedFields.length > 0 && <details className="advanced-panel"><summary>Advanced</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
         </div>
       </fieldset>
       <div className="inspector-actions is-split">

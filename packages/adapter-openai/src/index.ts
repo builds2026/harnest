@@ -1,4 +1,4 @@
-import { AdapterError, parseSse } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
 import type {
   AdapterContext,
   ModelAdapter,
@@ -9,6 +9,8 @@ import type {
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1/";
 const DEFAULT_API_KEY = "env:OPENAI_API_KEY";
+const MAX_PROVIDER_TOOL_CALLS = 128;
+const MAX_TOOL_ARGUMENT_BYTES = 1_048_576;
 
 export interface OpenAICompatibleAdapterOptions {
   readonly id?: string;
@@ -67,7 +69,7 @@ async function throwHttpError(response: Response, adapterId: string): Promise<ne
   const requestId = response.headers.get("x-request-id") ?? undefined;
   let message = `${adapterId} request failed with HTTP ${response.status}`;
   try {
-    const parsed: unknown = JSON.parse(await response.text());
+    const parsed: unknown = JSON.parse(await readBoundedResponseText(response));
     message = providerMessage(parsed) ?? message;
   } catch {
     // The status still provides a stable normalized error when the body is not JSON.
@@ -90,6 +92,26 @@ function requireBody(response: Response, adapterId: string): ReadableStream<Uint
   });
 }
 
+function messages(request: ModelRequest): unknown[] {
+  return request.messages.map((message) => {
+    if (message.role === "assistant" && message.toolCalls?.length) return {
+      role: "assistant",
+      content: message.content || null,
+      tool_calls: message.toolCalls.map((call) => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.input) },
+      })),
+    };
+    if (message.role === "tool") return {
+      role: "tool",
+      content: message.content,
+      tool_call_id: message.toolCallId,
+    };
+    return { role: message.role, content: message.content };
+  });
+}
+
 export function createOpenAICompatibleAdapter(
   options: OpenAICompatibleAdapterOptions = {},
 ): ModelAdapter {
@@ -98,15 +120,21 @@ export function createOpenAICompatibleAdapter(
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true },
+    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
       const body: Record<string, unknown> = {
         model: request.model,
-        messages: request.messages,
+        messages: messages(request),
         stream: true,
         stream_options: { include_usage: true },
+        ...(request.tools?.length ? {
+          tools: request.tools.map((tool) => ({
+            type: "function",
+            function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
+          })),
+        } : {}),
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
         ...(request.maxTokens === undefined ? {} : { max_tokens: request.maxTokens }),
         ...(request.responseSchema === undefined
@@ -146,6 +174,7 @@ export function createOpenAICompatibleAdapter(
 
       let reason: (ModelEvent & { type: "finish" }) | undefined;
       let model = request.model;
+      const toolCalls = new Map<string, { id: string; name: string; arguments: string; argumentBytes: number }>();
       for await (const event of parseSse(requireBody(response, id))) {
         if (event.data === "[DONE]") break;
 
@@ -177,6 +206,35 @@ export function createOpenAICompatibleAdapter(
           if (typeof delta?.content === "string" && delta.content.length > 0) {
             yield { type: "text-delta", text: delta.content };
           }
+          const deltas = Array.isArray(delta?.tool_calls) ? delta.tool_calls : [];
+          for (let deltaIndex = 0; deltaIndex < deltas.length; deltaIndex += 1) {
+            const value = deltas[deltaIndex];
+            const call = asRecord(value);
+            const fn = asRecord(call?.function);
+            const choiceKey = typeof choice?.index === "number" ? choice.index : 0;
+            const callKey = typeof call?.index === "number" ? `index:${call.index}`
+              : typeof call?.id === "string" && call.id ? `id:${call.id}` : `position:${deltaIndex}`;
+            const key = `${choiceKey}:${callKey}`;
+            let current = toolCalls.get(key);
+            if (!current) {
+              if (toolCalls.size >= MAX_PROVIDER_TOOL_CALLS) throw new AdapterError(
+                `OpenAI-compatible provider exceeded the ${MAX_PROVIDER_TOOL_CALLS} Tool-call limit`,
+                { adapterId: id, code: "provider_response_limit" },
+              );
+              current = { id: "", name: "", arguments: "", argumentBytes: 0 };
+              toolCalls.set(key, current);
+            }
+            if (typeof call?.id === "string") current.id += call.id;
+            if (typeof fn?.name === "string") current.name += fn.name;
+            if (typeof fn?.arguments === "string") {
+              current.argumentBytes += new TextEncoder().encode(fn.arguments).byteLength;
+              if (current.argumentBytes > MAX_TOOL_ARGUMENT_BYTES) throw new AdapterError(
+                `OpenAI-compatible Tool arguments exceed the ${MAX_TOOL_ARGUMENT_BYTES}-byte limit`,
+                { adapterId: id, code: "provider_response_limit" },
+              );
+              current.arguments += fn.arguments;
+            }
+          }
           if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
             reason = finishReason(choice.finish_reason);
           }
@@ -187,6 +245,23 @@ export function createOpenAICompatibleAdapter(
         adapterId: id,
         code: "invalid_stream",
       });
+      for (const call of toolCalls.values()) {
+        if (!call.id || !call.name) throw new AdapterError("OpenAI-compatible provider returned an incomplete Tool call", {
+          adapterId: id,
+          code: "invalid_tool_call",
+        });
+        let input: unknown;
+        try {
+          input = call.arguments ? JSON.parse(call.arguments) as unknown : {};
+        } catch (cause) {
+          throw new AdapterError("OpenAI-compatible provider returned invalid Tool arguments", {
+            adapterId: id,
+            code: "invalid_tool_call",
+            cause,
+          });
+        }
+        yield { type: "tool-call", call: { id: call.id, name: call.name, input } };
+      }
       yield { ...reason, model };
     },
   };
