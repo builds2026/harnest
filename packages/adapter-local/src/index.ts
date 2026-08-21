@@ -1,4 +1,4 @@
-import { AdapterError, parseNdjson } from "@harnest/core";
+import { AdapterError, parseNdjson, readBoundedResponseText } from "@harnest/core";
 import type {
   AdapterContext,
   ModelAdapter,
@@ -9,6 +9,8 @@ import type {
 
 const DEFAULT_BASE_URL = "http://localhost:11434/";
 const DEFAULT_API_KEY = "env:OLLAMA_API_KEY";
+const MAX_PROVIDER_TOOL_CALLS = 128;
+const MAX_TOOL_ARGUMENT_BYTES = 1_048_576;
 
 export interface OllamaAdapterOptions {
   readonly id?: string;
@@ -54,10 +56,30 @@ function errorMessage(value: unknown): string | undefined {
   return typeof error?.message === "string" ? error.message : undefined;
 }
 
+function boundedToolInput(value: unknown, adapterId: string): unknown {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (cause) {
+    throw new AdapterError("Ollama returned non-serializable Tool arguments", {
+      adapterId,
+      code: "invalid_tool_call",
+      cause,
+    });
+  }
+  if (serialized === undefined || new TextEncoder().encode(serialized).byteLength > MAX_TOOL_ARGUMENT_BYTES) {
+    throw new AdapterError(`Ollama Tool arguments exceed the ${MAX_TOOL_ARGUMENT_BYTES}-byte limit`, {
+      adapterId,
+      code: "provider_response_limit",
+    });
+  }
+  return value;
+}
+
 async function throwHttpError(response: Response, adapterId: string): Promise<never> {
   let message = `${adapterId} request failed with HTTP ${response.status}`;
   try {
-    const text = await response.text();
+    const text = await readBoundedResponseText(response);
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -84,15 +106,31 @@ function requireBody(response: Response, adapterId: string): ReadableStream<Uint
   });
 }
 
+function providerMessages(request: ModelRequest): unknown[] {
+  return request.messages.map((message) => {
+    if (message.role === "assistant" && message.toolCalls?.length) return {
+      role: "assistant",
+      content: message.content,
+      tool_calls: message.toolCalls.map((call) => ({
+        function: { name: call.name, arguments: call.input },
+      })),
+    };
+    if (message.role === "tool") return { role: "tool", content: message.content, tool_name: message.name };
+    return { role: message.role, content: message.content };
+  });
+}
+
 export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAdapter {
   const id = options.id ?? "ollama";
   const credential = options.apiKey ?? DEFAULT_API_KEY;
+  let requestSequence = 0;
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true },
+    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
     requiredCredentials: options.apiKey?.startsWith("env:") ? [options.apiKey] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
+      const requestId = requestSequence += 1;
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
       const modelOptions = {
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
@@ -100,8 +138,14 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
       };
       const body = {
         model: request.model,
-        messages: request.messages,
+        messages: providerMessages(request),
         stream: true,
+        ...(request.tools?.length ? {
+          tools: request.tools.map((tool) => ({
+            type: "function",
+            function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
+          })),
+        } : {}),
         ...(Object.keys(modelOptions).length === 0 ? {} : { options: modelOptions }),
         ...(request.responseSchema === undefined ? {} : { format: request.responseSchema }),
       };
@@ -129,6 +173,7 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
       let reason: (ModelEvent & { type: "finish" }) | undefined;
       let finalUsage: TokenUsage | undefined;
       let model = request.model;
+      const toolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       for await (const value of parseNdjson(requireBody(response, id))) {
         const root = asRecord(value);
         if (!root) {
@@ -146,9 +191,28 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
         if (typeof message?.content === "string" && message.content.length > 0) {
           yield { type: "text-delta", text: message.content };
         }
+        const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+        for (const callValue of calls) {
+          if (toolCalls.length >= MAX_PROVIDER_TOOL_CALLS) throw new AdapterError(
+            `Ollama exceeded the ${MAX_PROVIDER_TOOL_CALLS} Tool-call limit`,
+            { adapterId: id, code: "provider_response_limit" },
+          );
+          const call = asRecord(callValue);
+          const fn = asRecord(call?.function);
+          if (typeof fn?.name !== "string") throw new AdapterError("Ollama returned an invalid Tool call", {
+            adapterId: id,
+            code: "invalid_tool_call",
+          });
+          toolCalls.push({
+            id: typeof call?.id === "string" ? call.id : `ollama-${requestId}-${toolCalls.length + 1}`,
+            name: fn.name,
+            input: boundedToolInput(fn.arguments ?? {}, id),
+          });
+        }
         if (root.done === true) {
           reason = mapFinishReason(root.done_reason);
           finalUsage = usage(root);
+          break;
         }
       }
 
@@ -157,6 +221,7 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
         adapterId: id,
         code: "invalid_stream",
       });
+      for (const call of toolCalls) yield { type: "tool-call", call };
       yield { ...reason, model };
     },
   };

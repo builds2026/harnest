@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
-  appendFile,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -10,12 +11,14 @@ import {
   rm,
   stat,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, StreamableHTTPClientTransport, type Tool } from "@modelcontextprotocol/client";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { AdapterError, AdapterRegistry, type ModelAdapter } from "./adapter.js";
+import type { ConnectionProfile } from "./connection.js";
 import type {
   ComponentDefinition,
   ComponentRegistry,
@@ -24,6 +27,27 @@ import type {
   ServiceResult,
 } from "./component.js";
 import type { RunEvent } from "./runtime.js";
+import { normalizeSpec } from "./graph.js";
+import {
+  ConnectionManager,
+  canonicalExecutable,
+  executeWebSearchConnection,
+  guardedFetch,
+  mcpToolApprovalId,
+  openMcpConnection,
+  protocolMode,
+  type McpConnectionHandle,
+} from "./node-connections.js";
+import { NodeSkillStore } from "./node-skills.js";
+import {
+  BUILTIN_TOOL_MANIFESTS,
+  NodeToolStore,
+  ToolStoreError,
+  type HttpCapabilityRequest,
+  type ModuleExecutionRequest,
+  type ProcessCapabilityRequest,
+  type WebSearchRequest,
+} from "./node-tools.js";
 import {
   parseSpec,
   stringifySpec,
@@ -32,7 +56,27 @@ import {
   type ParseResult,
   type ValidationResult,
 } from "./spec.js";
-import type { ToolDefinition, ToolRegistry } from "./tool.js";
+import type {
+  ToolApprovalDecision,
+  ToolApprovalRequest,
+  ToolBinding,
+  ToolDefinition,
+  ToolRegistry,
+} from "./tool.js";
+
+export {
+  ConnectionManager,
+  canonicalExecutable,
+  guardedFetch,
+  mcpToolApprovalId,
+  openMcpConnection,
+  protocolMode,
+  type ConnectionManagerOptions,
+  type ConnectionTestOptions,
+  type McpConnectionHandle,
+} from "./node-connections.js";
+export * from "./node-skills.js";
+export * from "./node-tools.js";
 
 export async function loadSpecFile(filePath: string): Promise<ParseResult> {
   try {
@@ -272,21 +316,56 @@ function isSensitiveProjectPath(root: string, target: string): boolean {
 async function storageDirectory(root: string, child?: string): Promise<string> {
   const directory = resolve(root, ".harnest", ...(child ? [child] : []));
   if (!isInside(root, directory)) throw new Error("Invalid Harnest storage directory");
-  await mkdir(directory, { recursive: true });
-  const canonical = await realpath(directory);
-  if (!isInside(root, canonical)) throw new Error("Harnest storage resolves outside the project");
-  return canonical;
+  let current = root;
+  for (const segment of relative(root, directory).split(sep).filter(Boolean)) {
+    const next = resolve(current, segment);
+    let info;
+    try {
+      info = await lstat(next);
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+      try {
+        await mkdir(next, { mode: 0o700 });
+      } catch (mkdirError) {
+        if (!(mkdirError && typeof mkdirError === "object" && "code" in mkdirError && mkdirError.code === "EEXIST")) {
+          throw mkdirError;
+        }
+      }
+      info = await lstat(next);
+    }
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error("Harnest storage contains an unsafe link or non-directory");
+    }
+    current = await realpath(next);
+    if (!isInside(root, current)) throw new Error("Harnest storage resolves outside the project");
+  }
+  return current;
+}
+
+async function readBoundedHandle(
+  handle: FileHandle,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const chunks: Buffer[] = [];
+  let bytesRead = 0;
+  while (bytesRead <= maxBytes) {
+    const chunk = Buffer.alloc(Math.min(65_536, maxBytes + 1 - bytesRead));
+    const result = await handle.read(chunk, 0, chunk.byteLength, bytesRead);
+    if (result.bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, result.bytesRead));
+    bytesRead += result.bytesRead;
+  }
+  const buffer = Buffer.concat(chunks, bytesRead);
+  return {
+    text: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf8"),
+    truncated: bytesRead > maxBytes,
+  };
 }
 
 async function readBounded(file: string, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
   const handle = await open(file, "r");
   try {
-    const buffer = Buffer.alloc(maxBytes + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
-    return {
-      text: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf8"),
-      truncated: bytesRead > maxBytes,
-    };
+    return await readBoundedHandle(handle, maxBytes);
   } finally {
     await handle.close();
   }
@@ -460,35 +539,401 @@ export class FileMemoryStore {
 
 export interface NodeRuntimeServiceOptions {
   readonly allowFileSystem?: true;
+  readonly allowModuleExecution?: true;
   readonly allowedContextRoots?: readonly string[];
   readonly allowProcessCommands?: readonly string[];
   readonly allowNetworkHosts?: true | readonly string[];
   readonly maxContextBytes?: number;
+  readonly connectionManager?: ConnectionManager;
+  readonly toolStore?: NodeToolStore;
+  readonly skillStore?: NodeSkillStore;
+  readonly approvedToolIds?: readonly string[];
+  readonly requestToolApproval?: (
+    request: ToolApprovalRequest,
+    context: ServiceExecutionContext,
+  ) => ToolApprovalDecision | Promise<ToolApprovalDecision>;
 }
 
 interface McpConnection {
   readonly client: Client;
   readonly transport: StdioClientTransport | StreamableHTTPClientTransport;
-  readonly tool: Tool;
+  readonly tools: Map<string, Tool>;
+  readonly transportType: "stdio" | "http";
+  readonly close?: () => Promise<void>;
 }
 
-function protocolMode(config: Readonly<Record<string, unknown>>, transport: "stdio" | "http") {
-  const protocol = config.protocol ?? (transport === "http" ? "auto" : "legacy");
-  if (protocol === "auto") return { mode: "auto" as const };
-  if (protocol === "2026-07-28") return { mode: { pin: "2026-07-28" } as const };
-  return { mode: "legacy" as const };
+const runtimeConnectionAvailable = (profile: ConnectionProfile): boolean =>
+  profile.status.state === "connected" || profile.status.state === "unknown";
+
+function assertRuntimeConnection(profile: ConnectionProfile): void {
+  if (!runtimeConnectionAvailable(profile)) {
+    throw new Error(`Connection '${profile.id}' is ${profile.status.state.replaceAll("_", " ")} and cannot be used`);
+  }
 }
+
+const forbiddenToolRequestHeader = /^(?::authority|host|authorization|proxy-.+|cookies?|connection|keep-alive|te|trailer|transfer-encoding|upgrade|content-length)$/i;
 
 export class NodeRuntimeServices implements RuntimeServices {
+  readonly connectionManager: ConnectionManager;
+  readonly toolStore: NodeToolStore;
+  readonly skillStore: NodeSkillStore;
+  readonly #projectDirectory: string;
   readonly #root: Promise<string>;
   readonly #memory: FileMemoryStore;
   readonly #options: NodeRuntimeServiceOptions;
   readonly #connections = new Map<string, Promise<McpConnection>>();
+  readonly #connectionSecrets = new Map<string, { readonly value: string; readonly runIds: Set<string> }>();
 
   constructor(projectDirectory: string, options: NodeRuntimeServiceOptions = {}) {
+    this.#projectDirectory = resolve(projectDirectory);
     this.#root = projectRoot(projectDirectory);
     this.#memory = new FileMemoryStore(projectDirectory);
     this.#options = options;
+    this.connectionManager = options.connectionManager ?? new ConnectionManager(projectDirectory);
+    this.skillStore = options.skillStore ?? new NodeSkillStore({ projectDirectory });
+    this.toolStore = options.toolStore ?? new NodeToolStore({
+      projectDirectory,
+      capabilities: {
+        authorizeNetworkHost: ({ url }) => {
+          this.#assertNetworkUrl(url);
+          return true;
+        },
+        performHttp: (request) => this.#performHttp(request),
+        authorizeProcess: (request) => this.#authorizeProcess(request),
+        authorizeFile: () => options.allowFileSystem === true,
+        executeModule: (request) => this.#executeModule(request),
+        webSearch: (request) => this.#webSearch(request),
+      },
+    });
+  }
+
+  async toolDefinitions(): Promise<readonly ToolDefinition[]> {
+    return [...this.toolStore.builtinDefinitions(), ...await this.toolStore.definitions()];
+  }
+
+  async connectionDiagnostics(spec: HarnessSpec, tools: ToolRegistry): Promise<Diagnostic[]> {
+    const normalized = normalizeSpec(spec);
+    const profiles = new Map((await this.connectionManager.list()).map((profile) => [profile.id, profile]));
+    const diagnostics: Diagnostic[] = [];
+    const bodies = [
+      { components: normalized.components, path: "$" },
+      ...Object.entries(normalized.subgraphs).map(([name, body]) => ({
+        components: body.components,
+        path: `$.subgraphs.${name}`,
+      })),
+    ];
+    for (const body of bodies) body.components.forEach((component, index) => {
+      const connectionId = typeof component.config.connectionId === "string" && component.config.connectionId.length
+        ? component.config.connectionId : undefined;
+      if (!connectionId) return;
+      let requiredKinds: readonly string[] | undefined;
+      if (component.type === "model") requiredKinds = ["provider"];
+      else if (component.type === "mcp-tool") requiredKinds = ["mcp"];
+      else if (component.type === "tool" && typeof component.config.tool === "string") {
+        requiredKinds = tools.has(component.config.tool)
+          ? tools.get(component.config.tool).connectionKinds
+          : ["mcp"];
+      }
+      if (!requiredKinds?.length) return;
+      const path = `${body.path}.components[${index}].config.connectionId`;
+      const profile = profiles.get(connectionId);
+      if (!profile) {
+        diagnostics.push({
+          code: "CONNECTION_NOT_FOUND",
+          path,
+          message: `Connection '${connectionId}' does not exist`,
+          componentId: component.id,
+          severity: "error",
+        });
+        return;
+      }
+      if (!runtimeConnectionAvailable(profile)) {
+        diagnostics.push({
+          code: profile.status.state === "disconnected" ? "CONNECTION_DISCONNECTED" : "CONNECTION_UNAVAILABLE",
+          path,
+          message: `Connection '${connectionId}' is ${profile.status.state.replaceAll("_", " ")} and cannot be used`,
+          componentId: component.id,
+          severity: "error",
+        });
+        return;
+      }
+      const actualKind = profile.kind === "mcp" ? `mcp-${String(profile.config.transport)}` : profile.kind;
+      if (!requiredKinds.includes(profile.kind) && !requiredKinds.includes(actualKind)) diagnostics.push({
+        code: "CONNECTION_TYPE_MISMATCH",
+        path,
+        message: `Connection '${connectionId}' is '${actualKind}', but this component requires ${requiredKinds.join(" or ")}`,
+        componentId: component.id,
+        severity: "error",
+      });
+    });
+    return diagnostics;
+  }
+
+  async resolveConnection(
+    connectionId: string,
+    context: ServiceExecutionContext,
+  ): Promise<ServiceResult> {
+    const profile = await this.connectionManager.require(connectionId);
+    assertRuntimeConnection(profile);
+    const credentialReferences: Record<string, string> = {};
+    for (const field of profile.credentialFields) {
+      const reference = this.connectionManager.credentialReference(profile.id, field);
+      const value = await this.connectionManager.resolveCredential(profile.id, field);
+      if (value === undefined) throw new Error(`Connection '${profile.id}' credential '${field}' is unavailable`);
+      credentialReferences[field] = reference;
+      const unlocked = this.#connectionSecrets.get(reference);
+      if (unlocked?.value === value) unlocked.runIds.add(context.runId);
+      else this.#connectionSecrets.set(reference, { value, runIds: new Set([context.runId]) });
+    }
+    return {
+      value: {
+        ...credentialReferences,
+        ...structuredClone(profile.config),
+        connectionId: profile.id,
+        connectionKind: profile.kind,
+        connectionName: profile.name,
+        credentialReferences,
+      },
+      metadata: {
+        connectionId: profile.id,
+        scope: profile.scope,
+        kind: profile.kind,
+        state: profile.status.state,
+      },
+    };
+  }
+
+  /** Synchronous bridge for HarnessRuntime's existing secret resolver contract. */
+  resolveConnectionSecret(reference: string): string | undefined {
+    return this.#connectionSecrets.get(reference)?.value;
+  }
+
+  resolveSecret(reference: string): string | undefined {
+    return this.resolveConnectionSecret(reference);
+  }
+
+  releaseRun(runId: string): void {
+    for (const [reference, unlocked] of this.#connectionSecrets) {
+      unlocked.runIds.delete(runId);
+      if (unlocked.runIds.size === 0) this.#connectionSecrets.delete(reference);
+    }
+  }
+
+  async executeTool(
+    binding: ToolBinding,
+    input: unknown,
+    context: ServiceExecutionContext,
+  ): Promise<ServiceResult> {
+    if (binding.source === "mcp") {
+      if (!binding.connectionId) throw new Error(`MCP Tool '${binding.id}' has no Connection`);
+      return this.callMcpTool({ connectionId: binding.connectionId, tool: binding.action ?? binding.id }, input, context);
+    }
+    let stored;
+    try {
+      stored = await this.toolStore.get(binding.id);
+    } catch (error) {
+      if (!(error instanceof ToolStoreError && error.code === "TOOL_MANIFEST_NOT_FOUND")) throw error;
+    }
+    if (stored) {
+      await this.#assertToolConnection(stored.connectionKinds, binding.connectionId);
+      const value = await this.toolStore.execute(stored, input, context, {
+        ...(binding.connectionId ? { connectionId: binding.connectionId } : {}),
+      });
+      return {
+        value: binding.connectionId
+          ? await this.connectionManager.redactSensitiveOutput(binding.connectionId, value)
+          : value,
+        metadata: { tool: binding.id, source: stored.source },
+      };
+    }
+    const builtin = BUILTIN_TOOL_MANIFESTS.find((candidate) => candidate.id === binding.id);
+    if (builtin) {
+      await this.#assertToolConnection(builtin.connectionKinds, binding.connectionId);
+      const value = await this.toolStore.executeBuiltin(binding.id, input, context, {
+        ...(binding.connectionId ? { connectionId: binding.connectionId } : {}),
+      });
+      return {
+        value: binding.connectionId
+          ? await this.connectionManager.redactSensitiveOutput(binding.connectionId, value)
+          : value,
+        metadata: { tool: binding.id, source: "builtin" },
+      };
+    }
+    if (!binding.connectionId) throw new Error(`Tool '${binding.id}' is not installed`);
+    const profile = await this.connectionManager.require(binding.connectionId);
+    if (profile.kind !== "mcp") throw new Error(`Tool '${binding.id}' is not installed`);
+    return this.callMcpTool({ connectionId: profile.id, tool: binding.action ?? binding.id }, input, context);
+  }
+
+  async loadSkill(skillId: string, _context: ServiceExecutionContext): Promise<ServiceResult> {
+    const skill = await this.skillStore.activate(skillId);
+    const grantedPermissions = [
+      ...(this.#options.allowFileSystem ? ["filesystem:read", "filesystem:write"] : []),
+      ...(this.#options.allowProcessCommands?.flatMap((command) => ["process", `process:${command}`]) ?? []),
+      ...(this.#options.allowNetworkHosts === true ? ["network"]
+        : this.#options.allowNetworkHosts?.flatMap((host) => ["network", `network:${host}`]) ?? []),
+      ...(this.#options.allowModuleExecution ? ["module:execute"] : []),
+    ];
+    return {
+      value: {
+        instructions: skill.body,
+        descriptor: skill.descriptor,
+        requirements: skill.descriptor.requirements,
+        grantedPermissions: [...new Set(grantedPermissions)],
+        provenance: skill.provenance,
+        provenanceVerified: skill.provenanceVerified,
+        scriptsPresent: skill.scriptsPresent,
+        trusted: skill.provenanceVerified && !skill.scriptsPresent,
+      },
+      metadata: {
+        skill: skill.descriptor.name,
+        scope: skill.scope,
+        namespace: skill.namespace,
+        documentHash: skill.documentHash,
+      },
+    };
+  }
+
+  async loadSkillResource(
+    skillId: string,
+    resourcePath: string,
+    _context: ServiceExecutionContext,
+  ): Promise<ServiceResult> {
+    const resource = await this.skillStore.loadResource(skillId, resourcePath);
+    return {
+      value: resource.content,
+      metadata: {
+        skill: resource.skill,
+        path: resource.path,
+        bytes: resource.bytes,
+        sha256: resource.sha256,
+        script: resource.script,
+        trusted: resource.trusted,
+      },
+    };
+  }
+
+  async #assertToolConnection(
+    kinds: readonly string[] | undefined,
+    connectionId: string | undefined,
+  ): Promise<ConnectionProfile | undefined> {
+    if ((!kinds || kinds.length === 0) && !connectionId) return undefined;
+    if (!connectionId) throw new Error(`This Tool requires a ${kinds?.join(" or ") ?? "compatible"} Connection`);
+    const profile = await this.connectionManager.require(connectionId);
+    assertRuntimeConnection(profile);
+    const kind = profile.kind === "mcp"
+      ? profile.config.transport === "stdio" ? "mcp-stdio" : "mcp-http"
+      : profile.kind;
+    if (kinds?.length && !kinds.includes(profile.kind) && !kinds.includes(kind)) {
+      throw new Error(`Connection '${connectionId}' is '${kind}', but this Tool requires ${kinds.join(" or ")}`);
+    }
+    return profile;
+  }
+
+  async #performHttp(capability: HttpCapabilityRequest): Promise<Response> {
+    this.#assertNetworkUrl(capability.url);
+    if (!capability.connectionId) return fetch(capability.request);
+    const profile = await this.connectionManager.require(capability.connectionId);
+    if (profile.kind !== "http-api" && profile.kind !== "tool-service") {
+      throw new Error(`Connection '${profile.id}' cannot authenticate an HTTP Tool`);
+    }
+    if (typeof profile.config.url !== "string") throw new Error(`Connection '${profile.id}' has no HTTP URL`);
+    const base = new URL(profile.config.url);
+    if ((base.protocol !== "http:" && base.protocol !== "https:") || base.username || base.password
+      || base.origin !== capability.url.origin) {
+      throw new Error(`Connection '${profile.id}' is not bound to HTTP origin '${capability.url.origin}'`);
+    }
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(asRecord(profile.config.headers) ?? {})) {
+      if (typeof value === "string") headers.set(name, value);
+    }
+    capability.request.headers.forEach((value, name) => {
+      if (forbiddenToolRequestHeader.test(name)) {
+        throw new Error(`HTTP Tool cannot control routing, credential, or hop-by-hop header '${name}'`);
+      }
+      headers.set(name, value);
+    });
+    for (const [name, field] of Object.entries(asRecord(profile.config.headerCredentials) ?? {})) {
+      if (typeof field !== "string") continue;
+      const value = await this.connectionManager.resolveCredential(profile.id, field);
+      if (value === undefined) throw new Error(`Connection '${profile.id}' credential '${field}' is unavailable`);
+      headers.set(name, value);
+    }
+    return fetch(new Request(capability.request, { headers, redirect: "error" }));
+  }
+
+  async #authorizeProcess(request: ProcessCapabilityRequest): Promise<boolean> {
+    if (!request.connectionId || !isAbsolute(request.command)) return false;
+    const commandInfo = await lstat(request.command).catch(() => undefined);
+    if (!commandInfo?.isFile() || commandInfo.isSymbolicLink()) return false;
+    const command = await realpath(request.command).catch(() => undefined);
+    if (!command || (process.platform === "win32"
+      ? command.toLocaleLowerCase() !== resolve(request.command).toLocaleLowerCase()
+      : command !== resolve(request.command))) return false;
+    const allowed = this.#options.allowProcessCommands?.some((candidate) => process.platform === "win32"
+      ? candidate.toLocaleLowerCase() === command.toLocaleLowerCase() : candidate === command);
+    if (!allowed) return false;
+    const profile = await this.connectionManager.require(request.connectionId);
+    if (profile.kind !== "local-runtime" || typeof profile.config.command !== "string") return false;
+    const configured = await realpath(profile.config.command).catch(() => undefined);
+    return configured !== undefined && (process.platform === "win32"
+      ? configured.toLocaleLowerCase() === command.toLocaleLowerCase() : configured === command);
+  }
+
+  async #executeModule(request: ModuleExecutionRequest): Promise<unknown> {
+    if (this.#options.allowModuleExecution !== true) {
+      throw new Error(`TypeScript Tool '${request.toolId}' requires reviewed module execution permission`);
+    }
+    const specifier = isAbsolute(request.resolvedModule)
+      ? pathToFileURL(request.resolvedModule).href
+      : await moduleUrl(request.resolvedModule, this.#projectDirectory, "TOOL_MODULE_UNTRUSTED");
+    const loaded = await importModule(specifier);
+    const candidate = request.exportName === "default" ? loaded.default : loaded[request.exportName];
+    if (typeof candidate !== "function") {
+      throw new Error(`TypeScript Tool '${request.toolId}' export '${request.exportName}' is not a function`);
+    }
+    return candidate(request.input, request.context) as unknown;
+  }
+
+  async #webSearch(request: WebSearchRequest): Promise<unknown> {
+    if (!request.connectionId) throw new Error("Web Search requires a Search Service Connection");
+    const profile = await this.#assertToolConnection(["tool-service"], request.connectionId);
+    if (!profile) throw new Error("Web Search Connection is unavailable");
+    return executeWebSearchConnection(this.connectionManager, profile, request);
+  }
+
+  async requestToolApproval(
+    request: ToolApprovalRequest,
+    context: ServiceExecutionContext,
+  ): Promise<ToolApprovalDecision> {
+    if (await this.#matchesPreapprovedTool(request.tool)) {
+      return { approved: true, source: "user", reason: `Tool '${request.tool.id}' was pre-approved` };
+    }
+    if (this.#options.requestToolApproval) return this.#options.requestToolApproval(request, context);
+    return {
+      approved: false,
+      source: "policy",
+      reason: `Tool '${request.tool.id}' requires explicit approval`,
+    };
+  }
+
+  async #matchesPreapprovedTool(binding: ToolBinding): Promise<boolean> {
+    if (!this.#options.approvedToolIds?.includes(binding.id)) return false;
+    if (!binding.connectionId) return true;
+    const profile = await this.connectionManager.require(binding.connectionId);
+    if (profile.kind === "mcp") {
+      const action = binding.action;
+      return typeof action === "string"
+        && profile.tools?.some((tool) => tool.name === action) === true
+        && binding.id === mcpToolApprovalId(profile.id, action);
+    }
+    if (BUILTIN_TOOL_MANIFESTS.some((tool) => tool.id === binding.id)) return true;
+    try {
+      if (await this.toolStore.get(binding.id)) return true;
+    } catch (error) {
+      if (!(error instanceof ToolStoreError && error.code === "TOOL_MANIFEST_NOT_FOUND")) throw error;
+    }
+    return true;
   }
 
   async loadContext(
@@ -596,42 +1041,82 @@ export class NodeRuntimeServices implements RuntimeServices {
   ): Promise<ServiceResult> {
     const args = asRecord(input);
     if (!args) throw new Error("MCP Tool arguments must be an object");
-    const pending = this.#connection(config, context);
-    const connection = await pending;
-    const timeout = typeof config.timeoutMs === "number" ? config.timeoutMs : 30_000;
-    const invoke = () => connection.client.callTool(
-      { name: connection.tool.name, arguments: args },
-      {
-        signal: context.signal,
-        timeout,
-        maxTotalTimeout: timeout,
-        toolDefinition: connection.tool,
-      },
-    );
-    let result: Awaited<ReturnType<typeof invoke>>;
+    const connectionId = typeof config.connectionId === "string" ? config.connectionId : undefined;
+    // Saved Connection lifecycle mutations must take effect on the next call; do not pool those sessions.
+    const ephemeral = connectionId !== undefined;
+    const pending = ephemeral ? this.#connect(config, context) : this.#connection(config, context);
+    let connection: McpConnection;
     try {
-      result = await invoke();
+      connection = await pending;
     } catch (error) {
-      await this.#evictConnection(context.nodeId, pending, connection);
+      if (connectionId) throw await this.connectionManager.redactSensitiveError(connectionId, error);
       throw error;
     }
-    if (result.isError === true) {
-      throw new Error(`MCP tool '${connection.tool.name}' returned an error result`);
+    try {
+      const toolName = config.tool;
+      if (typeof toolName !== "string" || !toolName) throw new Error("MCP tool name is invalid");
+      let tool = connection.tools.get(toolName);
+      if (!tool) {
+        let listed: Awaited<ReturnType<typeof connection.client.listTools>>;
+        try {
+          listed = await connection.client.listTools(undefined, {
+            signal: context.signal,
+            timeout: typeof config.timeoutMs === "number" ? config.timeoutMs : 30_000,
+            maxTotalTimeout: typeof config.timeoutMs === "number" ? config.timeoutMs : 30_000,
+            cacheMode: "refresh",
+          });
+        } catch (error) {
+          if (connectionId) throw await this.connectionManager.redactSensitiveError(connectionId, error);
+          throw error;
+        }
+        connection.tools.clear();
+        for (const candidate of listed.tools) connection.tools.set(candidate.name, candidate);
+        tool = connection.tools.get(toolName);
+      }
+      if (!tool) throw new Error(`MCP server does not expose configured tool '${toolName}'`);
+      const timeout = typeof config.timeoutMs === "number" ? config.timeoutMs : 30_000;
+      const invoke = () => connection.client.callTool(
+        { name: tool.name, arguments: args },
+        {
+          signal: context.signal,
+          timeout,
+          maxTotalTimeout: timeout,
+          toolDefinition: tool,
+        },
+      );
+      let result: Awaited<ReturnType<typeof invoke>>;
+      try {
+        result = await invoke();
+      } catch (error) {
+        if (!ephemeral) await this.#evictConnection(`node:${context.nodeId}`, pending, connection);
+        if (connectionId) throw await this.connectionManager.redactSensitiveError(connectionId, error);
+        throw error;
+      }
+      if (result.isError === true) {
+        throw new Error(`MCP tool '${tool.name}' returned an error result`);
+      }
+      const rawValue = result.structuredContent !== undefined ? result.structuredContent : result.content;
+      const value = connectionId
+        ? await this.connectionManager.redactSensitiveOutput(connectionId, rawValue)
+        : rawValue;
+      return {
+        value,
+        metadata: {
+          transport: connection.transportType,
+          tool: tool.name,
+          protocol: connection.client.getNegotiatedProtocolVersion() ?? "unknown",
+          isError: false,
+        },
+      };
+    } finally {
+      if (ephemeral) await this.#closeConnection(connection);
     }
-    return {
-      value: result.structuredContent !== undefined ? result.structuredContent : result.content,
-      metadata: {
-        transport: config.transport,
-        tool: connection.tool.name,
-        protocol: connection.client.getNegotiatedProtocolVersion() ?? "unknown",
-        isError: false,
-      },
-    };
   }
 
   async close(): Promise<void> {
     const settled = await Promise.allSettled(this.#connections.values());
     this.#connections.clear();
+    this.#connectionSecrets.clear();
     await Promise.allSettled(settled.flatMap((result) => {
       if (result.status === "rejected") return [];
       return [this.#closeConnection(result.value)];
@@ -639,16 +1124,20 @@ export class NodeRuntimeServices implements RuntimeServices {
   }
 
   async #evictConnection(
-    nodeId: string,
+    connectionKey: string,
     pending: Promise<McpConnection>,
     connection: McpConnection,
   ): Promise<void> {
-    if (this.#connections.get(nodeId) !== pending) return;
-    this.#connections.delete(nodeId);
+    if (this.#connections.get(connectionKey) !== pending) return;
+    this.#connections.delete(connectionKey);
     await this.#closeConnection(connection);
   }
 
-  async #closeConnection({ client, transport }: McpConnection): Promise<void> {
+  async #closeConnection({ client, transport, close }: McpConnection): Promise<void> {
+    if (close) {
+      await close();
+      return;
+    }
     await Promise.allSettled([
       ...(transport instanceof StreamableHTTPClientTransport && transport.sessionId
         ? [Promise.resolve().then(() => transport.terminateSession())]
@@ -661,12 +1150,15 @@ export class NodeRuntimeServices implements RuntimeServices {
     config: Readonly<Record<string, unknown>>,
     context: ServiceExecutionContext,
   ): Promise<McpConnection> {
-    const existing = this.#connections.get(context.nodeId);
+    const key = typeof config.connectionId === "string"
+      ? `connection:${config.connectionId}`
+      : `node:${context.nodeId}`;
+    const existing = this.#connections.get(key);
     if (existing) return existing;
     const pending = this.#connect(config, context);
-    this.#connections.set(context.nodeId, pending);
+    this.#connections.set(key, pending);
     void pending.catch(() => {
-      if (this.#connections.get(context.nodeId) === pending) this.#connections.delete(context.nodeId);
+      if (this.#connections.get(key) === pending) this.#connections.delete(key);
     });
     return pending;
   }
@@ -675,95 +1167,136 @@ export class NodeRuntimeServices implements RuntimeServices {
     config: Readonly<Record<string, unknown>>,
     context: ServiceExecutionContext,
   ): Promise<McpConnection> {
-    const root = await this.#root;
-    const transportType = config.transport;
     const toolName = config.tool;
-    if ((transportType !== "stdio" && transportType !== "http") || typeof toolName !== "string") {
-      throw new Error("MCP transport or tool is invalid");
+    if (typeof toolName !== "string" || !toolName) throw new Error("MCP tool is invalid");
+    if (typeof config.connectionId === "string") {
+      const profile = await this.connectionManager.require(config.connectionId, "mcp");
+      const resolved = await this.resolveConnection(profile.id, context);
+      const references = asRecord(asRecord(resolved.value)?.credentialReferences);
+      if (references) {
+        for (const reference of Object.values(references)) {
+          if (typeof reference === "string") context.resolveSecret(reference);
+        }
+      }
+      let tools = new Map<string, Tool>();
+      const handle: McpConnectionHandle = await openMcpConnection(
+        this.connectionManager,
+        profile,
+        {
+          signal: context.signal,
+          ...(typeof config.timeoutMs === "number" ? { timeoutMs: config.timeoutMs } : {}),
+          ...(this.#options.allowProcessCommands ? { allowProcessCommands: this.#options.allowProcessCommands } : {}),
+          ...(profile.config.transport === "http" && typeof profile.config.url === "string"
+            ? { allowNetworkHosts: this.#options.allowNetworkHosts === true ? true : [
+              ...(this.#options.allowNetworkHosts ?? []), new URL(profile.config.url).host,
+            ] }
+            : this.#options.allowNetworkHosts !== undefined ? { allowNetworkHosts: this.#options.allowNetworkHosts } : {}),
+        },
+        async (changed) => {
+          await this.connectionManager.storeDiscoveredTools(profile.id, changed);
+          tools.clear();
+          for (const candidate of changed) tools.set(candidate.name, candidate as Tool);
+        },
+      );
+      tools = new Map(handle.tools.map((tool) => [tool.name, tool]));
+      if (!tools.has(toolName)) {
+        await handle.close();
+        throw new Error(`MCP server does not expose configured tool '${toolName}'`);
+      }
+      return {
+        client: handle.client,
+        transport: handle.transport,
+        tools,
+        transportType: profile.config.transport as "stdio" | "http",
+        close: handle.close,
+      };
     }
-    const timeout = typeof config.timeoutMs === "number" ? config.timeoutMs : 30_000;
+    const timeout = typeof config.timeoutMs === "number" && Number.isInteger(config.timeoutMs)
+      && config.timeoutMs >= 1 && config.timeoutMs <= 600_000 ? config.timeoutMs : 30_000;
+    const transportType = config.transport;
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
     if (transportType === "stdio") {
-      if (typeof config.command !== "string" || config.command.length === 0) {
-        throw new Error("MCP stdio requires config.command");
-      }
-      if (!this.#options.allowProcessCommands?.includes(config.command)) {
-        throw new Error(`MCP stdio command '${config.command}' is not explicitly allowed`);
-      }
-      if (config.args !== undefined
-        && (!Array.isArray(config.args) || !config.args.every((item) => typeof item === "string"))) {
-        throw new Error("MCP stdio args must be strings");
+      const requested = config.command;
+      if (typeof requested !== "string" || !requested) throw new Error("Raw MCP stdio command is invalid");
+      const nodeAlias = /^(?:node|node\.exe)$/i.test(requested);
+      const executable = await canonicalExecutable(nodeAlias ? await realpath(process.execPath) : requested);
+      const allowed = this.#options.allowProcessCommands?.some((candidate) => {
+        const left = process.platform === "win32" ? candidate.toLocaleLowerCase() : candidate;
+        const configured = process.platform === "win32" ? requested.toLocaleLowerCase() : requested;
+        const canonical = process.platform === "win32" ? executable.path.toLocaleLowerCase() : executable.path;
+        return left === configured || left === canonical;
+      });
+      if (!allowed) throw new Error(`MCP stdio command '${requested}' is not explicitly allowed`);
+      const args = config.args === undefined ? [] : config.args;
+      if (!Array.isArray(args) || args.length > 128
+        || args.some((argument) => typeof argument !== "string" || argument.length > 8_192)) {
+        throw new Error("Raw MCP stdio arguments are invalid");
       }
       transport = new StdioClientTransport({
-        command: config.command,
-        ...(Array.isArray(config.args) ? { args: config.args as string[] } : {}),
-        cwd: root,
+        command: executable.path,
+        args: args as string[],
+        cwd: this.#projectDirectory,
         env: getDefaultEnvironment(),
-        stderr: "pipe",
+        stderr: "ignore",
       });
-    } else {
-      if (typeof config.url !== "string") throw new Error("MCP HTTP requires config.url");
+    } else if (transportType === "http") {
+      if (typeof config.url !== "string") throw new Error("Raw MCP HTTP URL is invalid");
       const url = new URL(config.url);
       this.#assertNetworkUrl(url);
       const headers = new Headers();
-      if (config.headers !== undefined) {
-        const configuredHeaders = asRecord(config.headers);
-        if (!configuredHeaders) throw new Error("MCP HTTP headers must be an object");
-        for (const [name, raw] of Object.entries(configuredHeaders)) {
-          if (typeof raw !== "string") throw new Error(`MCP HTTP header '${name}' must be a string`);
-          if (!/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(raw)) {
-            throw new Error(`MCP HTTP header '${name}' must use an env:NAME secret reference`);
-          }
-          const value = context.resolveSecret(raw);
-          if (value === undefined) throw new Error(`MCP HTTP secret reference '${raw}' is unavailable`);
-          headers.set(name, value);
+      const configuredHeaders = asRecord(config.headers) ?? {};
+      if (Object.keys(configuredHeaders).length > 64) throw new Error("Raw MCP headers exceed the safe limit");
+      for (const [name, reference] of Object.entries(configuredHeaders)) {
+        if (/^(?::authority|host|proxy-.+|connection|keep-alive|te|trailer|transfer-encoding|upgrade|content-length)$/i.test(name)
+          || typeof reference !== "string" || !/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(reference)) {
+          throw new Error(`Raw MCP header '${name}' is invalid`);
         }
+        const value = context.resolveSecret(reference);
+        if (value === undefined) throw new Error(`Raw MCP credential '${reference}' is unavailable`);
+        headers.set(name, value);
       }
-      const guardedFetch: typeof fetch = async (request, init) => {
-        const requestUrl = new URL(request instanceof Request ? request.url : request.toString());
-        this.#assertNetworkUrl(requestUrl);
-        return fetch(request, { ...init, redirect: "error" });
-      };
       transport = new StreamableHTTPClientTransport(url, {
-        fetch: guardedFetch,
+        fetch: guardedFetch(this.#options.allowNetworkHosts, { timeoutMs: timeout, maxStreamBytes: 2 * 1_048_576 }),
         requestInit: { headers, redirect: "error" },
         onInsufficientScope: "throw",
       });
+    } else {
+      throw new Error("Raw MCP transport must be stdio or http");
     }
     const client = new Client(
       { name: "harnest", version: "0.2.0" },
       { versionNegotiation: protocolMode(config, transportType), listMaxPages: 16 },
     );
     try {
-      await client.connect(transport, {
-        signal: context.signal,
-        timeout,
-        maxTotalTimeout: timeout,
-      });
-      const listed = await client.listTools(undefined, {
-        signal: context.signal,
-        timeout,
-        maxTotalTimeout: timeout,
-      });
-      const tool = listed.tools.find((candidate) => candidate.name === toolName);
-      if (!tool) throw new Error(`MCP server does not expose configured tool '${toolName}'`);
-      return { client, transport, tool };
-    } catch (error) {
+      const requestOptions = { signal: context.signal, timeout, maxTotalTimeout: timeout };
+      await client.connect(transport, requestOptions);
+      const listed = await client.listTools(undefined, { ...requestOptions, cacheMode: "refresh" });
+      if (!listed.tools.some((tool) => tool.name === toolName)) {
+        throw new Error(`MCP server does not expose configured tool '${toolName}'`);
+      }
+      return {
+        client,
+        transport,
+        tools: new Map(listed.tools.map((tool) => [tool.name, tool])),
+        transportType,
+      };
+    } catch (cause) {
       await client.close().catch(() => undefined);
-      throw error;
+      throw cause;
     }
   }
 
   #assertNetworkUrl(url: URL): void {
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("MCP URL must use http or https");
+    const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+      throw new Error("HTTP URL must use HTTPS, or HTTP on a literal loopback address");
     }
-    if (url.username || url.password) throw new Error("MCP URL must not contain credentials");
+    if (url.username || url.password || url.hash) throw new Error("HTTP URL must not contain credentials or a fragment");
     const allowed = this.#options.allowNetworkHosts;
     const normalized = url.host.toLocaleLowerCase();
     const hosts = Array.isArray(allowed) ? allowed.map((host) => host.toLocaleLowerCase()) : [];
     if (allowed !== true && !hosts.includes(normalized)) {
-      throw new Error(`MCP HTTP host '${url.host}' is not explicitly allowed`);
+      throw new Error(`HTTP host '${url.host}' is not explicitly allowed`);
     }
   }
 }
@@ -844,6 +1377,91 @@ function storedEvent(event: RunEvent): StoredRunEvent {
 }
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const MAX_RUN_FILE_BYTES = 8 * 1_048_576;
+const MAX_RUN_LINE_BYTES = 65_536;
+const MAX_RUN_EVENTS = 10_000;
+
+async function runFile(directory: string, runId: string): Promise<{
+  readonly path: string;
+  readonly size: number;
+  readonly modified: number;
+}> {
+  const path = resolve(directory, `${runId}.ndjson`);
+  if (!isInside(directory, path)) throw new Error("Run trace resolves outside Harnest storage");
+  const lexicalInfo = await lstat(path);
+  if (!lexicalInfo.isFile() || lexicalInfo.isSymbolicLink() || lexicalInfo.nlink !== 1) {
+    throw new Error("Run trace must be a regular, unlinked file");
+  }
+  const canonical = await realpath(path);
+  if (!isInside(directory, canonical)) throw new Error("Run trace resolves outside Harnest storage");
+  const info = await stat(canonical);
+  if (!info.isFile()) throw new Error("Run trace must be a regular file");
+  return { path: canonical, size: info.size, modified: info.mtimeMs };
+}
+
+function parseRunEvents(runId: string, text: string): StoredRunEvent[] {
+  const events: StoredRunEvent[] = [];
+  for (const [index, line] of text.split(/\r?\n/u).entries()) {
+    if (!line) continue;
+    try {
+      if (byteLength(line) > MAX_RUN_LINE_BYTES) throw new Error("event exceeds the 64 KiB line limit");
+      if (events.length >= MAX_RUN_EVENTS) throw new Error("trace exceeds the 10,000 event limit");
+      const event = JSON.parse(line) as unknown;
+      const record = asRecord(event);
+      if (!record
+        || typeof record.type !== "string"
+        || record.runId !== runId
+        || typeof record.timestamp !== "string") {
+        throw new Error("event shape is invalid");
+      }
+      events.push(record as StoredRunEvent);
+    } catch (error) {
+      throw new Error(
+        `Invalid run trace at line ${index + 1}: ${error instanceof Error ? error.message : "invalid JSON"}`,
+        { cause: error },
+      );
+    }
+  }
+  return events;
+}
+
+async function openRunFileForAppend(directory: string, runId: string): Promise<FileHandle> {
+  const path = resolve(directory, `${runId}.ndjson`);
+  if (!isInside(directory, path)) throw new Error("Run trace resolves outside Harnest storage");
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+      throw new Error("Run trace must be a regular, unlinked file");
+    }
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  }
+
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(
+    path,
+    fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | noFollow,
+    0o600,
+  );
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const lexical = await lstat(path, { bigint: true });
+    if (!opened.isFile() || opened.nlink !== 1n || opened.ino === 0n
+      || !lexical.isFile() || lexical.isSymbolicLink() || lexical.nlink !== 1n) {
+      throw new Error("Run trace must be a verifiable regular, unlinked file");
+    }
+    const canonical = await realpath(path);
+    if (!isInside(directory, canonical)) throw new Error("Run trace resolves outside Harnest storage");
+    const resolved = await stat(canonical, { bigint: true });
+    if (!resolved.isFile() || resolved.ino !== opened.ino) {
+      throw new Error("Run trace changed while it was being opened");
+    }
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
 
 export class FileRunStore {
   readonly #root: Promise<string>;
@@ -868,28 +1486,11 @@ export class FileRunStore {
     if (!RUN_ID.test(runId)) throw new Error("Run id is invalid");
     await this.#pending.get(runId);
     const directory = await storageDirectory(await this.#root, "runs");
-    const text = await readFile(join(directory, `${runId}.ndjson`), "utf8");
-    const events: StoredRunEvent[] = [];
-    for (const [index, line] of text.split(/\r?\n/u).entries()) {
-      if (!line) continue;
-      try {
-        const event = JSON.parse(line) as unknown;
-        const record = asRecord(event);
-        if (!record
-          || typeof record.type !== "string"
-          || typeof record.runId !== "string"
-          || typeof record.timestamp !== "string") {
-          throw new Error("event shape is invalid");
-        }
-        events.push(record as StoredRunEvent);
-      } catch (error) {
-        throw new Error(
-          `Invalid run trace at line ${index + 1}: ${error instanceof Error ? error.message : "invalid JSON"}`,
-          { cause: error },
-        );
-      }
-    }
-    return events;
+    const file = await runFile(directory, runId);
+    if (file.size > MAX_RUN_FILE_BYTES) throw new Error("Run trace exceeds the 8 MiB safety limit");
+    const selected = await readBounded(file.path, MAX_RUN_FILE_BYTES);
+    if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
+    return parseRunEvents(runId, selected.text);
   }
 
   async list(limit = 50): Promise<RunSummary[]> {
@@ -899,15 +1500,26 @@ export class FileRunStore {
       .filter((entry) => entry.isFile() && entry.name.endsWith(".ndjson"))
       .map((entry) => entry.name.slice(0, -7))
       .filter((runId) => RUN_ID.test(runId));
-    const ordered = await Promise.all(files.map(async (runId) => ({
-      runId,
-      modified: (await stat(join(directory, `${runId}.ndjson`))).mtimeMs,
-    })));
+    const ordered: { runId: string; modified: number }[] = [];
+    for (const runId of files) {
+      try {
+        const file = await runFile(directory, runId);
+        if (file.size <= MAX_RUN_FILE_BYTES) ordered.push({ runId, modified: file.modified });
+      } catch {
+        // A concurrently removed, linked, or invalid trace is not listable.
+      }
+    }
     ordered.sort((left, right) => right.modified - left.modified);
     // ponytail: scanning the newest NDJSON files is enough until projects reach thousands of local runs.
     const summaries: RunSummary[] = [];
-    for (const { runId } of ordered.slice(0, boundedLimit)) {
-      const events = await this.read(runId);
+    for (const { runId } of ordered) {
+      if (summaries.length >= boundedLimit) break;
+      let events: StoredRunEvent[];
+      try {
+        events = await this.read(runId);
+      } catch {
+        continue;
+      }
       const first = events[0];
       const last = events.at(-1);
       const ended = [...events].reverse().find((event) => event.type === "run-end");
@@ -926,11 +1538,36 @@ export class FileRunStore {
   }
 
   async #append(event: RunEvent): Promise<void> {
+    const serialized = JSON.stringify(storedEvent(event));
+    if (byteLength(serialized) > MAX_RUN_LINE_BYTES) {
+      throw new Error("Run trace event exceeds the 64 KiB line limit");
+    }
+    const line = Buffer.from(`${serialized}\n`, "utf8");
     const directory = await storageDirectory(await this.#root, "runs");
-    await appendFile(
-      join(directory, `${event.runId}.ndjson`),
-      `${JSON.stringify(storedEvent(event))}\n`,
-      { encoding: "utf8", mode: 0o600 },
-    );
+    const handle = await openRunFileForAppend(directory, event.runId);
+    try {
+      const opened = await handle.stat({ bigint: true });
+      if (opened.size + BigInt(line.byteLength) > BigInt(MAX_RUN_FILE_BYTES)) {
+        throw new Error("Run trace exceeds the 8 MiB safety limit");
+      }
+      const selected = await readBoundedHandle(handle, MAX_RUN_FILE_BYTES);
+      if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
+      if (selected.text.length > 0 && !selected.text.endsWith("\n")) {
+        throw new Error("Run trace is incomplete and cannot be appended");
+      }
+      const events = parseRunEvents(event.runId, selected.text);
+      if (events.length >= MAX_RUN_EVENTS) throw new Error("Run trace exceeds the 10,000 event limit");
+      const beforeWrite = await handle.stat({ bigint: true });
+      if (beforeWrite.size !== opened.size) throw new Error("Run trace changed while it was being appended");
+      const { bytesWritten } = await handle.write(line, 0, line.byteLength, null);
+      if (bytesWritten !== line.byteLength) throw new Error("Run trace append was incomplete");
+      const afterWrite = await handle.stat({ bigint: true });
+      if (afterWrite.size !== beforeWrite.size + BigInt(line.byteLength)
+        || afterWrite.size > BigInt(MAX_RUN_FILE_BYTES)) {
+        throw new Error("Run trace changed while it was being appended");
+      }
+    } finally {
+      await handle.close();
+    }
   }
 }

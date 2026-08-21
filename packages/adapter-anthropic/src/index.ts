@@ -1,4 +1,4 @@
-import { AdapterError, parseSse } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
 import type {
   AdapterContext,
   ModelAdapter,
@@ -9,6 +9,8 @@ import type {
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com/";
 const DEFAULT_API_KEY = "env:ANTHROPIC_API_KEY";
+const MAX_PROVIDER_TOOL_CALLS = 128;
+const MAX_TOOL_ARGUMENT_BYTES = 1_048_576;
 
 export interface AnthropicAdapterOptions {
   readonly id?: string;
@@ -50,12 +52,31 @@ function errorDetails(value: unknown): { message?: string; code?: string } {
   };
 }
 
+function assertToolArgumentSize(value: unknown, adapterId: string): void {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (cause) {
+    throw new AdapterError("Anthropic returned non-serializable Tool arguments", {
+      adapterId,
+      code: "invalid_tool_call",
+      cause,
+    });
+  }
+  if (serialized !== undefined && new TextEncoder().encode(serialized).byteLength > MAX_TOOL_ARGUMENT_BYTES) {
+    throw new AdapterError(`Anthropic Tool arguments exceed the ${MAX_TOOL_ARGUMENT_BYTES}-byte limit`, {
+      adapterId,
+      code: "provider_response_limit",
+    });
+  }
+}
+
 async function throwHttpError(response: Response, adapterId: string): Promise<never> {
   const requestId = response.headers.get("request-id") ?? undefined;
   let message = `${adapterId} request failed with HTTP ${response.status}`;
   let code = `http_${response.status}`;
   try {
-    const details = errorDetails(JSON.parse(await response.text()) as unknown);
+    const details = errorDetails(JSON.parse(await readBoundedResponseText(response)) as unknown);
     message = details.message ?? message;
     code = details.code ?? code;
   } catch {
@@ -90,13 +111,43 @@ function usage(inputTokens: number | undefined, outputTokens: number | undefined
   };
 }
 
+function providerMessages(request: ModelRequest): Array<{ role: "user" | "assistant"; content: unknown }> {
+  const nonSystem = request.messages.filter((message) => message.role !== "system");
+  if (!nonSystem.some((message) => message.role === "tool" || message.toolCalls?.length)) {
+    return nonSystem.map((message) => ({
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: message.content,
+    }));
+  }
+  const result: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
+  for (const message of request.messages) {
+    if (message.role === "system") continue;
+    const role = message.role === "assistant" ? "assistant" : "user";
+    const content = message.role === "tool"
+      ? [{ type: "tool_result", tool_use_id: message.toolCallId, content: message.content }]
+      : [
+          ...(message.content ? [{ type: "text", text: message.content }] : []),
+          ...(message.role === "assistant" ? (message.toolCalls ?? []).map((call) => ({
+            type: "tool_use",
+            id: call.id,
+            name: call.name,
+            input: call.input,
+          })) : []),
+        ];
+    const previous = result.at(-1);
+    if (previous?.role === role) previous.content.push(...content);
+    else result.push({ role, content });
+  }
+  return result;
+}
+
 export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): ModelAdapter {
   const id = options.id ?? "anthropic";
   const credential = options.apiKey ?? DEFAULT_API_KEY;
 
   return {
     id,
-    capabilities: { streaming: true, json: false, cancellation: true },
+    capabilities: { streaming: true, json: false, cancellation: true, tools: true },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
@@ -104,14 +155,19 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
         .filter((message) => message.role === "system")
         .map((message) => message.content)
         .join("\n\n");
-      const messages = request.messages
-        .filter((message) => message.role !== "system")
-        .map(({ role, content }) => ({ role, content }));
+      const messages = providerMessages(request);
       const body = {
         model: request.model,
         max_tokens: request.maxTokens ?? 1024,
         messages,
         stream: true,
+        ...(request.tools?.length ? {
+          tools: request.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.inputSchema,
+          })),
+        } : {}),
         ...(system.length === 0 ? {} : { system }),
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       };
@@ -142,6 +198,13 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
       let model = request.model;
       let inputTokens: number | undefined;
       let outputTokens: number | undefined;
+      const toolCalls = new Map<number, {
+        id: string;
+        name: string;
+        initial: unknown;
+        partial: string;
+        partialBytes: number;
+      }>();
       for await (const event of parseSse(requireBody(response, id))) {
         let payload: unknown;
         try {
@@ -168,10 +231,40 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
           const startUsage = asRecord(message?.usage);
           if (typeof message?.model === "string") model = message.model;
           if (typeof startUsage?.input_tokens === "number") inputTokens = startUsage.input_tokens;
+        } else if (type === "content_block_start") {
+          const block = asRecord(root?.content_block);
+          if (block?.type === "tool_use" && typeof root?.index === "number"
+            && typeof block.id === "string" && typeof block.name === "string") {
+            if (!toolCalls.has(root.index) && toolCalls.size >= MAX_PROVIDER_TOOL_CALLS) throw new AdapterError(
+              `Anthropic exceeded the ${MAX_PROVIDER_TOOL_CALLS} Tool-call limit`,
+              { adapterId: id, code: "provider_response_limit" },
+            );
+            assertToolArgumentSize(block.input, id);
+            toolCalls.set(root.index, {
+              id: block.id,
+              name: block.name,
+              initial: block.input,
+              partial: "",
+              partialBytes: 0,
+            });
+          }
         } else if (type === "content_block_delta") {
           const delta = asRecord(root?.delta);
           if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
             yield { type: "text-delta", text: delta.text };
+          } else if (delta?.type === "input_json_delta" && typeof delta.partial_json === "string"
+            && typeof root?.index === "number") {
+            const call = toolCalls.get(root.index);
+            if (!call) throw new AdapterError("Anthropic returned Tool arguments before Tool metadata", {
+              adapterId: id,
+              code: "invalid_tool_call",
+            });
+            call.partialBytes += new TextEncoder().encode(delta.partial_json).byteLength;
+            if (call.partialBytes > MAX_TOOL_ARGUMENT_BYTES) throw new AdapterError(
+              `Anthropic Tool arguments exceed the ${MAX_TOOL_ARGUMENT_BYTES}-byte limit`,
+              { adapterId: id, code: "provider_response_limit" },
+            );
+            call.partial += delta.partial_json;
           }
         } else if (type === "message_delta") {
           const delta = asRecord(root?.delta);
@@ -189,6 +282,22 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
         adapterId: id,
         code: "invalid_stream",
       });
+      for (const call of toolCalls.values()) {
+        let input: unknown = call.initial ?? {};
+        if (call.partial) {
+          try {
+            input = JSON.parse(call.partial) as unknown;
+            assertToolArgumentSize(input, id);
+          } catch (cause) {
+            throw new AdapterError("Anthropic returned invalid Tool arguments", {
+              adapterId: id,
+              code: "invalid_tool_call",
+              cause,
+            });
+          }
+        }
+        yield { type: "tool-call", call: { id: call.id, name: call.name, input } };
+      }
       yield { ...reason, model };
     },
   };

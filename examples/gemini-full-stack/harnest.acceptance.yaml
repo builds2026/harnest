@@ -1,0 +1,340 @@
+components:
+  - id: reviewLoop
+    type: loop
+    config:
+      subgraph: reviewCycle
+      maxIterations: 1
+      timeoutMs: 120000
+      until:
+        path: /evaluation/passed
+        op: truthy
+  - id: jsonRoute
+    type: router
+    config:
+      condition:
+        op: truthy
+  - id: output
+    type: output
+    config:
+      format: json
+      schema:
+        type: object
+        properties:
+          status:
+            type: string
+            enum:
+              - ready
+              - needs-attention
+          summary:
+            type: string
+            minLength: 1
+          evidence:
+            type: array
+            minItems: 1
+            items:
+              type: string
+              minLength: 1
+          nextStep:
+            type: string
+            minLength: 1
+          toolUsed:
+            type: boolean
+        required:
+          - status
+          - summary
+          - evidence
+          - nextStep
+          - toolUsed
+        additionalProperties: false
+connections:
+  - from:
+      component: reviewLoop
+      port: value
+    to:
+      component: jsonRoute
+      port: value
+    select: /answer
+  - from:
+      component: jsonRoute
+      port: "true"
+    to:
+      component: output
+      port: value
+entrypoint: output
+version: "0.2"
+subgraphs:
+  reviewCycle:
+    components:
+      - id: knowledge
+        type: context
+        config:
+          source: directory
+          path: knowledge
+          pattern: "**/*.md"
+          topK: 2
+          maxBytes: 24576
+      - id: reviewMemory
+        type: memory
+        config:
+          key: geminiFullStackReview
+          operation: read
+          initial:
+            language: ko
+            goal: Use grounded evidence and preserve an auditable trace.
+      - id: toolFixture
+        type: memory
+        config:
+          key: geminiFullStackToolFixture
+          operation: read
+          initial:
+            candidate: Harnest trace acceptance review
+            requiredTerms:
+              - Harnest
+              - trace
+      - id: standaloneCheck
+        type: local-tool
+        config:
+          tool: demo.fixture-check
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          apiKey: env:GEMINI_API_KEY
+          temperature: 0.2
+          maxTokens: 1200
+      - id: prompt
+        type: prompt
+        config:
+          template: |
+            You are conducting a Korean release-readiness review for Harnest.
+            Use only the connected Context, Memory, Skill, and Tool results as evidence.
+            Before answering, call the connected function named demo_release-check exactly once.
+            Pass the user's request as candidate and use ["Harnest", "trace"] as requiredTerms.
+            The standalone connected result is only a baseline; do not treat it as the required function call.
+            Return only one JSON object with exactly these fields:
+            {"status":"ready|needs-attention","summary":"...","evidence":["..."],"nextStep":"...","toolUsed":true}
+            Do not add Markdown or fields outside this schema.
+      - id: releaseCheck
+        type: tool
+        config:
+          tool: demo.release-check
+      - id: reviewSkill
+        type: skill
+        config:
+          skill: traceable-review
+      - id: agent
+        type: agent
+        config:
+          system: Ground claims in the supplied resources. Keep the answer concise and Korean.
+          maxTurns: 4
+          maxToolCalls: 2
+          toolTimeoutMs: 5000
+          toolError: model
+          allowTools:
+            - demo.release-check
+      - id: schemaCheck
+        type: evaluator
+        config:
+          type: output-schema
+          schema:
+            type: object
+            properties:
+              status:
+                type: string
+                enum:
+                  - ready
+                  - needs-attention
+              summary:
+                type: string
+                minLength: 1
+              evidence:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+                  minLength: 1
+              nextStep:
+                type: string
+                minLength: 1
+              toolUsed:
+                type: boolean
+            required:
+              - status
+              - summary
+              - evidence
+              - nextStep
+              - toolUsed
+            additionalProperties: false
+      - id: jsonParse
+        type: output
+        config:
+          format: json
+      - id: result
+        type: join
+        config:
+          mode: object
+          keys:
+            - answer
+            - evaluation
+    connections:
+      - from:
+          component: knowledge
+          port: context
+        to:
+          component: agent
+          port: context
+      - from:
+          component: reviewMemory
+          port: memory
+        to:
+          component: agent
+          port: memory
+      - from:
+          component: toolFixture
+          port: memory
+        to:
+          component: standaloneCheck
+          port: arguments
+      - from:
+          component: standaloneCheck
+          port: result
+        to:
+          component: agent
+          port: toolResults
+      - from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - from:
+          component: releaseCheck
+          port: tool
+        to:
+          component: agent
+          port: tools
+      - from:
+          component: reviewSkill
+          port: skill
+        to:
+          component: agent
+          port: skills
+      - from:
+          component: agent
+          port: response
+        to:
+          component: jsonParse
+          port: value
+      - from:
+          component: jsonParse
+          port: value
+        to:
+          component: schemaCheck
+          port: value
+      - from:
+          component: jsonParse
+          port: value
+        to:
+          component: result
+          port: values
+      - from:
+          component: schemaCheck
+          port: evaluation
+        to:
+          component: result
+          port: values
+    entrypoint: result
+runtime:
+  timeoutMs: 120000
+tests:
+  - id: gemini-full-stack
+    input: "Harnest trace release review: verify the acceptance checklist and give the next test step."
+    assertions:
+      - type: output-schema
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            summary:
+              type: string
+            evidence:
+              type: array
+              minItems: 1
+            nextStep:
+              type: string
+            toolUsed:
+              type: boolean
+          required:
+            - status
+            - summary
+            - evidence
+            - nextStep
+            - toolUsed
+          additionalProperties: false
+      - type: tool-called
+        tool: demo.release-check
+        minCalls: 1
+        maxCalls: 2
+      - type: iterations
+        min: 1
+        max: 1
+      - type: latency
+        maxMs: 115000
+studio:
+  positions:
+    reviewLoop:
+      x: 40
+      y: 180
+    jsonRoute:
+      x: 370
+      y: 180
+    output:
+      x: 670
+      y: 180
+  subgraphs:
+    reviewCycle:
+      positions:
+        knowledge:
+          x: 40
+          y: 50
+        reviewMemory:
+          x: 40
+          y: 180
+        toolFixture:
+          x: 40
+          y: 310
+        standaloneCheck:
+          x: 300
+          y: 310
+        model:
+          x: 40
+          y: 460
+        prompt:
+          x: 40
+          y: 610
+        releaseCheck:
+          x: 300
+          y: 510
+        reviewSkill:
+          x: 300
+          y: 640
+        agent:
+          x: 640
+          y: 368
+        schemaCheck:
+          x: 1140
+          y: 300
+        jsonParse:
+          x: 880
+          y: 360
+        result:
+          x: 1420
+          y: 360

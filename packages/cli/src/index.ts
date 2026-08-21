@@ -3,7 +3,12 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
+import { anthropicAdapter } from "@harnest/adapter-anthropic";
+import { geminiAdapter } from "@harnest/adapter-gemini";
+import { ollamaAdapter } from "@harnest/adapter-local";
+import { openAIAdapter } from "@harnest/adapter-openai";
 import {
   AdapterRegistry,
   compileSpec,
@@ -14,6 +19,7 @@ import {
   validateSpec,
   type Diagnostic,
   type RunEndEvent,
+  type ToolApprovalRequest,
   type TokenUsage,
 } from "@harnest/core";
 import {
@@ -42,7 +48,12 @@ Runtime capabilities (denied by default):
   --context-root <path>         Restrict Context reads to a project-relative root (repeatable)
   --allow-process <command>     Allow one exact MCP stdio command (repeatable)
   --allow-network <host>        Allow one exact MCP HTTP host[:port] (repeatable)
+  --approve-tool <id>           Pre-approve one exact risky Tool id (repeatable)
+
+Risky Tools otherwise prompt once per call in a TTY and are denied in non-interactive runs.
 `;
+
+const shippedAdapters = [openAIAdapter, anthropicAdapter, geminiAdapter, ollamaAdapter] as const;
 
 function printDiagnostics(diagnostics: Diagnostic[]): void {
   for (const diagnostic of diagnostics) {
@@ -56,8 +67,9 @@ async function load(file: string, options: {
   checkEnvironment?: boolean;
   loadModules?: boolean;
   allowModules?: boolean;
+  nodeServices?: NodeRuntimeServiceOptions;
 } = {}) {
-  const { checkEnvironment = false, loadModules = true, allowModules = false } = options;
+  const { checkEnvironment = false, loadModules = true, allowModules = false, nodeServices = {} } = options;
   const absolute = resolve(file);
   const parsed = await loadSpecFile(absolute);
   if (!parsed.ok) {
@@ -68,51 +80,73 @@ async function load(file: string, options: {
   const adapters = new AdapterRegistry();
   const components = createBuiltinComponentRegistry();
   const tools = new ToolRegistry();
-  if (loadModules) {
-    const adapterResult = await loadAdapterModules(
-      parsed.spec,
-      adapters,
-      dirname(absolute),
-      ...(allowModules ? [{ allowModuleExecution: true as const }] : []),
-    );
-    const runtimeResult = await loadRuntimeModules(
-      parsed.spec,
-      { adapters, components, tools },
-      dirname(absolute),
-      ...(allowModules ? [{ allowModuleExecution: true as const }] : []),
-    );
-    const diagnostics = [...adapterResult.diagnostics, ...runtimeResult.diagnostics];
-    if (diagnostics.length > 0) {
-      printDiagnostics(diagnostics);
-      throw new Error("Runtime modules could not be loaded");
-    }
-  }
-
-  const validation = validateSpec(parsed.spec, {
-    ...(loadModules ? { registry: adapters, components, tools } : {}),
-    ...(checkEnvironment ? { env: process.env } : {}),
+  const services = new NodeRuntimeServices(dirname(absolute), {
+    ...nodeServices,
+    ...(allowModules ? { allowModuleExecution: true as const } : {}),
   });
-  if (!validation.ok) {
-    printDiagnostics(validation.diagnostics);
-    throw new Error("Spec is invalid");
+  try {
+    for (const definition of await services.toolDefinitions()) {
+      if (!tools.has(definition.id)) tools.register(definition);
+    }
+    if (loadModules) {
+      const adapterResult = await loadAdapterModules(
+        parsed.spec,
+        adapters,
+        dirname(absolute),
+        ...(allowModules ? [{ allowModuleExecution: true as const }] : []),
+      );
+      const runtimeResult = await loadRuntimeModules(
+        parsed.spec,
+        { adapters, components, tools },
+        dirname(absolute),
+        ...(allowModules ? [{ allowModuleExecution: true as const }] : []),
+      );
+      const diagnostics = [...adapterResult.diagnostics, ...runtimeResult.diagnostics];
+      if (diagnostics.length > 0) {
+        printDiagnostics(diagnostics);
+        throw new Error("Runtime modules could not be loaded");
+      }
+    }
+    for (const adapter of shippedAdapters) if (!adapters.has(adapter.id)) adapters.register(adapter);
+
+    const validation = validateSpec(parsed.spec, {
+      ...(loadModules ? { registry: adapters, components, tools } : {}),
+      ...(checkEnvironment ? { env: process.env } : {}),
+    });
+    const diagnostics = [...validation.diagnostics, ...await services.connectionDiagnostics(parsed.spec, tools)];
+    if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
+      printDiagnostics(diagnostics);
+      throw new Error("Spec is invalid");
+    }
+    printDiagnostics(diagnostics.filter((diagnostic) => diagnostic.severity === "warning"));
+    return { spec: parsed.spec, adapters, components, tools, services, absolute };
+  } catch (error) {
+    await services.close();
+    throw error;
   }
-  printDiagnostics(validation.diagnostics.filter((diagnostic) => diagnostic.severity === "warning"));
-  return { spec: parsed.spec, adapters, components, tools, absolute };
 }
 
 async function validate(file: string, allowModules: boolean): Promise<void> {
-  await load(file, { checkEnvironment: true, allowModules });
-  console.log(`Valid: ${resolve(file)}`);
+  const loaded = await load(file, { checkEnvironment: true, allowModules });
+  try {
+    console.log(`Valid: ${resolve(file)}`);
+  } finally {
+    await loaded.services.close();
+  }
 }
 
 async function inspect(file: string, allowModules: boolean): Promise<void> {
-  const { spec, adapters, components, tools } = await load(file, { allowModules });
-  const compiled = compileSpec(spec, { registry: adapters, components, tools });
-  if (!compiled.ok) {
-    printDiagnostics(compiled.diagnostics);
-    throw new Error("Spec could not be compiled");
+  const { spec, adapters, components, tools, services } = await load(file, { allowModules });
+  try {
+    const compiled = compileSpec(spec, { registry: adapters, components, tools });
+    if (!compiled.ok) {
+      printDiagnostics(compiled.diagnostics);
+      throw new Error("Spec could not be compiled");
+    }
+    console.log(JSON.stringify(compiled.plan, null, 2));
+  } finally {
+    await services.close();
   }
-  console.log(JSON.stringify(compiled.plan, null, 2));
 }
 
 function inputValue(raw: string): unknown {
@@ -133,6 +167,7 @@ interface CapabilityValues {
   "context-root"?: string[];
   "allow-process"?: string[];
   "allow-network"?: string[];
+  "approve-tool"?: string[];
 }
 
 const capabilityOptions = {
@@ -141,35 +176,85 @@ const capabilityOptions = {
   "context-root": { type: "string" as const, multiple: true },
   "allow-process": { type: "string" as const, multiple: true },
   "allow-network": { type: "string" as const, multiple: true },
+  "approve-tool": { type: "string" as const, multiple: true },
 };
 
+const TOOL_ID = /^[a-z][a-z0-9._-]{0,127}$/;
+
+function approvedToolIds(values: CapabilityValues): string[] {
+  const ids = [...new Set(values["approve-tool"] ?? [])];
+  const invalid = ids.find((id) => !TOOL_ID.test(id));
+  if (invalid) throw new Error(`--approve-tool requires an exact Tool id; received '${invalid}'`);
+  return ids;
+}
+
+function approvalInput(request: ToolApprovalRequest): string {
+  try {
+    return JSON.stringify(request.input, null, 2) ?? "undefined";
+  } catch {
+    return "[unserializable input]";
+  }
+}
+
 function serviceOptions(values: CapabilityValues): NodeRuntimeServiceOptions {
+  const approved = approvedToolIds(values);
+  const interactive = process.stdin.isTTY === true && process.stderr.isTTY === true;
   return {
+    ...(values["allow-modules"] ? { allowModuleExecution: true as const } : {}),
     ...(values["allow-files"] ? { allowFileSystem: true as const } : {}),
     ...(values["context-root"]?.length ? { allowedContextRoots: values["context-root"] } : {}),
     ...(values["allow-process"]?.length ? { allowProcessCommands: values["allow-process"] } : {}),
     ...(values["allow-network"]?.length ? { allowNetworkHosts: values["allow-network"] } : {}),
+    ...(approved.length ? { approvedToolIds: approved } : {}),
+    ...(interactive ? {
+      requestToolApproval: async (request, context) => {
+        process.stderr.write([
+          "\nTool approval requested",
+          `tool  ${request.tool.id}`,
+          ...(request.tool.connectionId ? [`connection  ${request.tool.connectionId}`] : []),
+          ...(request.tool.action ? [`action  ${request.tool.action}`] : []),
+          `risk  ${request.tool.risk ?? "external"}`,
+          `call  ${request.callId} · turn ${request.turn}`,
+          "input",
+          approvalInput(request),
+          "",
+        ].join("\n"));
+        const terminal = createInterface({ input: process.stdin, output: process.stderr });
+        try {
+          const answer = await terminal.question("Approve this call once? [y/N] ", { signal: context.signal });
+          const permitted = /^(?:y|yes)$/i.test(answer.trim());
+          return permitted
+            ? { approved: true, source: "user" }
+            : { approved: false, source: "user", reason: "Denied by the CLI operator" };
+        } catch (error) {
+          if (!context.signal.aborted) throw error;
+          return { approved: false, source: "policy", reason: "Run cancelled before approval" };
+        } finally {
+          terminal.close();
+        }
+      },
+    } : {}),
   };
 }
 
 async function run(file: string, rawInput: string, capabilities: CapabilityValues): Promise<void> {
-  const { spec, adapters, components, tools, absolute } = await load(file, {
+  const { spec, adapters, components, tools, services, absolute } = await load(file, {
     checkEnvironment: true,
     allowModules: capabilities["allow-modules"] ?? false,
+    nodeServices: serviceOptions(capabilities),
   });
   const project = dirname(absolute);
-  const services = new NodeRuntimeServices(project, serviceOptions(capabilities));
   const store = new FileRunStore(project);
-  const runtime = new HarnessRuntime(spec, adapters, {
-    env: process.env,
-    components,
-    tools,
-    services,
-    eventSink: store,
-  });
   let end: RunEndEvent | undefined;
   let streamedText = "";
   try {
+    const runtime = new HarnessRuntime(spec, adapters, {
+      env: process.env,
+      components,
+      tools,
+      services,
+      eventSink: store,
+    });
     for await (const event of runtime.stream(inputValue(rawInput))) {
       if (event.type === "text-delta") {
         streamedText += event.text;
@@ -194,12 +279,12 @@ async function run(file: string, rawInput: string, capabilities: CapabilityValue
 }
 
 async function test(file: string, capabilities: CapabilityValues): Promise<void> {
-  const { spec, adapters, components, tools, absolute } = await load(file, {
+  const { spec, adapters, components, tools, services, absolute } = await load(file, {
     checkEnvironment: true,
     allowModules: capabilities["allow-modules"] ?? false,
+    nodeServices: serviceOptions(capabilities),
   });
   const project = dirname(absolute);
-  const services = new NodeRuntimeServices(project, serviceOptions(capabilities));
   const store = new FileRunStore(project);
   try {
     const report = await runHarnessTests(spec, adapters, {
@@ -260,6 +345,7 @@ async function studio(file: string, port: string, capabilities: CapabilityValues
   }
   const studioPackage = createRequire(import.meta.url).resolve("@harnest/studio/package.json");
   const command = process.platform === "win32" ? "npm.cmd" : "npm";
+  const preapprovedTools = approvedToolIds(capabilities);
   const child = spawn(
     command,
     ["run", "dev", "--", "--hostname", "127.0.0.1", "--port", String(portNumber)],
@@ -278,6 +364,9 @@ async function studio(file: string, port: string, capabilities: CapabilityValues
           : {}),
         ...(capabilities["allow-network"]?.length
           ? { HARNEST_ALLOW_NETWORK: capabilities["allow-network"].join(",") }
+          : {}),
+        ...(preapprovedTools.length
+          ? { HARNEST_APPROVE_TOOLS: preapprovedTools.join(",") }
           : {}),
       },
       stdio: "inherit",

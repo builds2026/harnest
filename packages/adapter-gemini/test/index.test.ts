@@ -65,4 +65,88 @@ describe("Gemini adapter", () => {
       },
     });
   });
+
+  it("normalizes function calls and encodes function responses", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response([
+        'data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"gem-1","name":"sum","args":{"a":2}},"thoughtSignature":"sig-new"}]},"finishReason":"STOP"}]}',
+        "",
+      ].join("\n\n"));
+    }));
+    const events = await collect(createGeminiAdapter().run({
+      model: "gemini-test",
+      messages: [
+        { role: "assistant", content: "", toolCalls: [{
+          id: "old", name: "sum", input: { a: 1 }, providerMetadata: { thoughtSignature: "sig-old" },
+        }] },
+        { role: "tool", content: "1", toolCallId: "old", name: "sum" },
+      ],
+      tools: [{
+        name: "sum",
+        description: "Add",
+        inputSchema: { type: "object", additionalProperties: false },
+      }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+
+    expect(events).toEqual([
+      { type: "tool-call", call: {
+        id: "gem-1", name: "sum", input: { a: 2 }, providerMetadata: { thoughtSignature: "sig-new" },
+      } },
+      { type: "finish", reason: "stop", model: "gemini-test" },
+    ]);
+    expect(body).toMatchObject({
+      tools: [{ functionDeclarations: [{
+        name: "sum",
+        parametersJsonSchema: { type: "object", additionalProperties: false },
+      }] }],
+      contents: [
+        { role: "model", parts: [{
+          functionCall: { id: "old", name: "sum", args: { a: 1 } }, thoughtSignature: "sig-old",
+        }] },
+        { role: "user", parts: [{ functionResponse: { id: "old", name: "sum", response: { output: "1" } } }] },
+      ],
+    });
+  });
+
+  it("keeps fallback function-call IDs unique across requests", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"sum","args":{}}}]},"finishReason":"STOP"}]}\n\n',
+    )));
+    const adapter = createGeminiAdapter();
+    const request: ModelRequest = { model: "gemini-test", messages: [{ role: "user", content: "add" }] };
+    const context: AdapterContext = { signal: new AbortController().signal, resolveSecret: () => "secret" };
+
+    const first = await collect(adapter.run(request, context));
+    const second = await collect(adapter.run(request, context));
+
+    expect([first[0], second[0]]).toEqual([
+      { type: "tool-call", call: { id: "gemini-1-0:0:sum", name: "sum", input: {} } },
+      { type: "tool-call", call: { id: "gemini-2-0:0:sum", name: "sum", input: {} } },
+    ]);
+  });
+
+  it("rejects oversized function-call arguments", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      `data: ${JSON.stringify({
+        candidates: [{
+          content: { parts: [{ functionCall: {
+            id: "gem-large",
+            name: "sum",
+            args: { value: "x".repeat(1_048_576) },
+          } }] },
+          finishReason: "STOP",
+        }],
+      })}\n\n`,
+    )));
+
+    await expect(collect(createGeminiAdapter().run({
+      model: "gemini-test",
+      messages: [{ role: "user", content: "use a tool" }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }))).rejects.toMatchObject({
+      adapterId: "gemini",
+      code: "provider_response_limit",
+    });
+  });
 });

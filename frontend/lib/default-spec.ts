@@ -5,7 +5,6 @@ export const EMPTY_SPEC = {
   components: [],
   connections: [],
   entrypoint: "",
-  runtime: { adapters: ["@harnest/adapter-local"] },
   tests: [],
   studio: { positions: {} },
 } satisfies HarnessSpec;

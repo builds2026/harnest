@@ -457,8 +457,8 @@ function validateGraphBody(
         component.id,
       ));
     }
-    if (component.type === "local-tool" && typeof component.config.tool === "string"
-      && options.tools && !options.tools.has(component.config.tool)) {
+    if ((component.type === "local-tool" || component.type === "tool") && typeof component.config.tool === "string"
+      && typeof component.config.connectionId !== "string" && options.tools && !options.tools.has(component.config.tool)) {
       diagnostics.push(diagnostic(
         "TOOL_NOT_REGISTERED",
         `${componentPath}.config.tool`,
@@ -466,13 +466,45 @@ function validateGraphBody(
         component.id,
       ));
     }
-    if (component.type === "local-tool" && typeof component.config.tool === "string"
+    if ((component.type === "local-tool" || component.type === "tool") && typeof component.config.tool === "string"
       && options.tools?.has(component.config.tool)) validateSchemaRegexes(
       options.tools.get(component.config.tool).inputSchema,
       `${componentPath}.config.tool.inputSchema`,
       diagnostics,
       component.id,
     );
+    if (component.type === "tool" && typeof component.config.tool === "string"
+      && options.tools?.has(component.config.tool)
+      && (options.tools.get(component.config.tool).connectionKinds?.length ?? 0) > 0
+      && (typeof component.config.connectionId !== "string" || component.config.connectionId.length === 0)) {
+      diagnostics.push(diagnostic(
+        "TOOL_CONNECTION_REQUIRED",
+        `${componentPath}.config.connectionId`,
+        `Tool '${component.config.tool}' requires a compatible Connection`,
+        component.id,
+      ));
+    }
+    if (component.type === "local-tool" && typeof component.config.tool === "string"
+      && options.tools?.has(component.config.tool)
+      && (options.tools.get(component.config.tool).connectionKinds?.length ?? 0) > 0) {
+      diagnostics.push(diagnostic(
+        "TOOL_COMPONENT_REQUIRED",
+        `${componentPath}.type`,
+        `Tool '${component.config.tool}' requires a Connection and cannot use the legacy local-tool component`,
+        component.id,
+      ));
+    }
+    if (component.type === "tool") {
+      for (const field of ["inputSchema", "outputSchema"] as const) {
+        const schema = asRecord(component.config[field]);
+        if (schema) validateSchemaRegexes(
+          schema,
+          `${componentPath}.config.${field}`,
+          diagnostics,
+          component.id,
+        );
+      }
+    }
   });
 
   const connectionIds = new Set<string>();

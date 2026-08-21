@@ -7,7 +7,7 @@ import {
 } from "./runtime-config";
 
 describe("Studio runtime capability scoping", () => {
-  it("only grants files, processes, and hosts named by root or subgraph components", () => {
+  it("keeps file roots graph-aware and passes host allowlists for Connection-backed execution", () => {
     const spec = {
       version: "0.2",
       components: [
@@ -37,11 +37,13 @@ describe("Studio runtime capability scoping", () => {
       contextRoots: ["docs"],
       processCommands: ["approved-mcp", "not-in-spec"],
       networkHosts: ["mcp.example.test", "not-in-spec.example"],
+      approvedToolIds: ["saved.read"],
     })).toEqual({
       allowFileSystem: true,
       allowedContextRoots: ["docs"],
-      allowProcessCommands: ["approved-mcp"],
-      allowNetworkHosts: ["mcp.example.test"],
+      allowProcessCommands: ["approved-mcp", "not-in-spec"],
+      allowNetworkHosts: ["mcp.example.test", "not-in-spec.example"],
+      approvedToolIds: ["saved.read"],
     });
     expect(hostCapabilityDiagnosticsFor(spec, {
       allowModules: false,
@@ -49,6 +51,7 @@ describe("Studio runtime capability scoping", () => {
       contextRoots: ["docs"],
       processCommands: ["approved-mcp"],
       networkHosts: ["mcp.example.test"],
+      approvedToolIds: [],
     })).toEqual([]);
   });
 
@@ -70,12 +73,14 @@ describe("Studio runtime capability scoping", () => {
       HARNEST_CONTEXT_ROOTS: "docs, knowledge",
       HARNEST_ALLOW_PROCESS: "approved-mcp, second",
       HARNEST_ALLOW_NETWORK: "MCP.EXAMPLE.TEST, localhost:3333",
+      HARNEST_APPROVE_TOOLS: "saved.read, saved.write",
     })).toEqual({
       allowModules: false,
       allowFiles: false,
       contextRoots: ["docs", "knowledge"],
       processCommands: ["approved-mcp", "second"],
       networkHosts: ["mcp.example.test", "localhost:3333"],
+      approvedToolIds: ["saved.read", "saved.write"],
     });
     expect(studioCapabilityPolicy({ HARNEST_ALLOW_MODULES: "1", HARNEST_ALLOW_FILES: "1" }))
       .toMatchObject({ allowModules: true, allowFiles: true });

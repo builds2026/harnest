@@ -9,6 +9,7 @@ import {
   runtimeResourcesFor,
 } from "@/lib/server";
 import { hostCapabilityDiagnosticsFor, studioCapabilityPolicy } from "@/lib/runtime-config";
+import { apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
 
 export const runtime = "nodejs";
 
@@ -27,25 +28,31 @@ export async function GET() {
     const loaded = await loadSpecFile(file);
     if (!loaded.ok) return diagnosticResponse(loaded.diagnostics);
     const resources = await runtimeResourcesFor(loaded.spec);
-    return Response.json({
-      spec: loaded.spec,
-      yaml: stringifySpec(loaded.spec),
-      file,
-      exists: true,
-      catalog: resources.components.catalog(),
-      diagnostics: resources.diagnostics,
-    });
-  } catch (error) {
-    return diagnosticResponse([requestDiagnostic(error instanceof Error ? error.message : `Could not load '${file}'`)], 500);
+    try {
+      return Response.json({
+        spec: loaded.spec,
+        yaml: stringifySpec(loaded.spec),
+        file,
+        exists: true,
+        catalog: resources.components.catalog(),
+        diagnostics: resources.diagnostics,
+      });
+    } finally {
+      await resources.services.close();
+    }
+  } catch {
+    return diagnosticResponse([requestDiagnostic("Could not load the harness")], 500);
   }
 }
 
 export async function PUT(request: Request) {
   let yaml: unknown;
   try {
-    ({ yaml } = await request.json() as { yaml?: unknown });
-  } catch {
-    return diagnosticResponse([requestDiagnostic("Request body must be JSON")], 400);
+    assertSameOrigin(request);
+    const body = await readJsonBody(request, 2_097_152);
+    ({ yaml } = body as { yaml?: unknown });
+  } catch (error) {
+    return apiErrorResponse(error);
   }
   if (typeof yaml !== "string") return diagnosticResponse([requestDiagnostic("yaml must be a string")], 400);
 
@@ -58,11 +65,11 @@ export async function PUT(request: Request) {
       diagnostics: hostCapabilityDiagnosticsFor(parsed.spec, studioCapabilityPolicy(process.env)),
       yaml: stringifySpec(parsed.spec),
     });
-  } catch (error) {
+  } catch {
     return diagnosticResponse([{
       code: "FILE_WRITE",
       path: harnessFile(),
-      message: error instanceof Error ? error.message : "Could not save harnest.yaml",
+      message: "Could not save harnest.yaml",
       severity: "error",
     }], 500);
   }

@@ -22,6 +22,7 @@ export type HarnessNodeData = Record<string, unknown> & {
   runState?: NodeRunState;
   iteration?: number;
   attempt?: number;
+  onAddAttachment?: (nodeId: string, slot: "tools" | "skills") => void;
 };
 
 export type HarnessEdgeData = Record<string, unknown> & {
