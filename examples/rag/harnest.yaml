@@ -1,0 +1,49 @@
+version: "0.2"
+components:
+  - id: knowledge
+    type: context
+    config:
+      source: directory
+      path: ./knowledge
+      pattern: "**/*.md"
+      topK: 2
+      maxBytes: 32768
+  - id: model
+    type: model
+    config: { adapter: rag-echo, model: deterministic-rag }
+  - id: prompt
+    type: prompt
+    config:
+      template: "Answer from only the connected project Context: {{input}}"
+  - id: agent
+    type: agent
+    config: {}
+  - id: output
+    type: output
+    config: { format: text }
+connections:
+  - from: { component: knowledge, port: context }
+    to: { component: agent, port: context }
+  - from: { component: model, port: model }
+    to: { component: agent, port: model }
+  - from: { component: prompt, port: prompt }
+    to: { component: agent, port: prompt }
+  - from: { component: agent, port: response }
+    to: { component: output, port: value }
+entrypoint: output
+runtime:
+  timeoutMs: 30000
+  adapters: [./echo-adapter.mjs]
+tests:
+  - id: grounded-context
+    input: How does Harnest keep file Context safe?
+    assertions:
+      - { type: includes, value: realpath }
+      - { type: includes, value: project }
+studio:
+  positions:
+    knowledge: { x: 50, y: 50 }
+    model: { x: 50, y: 220 }
+    prompt: { x: 50, y: 390 }
+    agent: { x: 390, y: 200 }
+    output: { x: 720, y: 200 }

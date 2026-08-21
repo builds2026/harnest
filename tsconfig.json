@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/adapter-openai" },
+    { "path": "./packages/adapter-anthropic" },
+    { "path": "./packages/adapter-gemini" },
+    { "path": "./packages/adapter-local" },
+    { "path": "./packages/cli" }
+  ]
+}

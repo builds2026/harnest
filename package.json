@@ -1,0 +1,29 @@
+{
+  "name": "harnest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.2",
+  "workspaces": [
+    "packages/*",
+    "frontend"
+  ],
+  "scripts": {
+    "build:packages": "tsc -b",
+    "build": "npm run build:packages && npm run build --workspace @harnest/studio",
+    "typecheck": "tsc -b && npm run typecheck --workspace @harnest/studio",
+    "test": "npm run build:packages && vitest run --exclude \"**/dist/**\"",
+    "lint": "eslint .",
+    "studio": "npm run harnest -- studio harnest.yaml",
+    "harnest": "tsx packages/cli/src/index.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.2.0",
+    "eslint": "^10.8.1",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.11"
+  }
+}

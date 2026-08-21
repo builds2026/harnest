@@ -1,0 +1,123 @@
+components:
+  - id: improveLoop
+    type: loop
+    config:
+      subgraph: improve
+      maxIterations: 3
+      timeoutMs: 15000
+      maxTokens: 10000
+      until:
+        path: /evaluation/passed
+        op: truthy
+  - id: output
+    type: output
+    config:
+      format: text
+connections:
+  - from:
+      component: improveLoop
+      port: value
+    to:
+      component: output
+      port: value
+    select: /draft
+entrypoint: output
+version: "0.2"
+subgraphs:
+  improve:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: improver
+          model: deterministic-improver
+      - id: prompt
+        type: prompt
+        config:
+          template: "Improve this draft, then mark it ready: {{input}}"
+      - id: agent
+        type: agent
+        config: {}
+      - id: quality
+        type: evaluator
+        config:
+          type: includes
+          value: "[PASS]"
+      - id: result
+        type: join
+        config:
+          mode: object
+          keys:
+            - draft
+            - evaluation
+    connections:
+      - from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - from:
+          component: agent
+          port: response
+        to:
+          component: quality
+          port: value
+      - from:
+          component: quality
+          port: value
+        to:
+          component: result
+          port: values
+      - from:
+          component: quality
+          port: evaluation
+        to:
+          component: result
+          port: values
+    entrypoint: result
+runtime:
+  timeoutMs: 30000
+  adapters:
+    - ./improve-adapter.mjs
+tests:
+  - id: improves-until-pass
+    input: Draft answer
+    assertions:
+      - type: includes
+        value: "[PASS]"
+      - type: iterations
+        min: 2
+        max: 2
+studio:
+  positions:
+    improveLoop:
+      x: -48
+      y: 144
+    output:
+      x: 560
+      y: 160
+  subgraphs:
+    improve:
+      positions:
+        model:
+          x: 60
+          y: 60
+        prompt:
+          x: 64
+          y: 256
+        agent:
+          x: 390
+          y: 150
+        quality:
+          x: 688
+          y: 128
+        result:
+          x: 940
+          y: 150

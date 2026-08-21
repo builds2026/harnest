@@ -1,0 +1,15 @@
+version: "0.1"
+components:
+  - id: prompt
+    type: prompt
+    config: { template: "{{input}}" }
+  - id: agent
+    type: agent
+    config: {}
+  - id: output
+    type: output
+    config: { format: text }
+connections:
+  - from: { component: prompt, port: prompt }
+    to: { component: output, port: value }
+entrypoint: output
