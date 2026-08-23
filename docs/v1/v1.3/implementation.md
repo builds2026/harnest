@@ -9,8 +9,10 @@
 | Reduced drag-and-drop dependence | The component catalog is collapsed by default and opened from `+ Add`. Drag-and-drop remains available as a secondary workflow. |
 | Dify-inspired Inspector | Common settings remain visible; detailed policy/schema fields use Advanced disclosure. Settings and actual Last run data are keyboard-navigable Base UI tabs. |
 | Shared design system | Canvas, Inspector, Header, catalog, workbench, Playground, and Integrate use common surface/state/type tokens. Light/dark themes persist locally and honor reduced motion. |
+| Responsive and keyboard behavior | Builder, Playground, and Integrate fit a 390 px viewport without horizontal overflow. Catalog cards clamp long metadata, and the catalog closes through either its named button or Escape. |
 | Workflow completion | Recipes, reusable Connections, automatic save/validation, tests, A/B Compare, persisted Activity, YAML import/export, Playground, and recovery states remain wired to existing runtime APIs. |
 | Differentiation | Core `describeHarness()` creates the secret-free Portable Integration Contract. It is exposed through Studio, CLI, SDK, HTTP, and MCP. |
+| Agent Skills interoperability | Skill frontmatter accepts the specification's space-delimited `allowed-tools` string and normalizes the common bounded YAML string-list form. Invalid installed skills stay disabled and their parser warnings are visible in Skill Manager. |
 | Compatibility | `specToDraft()` / `draftToSpec()` remain the single Canvas/YAML round trip. v0.1 upgrades only when a v0.2 component or edge feature requires it. Existing runtime behavior is unchanged. |
 
 ## File upload and Code Runner
@@ -22,6 +24,8 @@ This is a real runtime path, not a UI placeholder:
 3. The session store copies those files into a run workspace inside the project and mounts it at `/mnt/data` read-only.
 4. The approved Docker/Podman runner has a read-only root, no network, dropped capabilities, a non-root user, and bounded resources.
 5. Files written below `/mnt/output` are scanned with depth/count/size/link limits, indexed as artifacts, and returned for safe preview or download.
+
+Saved container Connections now provide the requested runtime directly, so a host Python installation is not required for a Python container. Docker/Podman starts with interactive stdin enabled, and Core rejects a Code Runner whose declared runtime does not match its Connection runtime.
 
 Limits remain one file 64 MiB, session 100 files / 256 MiB, and one run 32 selected files. HTML/SVG are never rendered as executable previews.
 

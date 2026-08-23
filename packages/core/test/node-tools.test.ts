@@ -257,6 +257,35 @@ describe("custom tool execution capabilities", () => {
     }
   });
 
+  it("delegates a connected Python runner without requiring host Python", async () => {
+    const root = await project();
+    try {
+      const authorizeProcess = vi.fn(async () => true);
+      const executeProcess = vi.fn(async () => ({ stdout: "5\n", stderr: "", exitCode: 0 }));
+      const store = new NodeToolStore({
+        projectDirectory: root,
+        capabilities: { authorizeProcess, executeProcess },
+      });
+      await expect(store.executeBuiltin("builtin.code-runner", {
+        runtime: "python",
+        code: "print(2 + 3)",
+      }, context, { connectionId: "python-sandbox" })).resolves.toEqual({
+        stdout: "5\n", stderr: "", exitCode: 0,
+      });
+      expect(authorizeProcess).toHaveBeenCalledWith(expect.objectContaining({
+        toolId: "builtin.code-runner",
+        command: "python",
+        connectionId: "python-sandbox",
+      }));
+      expect(executeProcess).toHaveBeenCalledWith(expect.objectContaining({
+        command: "python",
+        connectionId: "python-sandbox",
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("terminates a command at its timeout", async () => {
     const root = await project();
     try {

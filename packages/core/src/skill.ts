@@ -143,6 +143,26 @@ const optionalString = (
   return value;
 };
 
+function allowedToolsFrom(record: Record<string, unknown>): string | undefined {
+  const value = record["allowed-tools"];
+  if (!Array.isArray(value)) return optionalString(record, "allowed-tools", 4_096);
+  if (value.length === 0 || value.length > 64
+    || !value.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 256)) {
+    throw new SkillParseError(
+      "SKILL_FIELD_INVALID",
+      "Skill 'allowed-tools' must be a non-empty string or a bounded string list",
+      "allowed-tools",
+    );
+  }
+  const normalized = value.map((item) => (item as string).trim()).join(" ");
+  if (normalized.length > 4_096) throw new SkillParseError(
+    "SKILL_FIELD_INVALID",
+    "Skill 'allowed-tools' must be no longer than 4096 characters",
+    "allowed-tools",
+  );
+  return normalized;
+}
+
 const requirementItemPattern = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
 
 function parseRequirementList(value: string | undefined, field: string): readonly string[] {
@@ -238,7 +258,7 @@ export function parseSkillDocument(source: string, options: ParseSkillOptions = 
   const description = requiredString(record, "description", 1, 1_024, "SKILL_DESCRIPTION_INVALID");
   const license = optionalString(record, "license");
   const compatibility = optionalString(record, "compatibility", 500);
-  const allowedTools = optionalString(record, "allowed-tools");
+  const allowedTools = allowedToolsFrom(record);
   const metadata = parseMetadata(record.metadata);
   const requirements: SkillRequirements = Object.freeze({
     tools: parseRequirementList(metadata["harnest-tools"], "harnest-tools"),

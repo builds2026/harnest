@@ -1072,7 +1072,7 @@ export function containerRunArguments(
     );
   }
   return [
-    "run", "--rm", "--name", name, "--pull", "never", "--network", "none", "--read-only",
+    "run", "--rm", "--interactive", "--name", name, "--pull", "never", "--network", "none", "--read-only",
     "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", String(pids),
     "--memory", `${memoryMb}m`, "--cpus", String(cpus), "--stop-timeout", "1",
     "--tmpfs", "/workspace:rw,nosuid,nodev,size=64m", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",

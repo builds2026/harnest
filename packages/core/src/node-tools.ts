@@ -1858,7 +1858,9 @@ export class NodeToolStore {
       );
     } else {
       const runtime = input.runtime as "node" | "python";
-      const command = runtime === "node" ? this.#options.codeRunners?.node ?? process.execPath : this.#options.codeRunners?.python;
+      const command = options.connectionId === undefined
+        ? runtime === "node" ? this.#options.codeRunners?.node ?? process.execPath : this.#options.codeRunners?.python
+        : runtime;
       if (command === undefined) {
         throw new ToolStoreError("TOOL_CAPABILITY_REQUIRED", `Code runner '${runtime}' is not configured`, id);
       }

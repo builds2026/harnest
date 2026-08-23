@@ -765,15 +765,22 @@ button:disabled {
 
 .palette-title {
   display: block;
+  overflow: hidden;
   font-size: 13px;
   font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .palette-description {
-  display: block;
+  display: -webkit-box;
+  overflow: hidden;
   margin-top: 2px;
   color: var(--muted);
   font-size: 10px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .drag-grip {
@@ -3939,6 +3946,10 @@ button.trace-item:hover {
   background: var(--playground-surface);
 }
 
+.playground-chat > * {
+  min-width: 0;
+}
+
 .playground-chat-header {
   display: flex;
   min-height: 70px;
@@ -5105,6 +5116,22 @@ button.trace-item:hover {
 }
 
 @media (max-width: 680px) {
+  .studio-shell:not(.is-playground) .brand-lockup,
+  .studio-shell:not(.is-playground) .rail-actions .button-primary {
+    display: none;
+  }
+
+  .studio-shell:not(.is-playground) .surface-tabs {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .studio-shell:not(.is-playground) .surface-tabs button {
+    min-width: 0;
+    flex: 1 1 auto;
+    padding-inline: 6px;
+  }
+
   .studio-shell.is-playground {
     grid-template-rows: 48px minmax(0, 1fr);
   }

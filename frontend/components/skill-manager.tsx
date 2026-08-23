@@ -31,6 +31,7 @@ export function SkillManager({ open, onClose, onChanged }: {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [installed, setInstalled] = useState<InstalledSkill[]>([]);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [reviewSkill, setReviewSkill] = useState<InstalledSkill>();
   const [scripts, setScripts] = useState<ScriptReview[]>([]);
   const first = useRef<HTMLInputElement>(null);
@@ -38,8 +39,9 @@ export function SkillManager({ open, onClose, onChanged }: {
   const loadInstalled = async () => {
     const response = await fetch("/api/skills", { cache: "no-store" });
     if (!response.ok) throw new Error(await requestMessage(response));
-    const payload = await response.json() as { skills: InstalledSkill[] };
+    const payload = await response.json() as { skills: InstalledSkill[]; warnings: string[] };
     setInstalled(payload.skills);
+    setWarnings(payload.warnings);
     return payload.skills;
   };
 
@@ -127,6 +129,7 @@ export function SkillManager({ open, onClose, onChanged }: {
     <section className="connection-sheet skill-sheet" role="dialog" aria-modal="true" aria-labelledby="skill-sheet-title">
       <header className="sheet-header"><div><span className="sheet-eyebrow">Progressive instruction catalog</span><h2 id="skill-sheet-title">Skills</h2></div><button className="sheet-close" aria-label="Close skills" disabled={busy} onClick={onClose}>×</button></header>
       {message && <div className="sheet-message" role="status">{message}</div>}
+      {warnings.length > 0 && <details className="source-review"><summary>{warnings.length} installed skill{warnings.length === 1 ? " needs" : "s need"} attention</summary><p>Invalid skills stay disabled until their SKILL.md metadata is corrected.</p><ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}
       {installed.some((skill) => skill.scriptsPresent) && !reviewSkill && <div className="source-review"><span>Scripts need explicit trust</span><p>Review code and its SHA-256 before allowing a model to load it.</p><div className="sheet-actions">{installed.filter((skill) => skill.scriptsPresent).map((skill) => <button key={skill.id} type="button" className="button" disabled={busy} onClick={() => void review(skill)}>Review {skill.label}</button>)}</div></div>}
       {reviewSkill && <div className="approval-body source-review"><span>{reviewSkill.label} · script review</span><p>Requirements: {[...reviewSkill.requirements.tools.map((value) => `tool:${value}`), ...reviewSkill.requirements.connections.map((value) => `connection:${value}`), ...reviewSkill.requirements.permissions.map((value) => `permission:${value}`)].join(", ") || "none"}</p>{scripts.map((script) => <details key={script.path} open={!script.approved}><summary>{script.approved ? "Approved" : "Review"} · {script.path} · {script.bytes} bytes</summary><code>{script.sha256}</code><pre>{script.content}</pre></details>)}<div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={() => { setReviewSkill(undefined); setScripts([]); }}>Back</button><button type="button" className="button button-primary" disabled={busy || scripts.every((script) => script.approved)} onClick={() => void approveScripts()}>{busy ? "Approving…" : "Approve exact hashes"}</button></div></div>}
       <form className="connection-form" onSubmit={submit}>

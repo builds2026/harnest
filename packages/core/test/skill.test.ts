@@ -41,6 +41,19 @@ describe("Agent Skill document parser", () => {
     expect(split.body).toBe("---\r\nbody");
   });
 
+  it("normalizes the common allowed-tools YAML list form", () => {
+    const parsed = parseSkillDocument(`---
+name: compatible
+description: Compatible skill.
+allowed-tools:
+  - Bash(firecrawl *)
+  - Bash(npx firecrawl *)
+---
+Instructions.
+`);
+    expect(parsed.descriptor.allowedTools).toBe("Bash(firecrawl *) Bash(npx firecrawl *)");
+  });
+
   it.each([
     ["missing delimiter", "name: safe\ndescription: Safe", "SKILL_FRONTMATTER_MISSING"],
     ["uppercase name", "---\nname: Not-Safe\ndescription: Safe\n---\n", "SKILL_NAME_INVALID"],

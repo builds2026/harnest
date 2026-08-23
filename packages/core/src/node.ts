@@ -894,7 +894,8 @@ export class NodeRuntimeServices implements RuntimeServices {
     if (profile.kind !== "local-runtime" || profile.config.sandbox !== "container") return false;
     await this.connectionManager.assertProcessApproved(profile);
     if (request.toolId === "builtin.code-runner") {
-      return profile.config.runtime === "node" || profile.config.runtime === "python";
+      return (profile.config.runtime === "node" || profile.config.runtime === "python")
+        && profile.config.runtime === request.command;
     }
     return typeof profile.config.command === "string" && profile.config.command === request.command;
   }

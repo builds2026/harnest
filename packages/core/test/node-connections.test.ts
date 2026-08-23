@@ -58,7 +58,7 @@ describe("container sandbox arguments", () => {
     ]);
     expect(args).toContain(`type=bind,source=${process.cwd()},target=/mnt/data,readonly`);
     expect(args).toContain(`type=bind,source=${process.cwd()},target=/mnt/output`);
-    expect(args).toEqual(expect.arrayContaining(["--network", "none", "--read-only", "--cap-drop", "ALL"]));
+    expect(args).toEqual(expect.arrayContaining(["--interactive", "--network", "none", "--read-only", "--cap-drop", "ALL"]));
     expect(() => containerRunArguments(profile, "sandbox", ["python", "-"], [], undefined, [
       { source: `${process.cwd()},other`, target: "/mnt/data", readOnly: true },
     ])).toThrow(/mount is invalid/);
@@ -268,6 +268,11 @@ child.on("exit", (code) => process.exit(code ?? 1))
     }, { runtime: "node", code: "console.log(2 + 3)" }, context)).resolves.toMatchObject({
       value: { stdout: "5\n", exitCode: 0 },
     });
+    await expect(services.executeTool({
+      id: "builtin.code-runner",
+      source: "builtin",
+      connectionId: connection.id,
+    }, { runtime: "python", code: "print(2 + 3)" }, context)).rejects.toThrow("was not approved");
     const invocations = async () => (await readFile(invocationLog, "utf8")).trim().split(/\r?\n/u)
       .map((line) => JSON.parse(line) as string[]);
     expect((await invocations()).at(-1)).toEqual(expect.arrayContaining([

@@ -1541,6 +1541,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   }, [activeSubgraph, document.draft.subgraphs]);
 
   useEffect(() => {
+    if (!paletteOpen) return;
+    const closePalette = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPaletteOpen(false);
+    };
+    window.addEventListener("keydown", closePalette);
+    return () => window.removeEventListener("keydown", closePalette);
+  }, [paletteOpen]);
+
+  useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") return;
       event.preventDefault();
