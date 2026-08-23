@@ -629,9 +629,6 @@ export class NodeRuntimeServices implements RuntimeServices {
       })),
     ];
     for (const body of bodies) body.components.forEach((component, index) => {
-      const connectionId = typeof component.config.connectionId === "string" && component.config.connectionId.length
-        ? component.config.connectionId : undefined;
-      if (!connectionId) return;
       let requiredKinds: readonly string[] | undefined;
       if (component.type === "model") requiredKinds = ["provider"];
       else if (component.type === "mcp-tool") requiredKinds = ["mcp"];
@@ -641,36 +638,42 @@ export class NodeRuntimeServices implements RuntimeServices {
           : ["mcp"];
       }
       if (!requiredKinds?.length) return;
-      const path = `${body.path}.components[${index}].config.connectionId`;
-      const profile = profiles.get(connectionId);
-      if (!profile) {
-        diagnostics.push({
-          code: "CONNECTION_NOT_FOUND",
+      const fields = component.type === "model" ? ["connectionId", "fallbackConnectionId"] : ["connectionId"];
+      for (const field of fields) {
+        const connectionId = typeof component.config[field] === "string" && component.config[field].length
+          ? component.config[field] as string : undefined;
+        if (!connectionId) continue;
+        const path = `${body.path}.components[${index}].config.${field}`;
+        const profile = profiles.get(connectionId);
+        if (!profile) {
+          diagnostics.push({
+            code: "CONNECTION_NOT_FOUND",
+            path,
+            message: `Connection '${connectionId}' does not exist`,
+            componentId: component.id,
+            severity: "error",
+          });
+          continue;
+        }
+        if (!runtimeConnectionAvailable(profile)) {
+          diagnostics.push({
+            code: profile.status.state === "disconnected" ? "CONNECTION_DISCONNECTED" : "CONNECTION_UNAVAILABLE",
+            path,
+            message: `Connection '${connectionId}' is ${profile.status.state.replaceAll("_", " ")} and cannot be used`,
+            componentId: component.id,
+            severity: "error",
+          });
+          continue;
+        }
+        const actualKind = profile.kind === "mcp" ? `mcp-${String(profile.config.transport)}` : profile.kind;
+        if (!requiredKinds.includes(profile.kind) && !requiredKinds.includes(actualKind)) diagnostics.push({
+          code: "CONNECTION_TYPE_MISMATCH",
           path,
-          message: `Connection '${connectionId}' does not exist`,
+          message: `Connection '${connectionId}' is '${actualKind}', but this component requires ${requiredKinds.join(" or ")}`,
           componentId: component.id,
           severity: "error",
         });
-        return;
       }
-      if (!runtimeConnectionAvailable(profile)) {
-        diagnostics.push({
-          code: profile.status.state === "disconnected" ? "CONNECTION_DISCONNECTED" : "CONNECTION_UNAVAILABLE",
-          path,
-          message: `Connection '${connectionId}' is ${profile.status.state.replaceAll("_", " ")} and cannot be used`,
-          componentId: component.id,
-          severity: "error",
-        });
-        return;
-      }
-      const actualKind = profile.kind === "mcp" ? `mcp-${String(profile.config.transport)}` : profile.kind;
-      if (!requiredKinds.includes(profile.kind) && !requiredKinds.includes(actualKind)) diagnostics.push({
-        code: "CONNECTION_TYPE_MISMATCH",
-        path,
-        message: `Connection '${connectionId}' is '${actualKind}', but this component requires ${requiredKinds.join(" or ")}`,
-        componentId: component.id,
-        severity: "error",
-      });
     });
     return diagnostics;
   }

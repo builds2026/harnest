@@ -55,5 +55,13 @@ describe("Studio commissioning templates", () => {
     expect(missingConnectionSetup([
       { type: "tool", config: { tool: "builtin.code-runner", connectionId: "sandbox-main" } },
     ], [], [])).toEqual({ id: "sandbox-main", kind: "local-runtime" });
+    expect(missingConnectionSetup([
+      { type: "model", config: { connectionId: "primary", fallbackConnectionId: "backup" } },
+    ], [{ id: "primary", kind: "provider", status: "connected" } as ConnectionSummary], []))
+      .toEqual({ id: "backup", kind: "provider" });
+    expect(missingConnectionSetup([
+      { type: "mcp-tool", config: { connectionId: "local-mcp" } },
+    ], [{ id: "local-mcp", kind: "mcp-stdio", status: "connected" } as ConnectionSummary], []))
+      .toBeUndefined();
   });
 });

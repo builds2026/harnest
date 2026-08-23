@@ -8,13 +8,26 @@ npm run harnest -- validate examples/rag/harnest.yaml -- --allow-modules
 npm run harnest -- inspect examples/rag/harnest.yaml -- --allow-modules
 ```
 
-CLI 명령은 `validate`, `inspect`, `run`, `test`, `runs`, `trace`, `studio`, `connections`, `connect`, `connection`, `skill`이다. 외부 capability는 기본 거부다.
+CLI 명령은 `init`, `bundle`, `validate`, `inspect`, `run`, `test`, `runs`, `trace`, `serve`, `mcp serve`, `studio`, `connections`, `connect`, `connection`, `skill`이다. 외부 capability는 기본 거부다.
 
 ```powershell
 npm run harnest -- run examples/rag/harnest.yaml -- --input "How are files protected?" --allow-modules --allow-files --context-root knowledge
 npm run harnest -- test examples/evaluation-loop/harnest.yaml -- --allow-modules
 npm run harnest -- runs examples/rag/harnest.yaml -- --limit 20
 npm run harnest -- trace <run-id> examples/rag/harnest.yaml -- --json
+```
+
+새 폴더에는 안전한 Gemini starter를 만들 수 있다. 기존 파일은 덮어쓰지 않는다.
+
+```powershell
+npm run harnest -- init my-agent
+npm run harnest -- studio my-agent/harnest.yaml
+```
+
+배포 artifact는 검증된 YAML과 project `assets/`만 포함하는 standard ZIP `.harnest`다. `.env`, Connection/vault, Trace와 `.harnest/` local state는 포함하지 않으며 기존 output을 덮어쓰지 않는다.
+
+```powershell
+npm run harnest -- bundle my-agent/harnest.yaml -- --output support-agent.harnest
 ```
 
 필요한 경우에만 다음 capability를 정확히 허용한다.
@@ -52,6 +65,30 @@ npm run harnest -- connections examples/gemini-full-stack/harnest.yaml
 
 `npm run` 뒤 Harnest option을 전달할 때는 예시처럼 두 번째 `--`가 필요하다. `connect`는 생성/갱신, credential 저장, OAuth 또는 sandbox 승인, 실제 test를 한 번에 수행한다. key/token은 hidden TTY 입력이나 `--secret-env`로만 받고 argv에 값을 받지 않는다. `connection test|login|disconnect|revoke|delete`로 lifecycle을 관리한다. Skill은 `skill list|install|review|approve`를 사용하며 GitHub/GitLab은 exact commit, npm은 exact version+sha512로 자동 고정한다.
 
+### Studio 없이 사용
+
+```powershell
+# literal-loopback HTTP: GET /health, POST /invoke, POST /stream
+npm run harnest -- serve harnest.yaml -- --port 8787 --allow-modules
+
+# stdio MCP: invoke_harness Tool
+npm run harnest -- mcp serve harnest.yaml -- --allow-modules
+```
+
+두 server는 같은 `@harnest/sdk` load/invoke/stream 경로를 사용한다. HTTP request body는 `{ "input": ... }`이고 `/stream`은 NDJSON이다. MCP Tool input은 `{ "message": "..." }` 또는 `{ "input": ... }`이다.
+
+```ts
+import { Harnest } from "@harnest/sdk";
+
+const harness = await Harnest.load("./harnest.yaml", { allowModuleExecution: true });
+try {
+  console.log((await harness.invoke("hello")).output);
+  console.log(await harness.test());
+} finally {
+  await harness.close();
+}
+```
+
 ## Studio
 
 ```powershell
@@ -62,16 +99,19 @@ npm run harnest -- studio harnest.yaml -- --port 3000
 
 Studio는 `127.0.0.1`에 server를 띄운다. 모든 request는 URL과 일치하는 literal-loopback Host를 요구하고, mutation은 같은 Origin도 요구한다. 일반 흐름은 다음과 같다.
 
-1. 빈 canvas에서 RAG, Web Research, Coding Agent, MCP Agent, Evaluation Loop 중 하나를 고른다.
-2. 필요한 Connection은 자동으로 열리며 서비스와 credential만 넣고 **Connect**한다. 저장·로그인/승인·test·Tool discovery가 한 동작으로 이어진다.
-3. Agent Tool/Skill port의 `+`에서 compatible 항목을 연결한다.
-4. **Validate** 후 input을 넣고 **Run**한다. 위험 Tool 요청은 exact 인자를 확인해 **Approve once** 또는 **Deny**한다.
-5. Trace에서 turn, Tool call/approval/result, Skill 사용과 run history를 확인한다.
-6. YAML은 하단 **Advanced** 진단용이며 정상 commissioning에 필수는 아니다.
+1. 첫 화면에서 RAG, Web Research, Coding Agent, MCP Agent, Evaluation Loop 중 원하는 결과의 **Recipe**를 고른다. 각 card는 필요한 Service와 sample input을 먼저 보여준다.
+2. 필요한 **Service** sheet가 자동으로 열린다. credential 또는 endpoint만 넣고 **Connect**하면 저장·OAuth/승인·test·Tool discovery가 이어진다. MCP OAuth는 URL에서 resource metadata, authorization server와 scope를 자동 탐색한다.
+3. Studio가 YAML을 자동 저장하고 runtime validation을 연속 실행한다. 상단의 한 개 next action과 **Setup** tab만 따라가면 된다.
+4. **Try**에 준비된 input을 보내고 answer를 먼저 확인한다. 위험 Tool은 정확한 argument와 사람이 읽을 수 있는 권한 설명을 보고 **Allow once** 또는 **Don’t allow**를 고른다.
+5. **Tests**에서 case ID·request·문자열 기대값을 추가·수정·삭제하고 자동 저장/check 뒤 **Run all**로 성공률과 case latency를 본다. object input, Output Schema, Tool-call·latency·iteration 같은 고급 assertion은 YAML에 그대로 보존된다.
+6. **Compare**는 같은 input의 A/B component setting을 실행하고 answer·evaluator 품질·비용·속도를 나란히 보여준다. **Activity**는 turn·Tool·approval·fallback·usage·run history를 보여준다.
+7. **YAML**은 import/export나 고급 편집이 필요할 때만 사용한다.
+
+Model을 선택하면 **Fallback provider**에서 primary와 다른 저장 Provider 하나를 고를 수 있다. primary Adapter가 retryable 오류를 보고한 경우에만 한 번 전환하며 두 attempt의 사용량·비용과 이유가 Activity에 남는다.
 
 Connection credential은 password field에 한 번 입력하며 browser로 다시 반환되지 않는다. vault는 Windows DPAPI, macOS Keychain, Linux Secret Service 중 안전한 OS backend를 사용하고 plaintext fallback은 없다.
 
-CLI `validate`와 Studio **Validate**는 저장 Connection metadata도 읽어 Model·MCP·Tool binding의 missing, disconnected/unavailable, incompatible kind를 root graph와 subgraph 모두에서 오류로 보고한다. Provider는 등록 Adapter model probe, MCP는 protocol discovery, Web Search/Scrape는 저장 mapping, 일반 HTTP API는 endpoint/auth probe, Local Runtime은 container image/command probe를 수행한다.
+CLI `validate`와 Studio의 자동 setup check는 저장 Connection metadata도 읽어 Model·MCP·Tool binding의 missing, disconnected/unavailable, incompatible kind를 root graph와 subgraph 모두에서 오류로 보고한다. Provider는 등록 Adapter model probe, MCP는 protocol discovery, Web Search/Scrape는 저장 mapping, 일반 HTTP API는 endpoint/auth probe, Local Runtime은 container image/command probe를 수행한다.
 
 Provider stream parser는 기본 total 16 MiB, line/event 8 MiB, HTTP error body 64 KiB로 제한한다. Adapter는 한 응답의 Tool call 128개와 call당 argument 1 MiB를 넘기지 않으며, Agent는 설정된 `maxToolCalls`와 provider turn별 text 8 MiB를 별도로 적용한다. 저장 Trace는 file당 8 MiB, NDJSON event당 64 KiB, run당 10,000 event를 넘으면 read/append를 거부한다.
 

@@ -6,6 +6,7 @@
     { "path": "./packages/adapter-anthropic" },
     { "path": "./packages/adapter-gemini" },
     { "path": "./packages/adapter-local" },
+    { "path": "./packages/sdk" },
     { "path": "./packages/cli" }
   ]
 }

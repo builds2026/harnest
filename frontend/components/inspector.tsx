@@ -202,12 +202,22 @@ function ConnectionField({
   if (!kinds.length) return null;
   const config = component.config as Record<string, unknown>;
   const selectedId = typeof config.connectionId === "string" ? config.connectionId : "";
+  const fallbackId = component.type === "model" && typeof config.fallbackConnectionId === "string"
+    ? config.fallbackConnectionId : "";
   const compatible = connections.filter((connection) => kinds.includes(connection.kind));
   const selected = connections.find((connection) => connection.id === selectedId);
   const preferred = kinds[0];
   const update = (connectionId: string) => onChange({
     ...component,
-    config: withConfigValue(config, "connectionId", connectionId || undefined),
+    config: withConfigValue(
+      withConfigValue(config, "connectionId", connectionId || undefined),
+      "fallbackConnectionId",
+      connectionId && connectionId !== fallbackId ? fallbackId || undefined : undefined,
+    ),
+  } as HarnessComponent);
+  const updateFallback = (connectionId: string) => onChange({
+    ...component,
+    config: withConfigValue(config, "fallbackConnectionId", connectionId || undefined),
   } as HarnessComponent);
 
   return (
@@ -223,6 +233,14 @@ function ConnectionField({
           ? <span className={`field-help connection-inline-status is-${selected.status}`}>{selected.status.replaceAll("_", " ")}</span>
           : <span className="field-help">Credentials stay in the local store; only this ID is saved in harnest.yaml.</span>}
       </div>
+      {component.type === "model" && <div className="field">
+        <label htmlFor={`fallback-connection-${component.id}`}>Fallback provider</label>
+        <select id={`fallback-connection-${component.id}`} disabled={locked || !selectedId} value={fallbackId} onChange={(event) => updateFallback(event.target.value)}>
+          <option value="">No fallback</option>
+          {compatible.filter(({ id }) => id !== selectedId).map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connection.status.replaceAll("_", " ")}</option>)}
+        </select>
+        <span className="field-help">Used once when the primary provider reports a retryable failure.</span>
+      </div>}
       <button type="button" className="button" disabled={locked} onClick={() => onConnect(preferred)}>{compatible.length ? "Manage connections" : "Connect"}</button>
     </div>
   );

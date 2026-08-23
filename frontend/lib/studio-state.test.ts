@@ -110,4 +110,22 @@ describe("Studio document state", () => {
     expect(Object.keys(output.data.manifest.ports.outputs)).toContain("value");
     expect(isEntrypointCandidate(output, draft.edges)).toBe(true);
   });
+
+  it("keeps editable and advanced test cases in the semantic draft", () => {
+    const withTests: HarnessSpec = {
+      version: "0.2",
+      components: spec.components,
+      connections: spec.connections,
+      entrypoint: spec.entrypoint,
+      tests: [
+        { id: "contains", input: "hello", assertion: { type: "includes", value: "hello" } },
+        { id: "bounded", input: { topic: "status" }, assertions: [
+          { type: "latency", maxMs: 2_000 },
+          { type: "iterations", max: 3 },
+        ] },
+      ],
+    };
+
+    expect(draftToSpec(createDocumentState(withTests, BUILTIN_COMPONENT_MANIFESTS).draft).tests).toEqual(withTests.tests);
+  });
 });

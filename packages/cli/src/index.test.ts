@@ -1,10 +1,12 @@
-import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import {
   AdapterRegistry,
   createBuiltinComponentRegistry,
@@ -440,6 +442,114 @@ runtime:
 });
 
 describe("harnest CLI", () => {
+  it("initializes a safe starter project without replacing an existing harness", async () => {
+    const directory = join(testRoot, "initialized");
+    const created = await exec(process.execPath, [cli, "init", directory], { cwd: root });
+    expect(created.stdout).toContain("Created");
+    const initialized = await import("@harnest/core/node").then(({ loadSpecFile }) => loadSpecFile(join(directory, "harnest.yaml")));
+    expect(initialized).toMatchObject({
+      ok: true,
+      spec: expect.objectContaining({ version: "0.2", entrypoint: "output" }),
+    });
+    await expect(exec(process.execPath, [cli, "init", directory], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Refusing to replace existing"),
+    });
+  });
+
+  it("packages harnest.yaml and assets as a standard single-file bundle", async () => {
+    const directory = join(testRoot, "bundled");
+    await exec(process.execPath, [cli, "init", directory], { cwd: root });
+    await mkdir(join(directory, "assets"));
+    await writeFile(join(directory, "assets", "guide.txt"), "deployable asset", "utf8");
+    const output = join(directory, "support-agent.harnest");
+    const bundled = await exec(process.execPath, [
+      cli, "bundle", join(directory, "harnest.yaml"), "--output", output,
+    ], { cwd: root });
+    expect(bundled.stdout).toContain("Bundled 2 files");
+    const archive = await readFile(output);
+    const end = archive.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    expect(end).toBeGreaterThan(0);
+    const count = archive.readUInt16LE(end + 10);
+    let offset = archive.readUInt32LE(end + 16);
+    const names: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      expect(archive.readUInt32LE(offset)).toBe(0x02014b50);
+      const nameLength = archive.readUInt16LE(offset + 28);
+      const extraLength = archive.readUInt16LE(offset + 30);
+      const commentLength = archive.readUInt16LE(offset + 32);
+      names.push(archive.subarray(offset + 46, offset + 46 + nameLength).toString("utf8"));
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+    expect(names).toEqual(["harnest.yaml", "assets/guide.txt"]);
+    await expect(exec(process.execPath, [
+      cli, "bundle", join(directory, "harnest.yaml"), "--output", output,
+    ], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Refusing to replace existing"),
+    });
+  });
+
+  it("serves the same harness through HTTP and MCP", async () => {
+    const directory = await project("cli-serving");
+    await cp(join(root, "examples", "custom-adapter", "echo-adapter.mjs"), join(directory, "echo-adapter.mjs"));
+    await cp(join(root, "examples", "custom-adapter", "harnest.yaml"), join(directory, "harnest.yaml"));
+    const spec = join(directory, "harnest.yaml");
+    const reservation = createServer();
+    await new Promise<void>((resolveListen) => reservation.listen(0, "127.0.0.1", resolveListen));
+    const port = (reservation.address() as AddressInfo).port;
+    await new Promise<void>((resolveClose) => reservation.close(() => resolveClose()));
+
+    const api = spawn(process.execPath, [cli, "serve", spec, "--port", String(port), "--allow-modules"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    api.stdout.setEncoding("utf8");
+    api.stdout.on("data", (chunk: string) => { output += chunk; });
+    try {
+      await new Promise<void>((resolveReady, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`API did not start: ${output}`)), 10_000);
+        const inspect = () => {
+          if (!output.includes("Harnest API ready")) return;
+          clearTimeout(timeout);
+          api.stdout.off("data", inspect);
+          resolveReady();
+        };
+        api.stdout.on("data", inspect);
+        api.once("error", reject);
+        inspect();
+      });
+      const response = await fetch(`http://127.0.0.1:${port}/invoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "HTTP hello" }),
+      });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ ok: true, output: expect.stringContaining("HTTP hello") });
+    } finally {
+      api.kill("SIGTERM");
+      await new Promise<void>((resolveExit) => api.once("exit", () => resolveExit()));
+    }
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [cli, "mcp", "serve", spec, "--allow-modules"],
+      cwd: root,
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "harnest-cli-test", version: "1.0.0" });
+    try {
+      await client.connect(transport);
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain("invoke_harness");
+      const called = await client.callTool({ name: "invoke_harness", arguments: { message: "MCP hello" } });
+      expect(called.content).toContainEqual(expect.objectContaining({ type: "text", text: expect.stringContaining("MCP hello") }));
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
   it("creates, tests, lists, and deletes a saved Connection", async () => {
     const directory = await project("cli-connections");
     const file = join(directory, "harnest.yaml");

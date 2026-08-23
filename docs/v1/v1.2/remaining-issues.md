@@ -5,14 +5,14 @@
 ## 외부 통합 검증
 
 - 실제 OpenAI·Anthropic credential과 로컬 Ollama model로 provider-native multi-turn Tool call을 재검증한다.
-- 실제 Firecrawl, self-hosted SearXNG, vendor MCP OAuth consent server에서 인증·rate limit·pagination·오류 응답을 검증한다.
+- 실제 Firecrawl와 self-hosted SearXNG에서 인증·rate limit·pagination·오류 응답을 검증한다. Morit MCP는 실제 Protected Resource Metadata → 별도 SSO metadata → DCR/PKCE authorization redirect까지 검증했지만 사용자 로그인·consent·token refresh/revoke는 계정 세션이 있어야 닫힌다.
 - 공개 GitHub/GitLab Skill repository와 실제 npm Skill package로 exact pin download를 검증한다. 현재 자동화는 mock archive/registry로 checksum, traversal, link, size 제한을 검증한다.
 
 ## 플랫폼 검증
 
 - Windows에서 DPAPI vault를 검증했다. macOS Keychain과 Linux Secret Service backend는 해당 OS CI에서 동일 lifecycle을 실행해야 한다.
 - Docker CLI는 설치돼 있지만 daemon이 실행 중이지 않아 실제 image pull/container E2E를 수행하지 못했다. fake engine integration은 image digest approval, no-network/read-only/cap-drop/non-root/resource arguments, timeout과 process tree cleanup을 검증한다.
-- in-app browser로 Template, Connection, Skill install/hash approval, compatible Tool attach, Save/Validate/Run/Test/Trace를 검증했다. 실제 OAuth popup과 canvas pointer edge 재배선은 별도 시각 회귀 대상이다.
+- in-app browser로 새 Recipe launchpad, 자동 저장/검증, Service form, Morit MCP OAuth auto-discovery 설정, Try, A/B Compare, Test/Activity와 기존 Skill/Tool 흐름을 검증했다. 실제 OAuth consent popup 완료와 canvas pointer edge 재배선은 별도 시각 회귀 대상이다.
 
 ## 의도한 배포 경계
 

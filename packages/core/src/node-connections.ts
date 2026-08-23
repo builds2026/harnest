@@ -24,6 +24,8 @@ import { Readable } from "node:stream";
 import {
   auth,
   Client,
+  discoverAuthorizationServerMetadata,
+  discoverOAuthProtectedResourceMetadata,
   InsufficientScopeError,
   selectClientAuthMethod,
   StreamableHTTPClientTransport,
@@ -1299,7 +1301,10 @@ export class ConnectionManager implements ConnectionCatalog {
     this.#assertVaultBinding(current, await this.#vault.read(binding));
     if (options.revoke && current.kind === "mcp" && current.config.transport === "http") {
       try {
-        await this.#revokeOAuth(current, options.allowNetworkHosts);
+        await this.#revokeOAuth(
+          current,
+          await this.oauthNetworkHostsFor(current.id, options.allowNetworkHosts),
+        );
       } catch (cause) {
         const message = safeMessage(cause, await this.#secretValues(current));
         return this.#setStatus(current, {
@@ -1545,13 +1550,19 @@ export class ConnectionManager implements ConnectionCatalog {
     let authorizationUrl: URL | undefined;
     const provider = await this.#oauthProvider(profile, redirect.toString(), options.scope, (url) => { authorizationUrl = url; });
     let result: Awaited<ReturnType<typeof auth>>;
+    let allowedOAuthHosts: true | readonly string[];
     try {
+      allowedOAuthHosts = await oauthNetworkHosts(
+        profile.config.url,
+        options.allowNetworkHosts,
+        options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
+      );
       result = await auth(provider, {
         serverUrl: profile.config.url,
         ...(options.scope ? { scope: options.scope } : {}),
         ...((options.forceReauthorization === true || profile.status.state === "insufficient_scope")
           ? { forceReauthorization: true } : {}),
-        fetchFn: guardedFetch(options.allowNetworkHosts, {
+        fetchFn: guardedFetch(allowedOAuthHosts, {
           timeoutMs: options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
           maxResponseBytes: MAX_DISCOVERY_BYTES,
         }),
@@ -1572,7 +1583,7 @@ export class ConnectionManager implements ConnectionCatalog {
     this.#assertVaultBinding(profile, entry);
     const session = entry?.oauthSession;
     if (!authorizationUrl || !session) throw new ConnectionError("OAUTH_INVALID", "OAuth did not produce an authorization redirect", id);
-    assertAllowedUrl(authorizationUrl, options.allowNetworkHosts);
+    assertAllowedUrl(authorizationUrl, allowedOAuthHosts);
     await this.#setStatus(profile, {
       state: "needs_auth",
       checkedAt: timestamp(this.#now),
@@ -1616,15 +1627,21 @@ export class ConnectionManager implements ConnectionCatalog {
     }
     const provider = await this.#oauthProvider(profile, session.redirectUrl, session.requestedScope, () => undefined);
     await this.#consumeOAuthState(profile, receivedState);
-    const transport = new StreamableHTTPClientTransport(new URL(profile.config.url), {
-      authProvider: provider,
-      fetch: guardedFetch(options.allowNetworkHosts, {
-        timeoutMs: options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
-        maxResponseBytes: MAX_DISCOVERY_BYTES,
-      }),
-      onInsufficientScope: "throw",
-    });
     try {
+      const allowedOAuthHosts = await oauthNetworkHosts(
+        profile.config.url,
+        options.allowNetworkHosts,
+        options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
+        session.discovery,
+      );
+      const transport = new StreamableHTTPClientTransport(new URL(profile.config.url), {
+        authProvider: provider,
+        fetch: guardedFetch(allowedOAuthHosts, {
+          timeoutMs: options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
+          maxResponseBytes: MAX_DISCOVERY_BYTES,
+        }),
+        onInsufficientScope: "throw",
+      });
       await transport.finishAuth(callback);
       await this.#clearOAuthSession(profile);
       return this.#setStatus(profile, {
@@ -1645,6 +1662,24 @@ export class ConnectionManager implements ConnectionCatalog {
     this.#assertVaultBinding(profile, entry);
     const session = entry?.oauthSession;
     return this.#oauthProvider(profile, redirectUrl ?? session?.redirectUrl, session?.requestedScope, () => undefined);
+  }
+
+  async oauthNetworkHostsFor(
+    id: string,
+    allowed?: true | readonly string[],
+    timeoutMs = OAUTH_FETCH_TIMEOUT_MS,
+  ): Promise<true | readonly string[]> {
+    const profile = await this.require(id, "mcp");
+    if (profile.config.transport !== "http" || typeof profile.config.url !== "string") return allowed ?? [];
+    const entry = await this.#vault.read(await this.#binding(profile.scope, profile.id));
+    this.#assertVaultBinding(profile, entry);
+    const current = entry?.oauth?.latest ?? Object.values(entry?.oauth ?? {}).at(-1);
+    return oauthNetworkHosts(
+      profile.config.url,
+      allowed,
+      timeoutMs,
+      entry?.oauthSession?.discovery ?? current?.discovery,
+    );
   }
 
   async #oauthProvider(
@@ -2162,6 +2197,62 @@ function assertAllowedUrl(url: URL, allowed: true | readonly string[] | undefine
   );
 }
 
+const OAUTH_METADATA_ENDPOINTS = [
+  "authorization_endpoint",
+  "token_endpoint",
+  "registration_endpoint",
+  "revocation_endpoint",
+  "userinfo_endpoint",
+  "jwks_uri",
+] as const;
+
+function addDiscoveredOAuthHost(hosts: Set<string>, value: unknown): URL | undefined {
+  if (typeof value !== "string") return undefined;
+  const url = secureEndpoint(value, "Discovered OAuth endpoint");
+  hosts.add(url.host.toLocaleLowerCase());
+  if (hosts.size > 32) throw new ConnectionError("OAUTH_INVALID", "OAuth discovery declared too many network hosts");
+  return url;
+}
+
+async function oauthNetworkHosts(
+  serverUrlValue: string,
+  allowed: true | readonly string[] | undefined,
+  timeoutMs: number,
+  discovery?: OAuthDiscoveryState,
+): Promise<true | readonly string[]> {
+  if (allowed === true) return true;
+  const serverUrl = secureEndpoint(serverUrlValue, "MCP resource");
+  const hosts = new Set((allowed ?? []).map((host) => host.toLocaleLowerCase()));
+  hosts.add(serverUrl.host.toLocaleLowerCase());
+
+  let resourceMetadata = discovery?.resourceMetadata;
+  if (!resourceMetadata && !discovery?.authorizationServerUrl) {
+    resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+      serverUrl,
+      undefined,
+      guardedFetch([...hosts], { timeoutMs, maxResponseBytes: MAX_DISCOVERY_BYTES }),
+    );
+  }
+  const authorizationServers = resourceMetadata?.authorization_servers ?? [];
+  const authorizationServer = addDiscoveredOAuthHost(
+    hosts,
+    discovery?.authorizationServerUrl ?? authorizationServers[0] ?? serverUrl.origin,
+  );
+  for (const value of authorizationServers.slice(1, 16)) addDiscoveredOAuthHost(hosts, value);
+
+  let metadata = discovery?.authorizationServerMetadata;
+  if (!metadata && authorizationServer) {
+    metadata = await discoverAuthorizationServerMetadata(authorizationServer, {
+      fetchFn: guardedFetch([...hosts], { timeoutMs, maxResponseBytes: MAX_DISCOVERY_BYTES }),
+    });
+  }
+  const metadataRecord: Record<string, unknown> | undefined = metadata
+    ? Object.fromEntries(Object.entries(metadata))
+    : undefined;
+  for (const field of OAUTH_METADATA_ENDPOINTS) addDiscoveredOAuthHost(hosts, metadataRecord?.[field]);
+  return [...hosts];
+}
+
 async function boundedResponse(response: Response, maxBytes: number): Promise<Response> {
   if (!response.body) return response;
   const reader = response.body.getReader();
@@ -2480,7 +2571,11 @@ export async function openMcpConnection(
   } else {
     if (typeof profile.config.url !== "string") throw new ConnectionError("CONNECTION_INVALID", "MCP HTTP URL is missing", profile.id);
     const url = new URL(profile.config.url);
-    assertAllowedUrl(url, options.allowNetworkHosts);
+    const oauth = profile.config.oauth === true || isRecord(profile.config.oauth);
+    const allowedNetworkHosts = oauth
+      ? await manager.oauthNetworkHostsFor(profile.id, options.allowNetworkHosts, timeout)
+      : options.allowNetworkHosts;
+    assertAllowedUrl(url, allowedNetworkHosts);
     const headers = new Headers();
     if (isRecord(profile.config.headers)) {
       for (const [name, value] of Object.entries(profile.config.headers)) if (typeof value === "string") headers.set(name, value);
@@ -2493,9 +2588,8 @@ export async function openMcpConnection(
         headers.set(name, value);
       }
     }
-    const oauth = profile.config.oauth === true || isRecord(profile.config.oauth);
     transport = new StreamableHTTPClientTransport(url, {
-      fetch: guardedFetch(options.allowNetworkHosts, { timeoutMs: timeout, maxStreamBytes: MAX_DISCOVERY_BYTES }),
+      fetch: guardedFetch(allowedNetworkHosts, { timeoutMs: timeout, maxStreamBytes: MAX_DISCOVERY_BYTES }),
       requestInit: { headers, redirect: "error" },
       ...(oauth ? { authProvider: await manager.oauthProviderFor(profile.id) } : {}),
       onInsufficientScope: "throw",

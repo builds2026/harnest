@@ -95,7 +95,7 @@ function ConnectionForm({
     <form className="connection-form" onSubmit={submit}>
       <div className="sheet-section-heading"><span>{connection ? "Edit connection" : "Connection settings"}</span><small>{definition.label}</small></div>
       <div className="field-grid">
-        {requestedId && !connection && <div className="source-review"><span>Required Connection id</span><code>{requestedId}</code><p>This immutable id comes from the Skill requirement and will be wired automatically.</p></div>}
+        {requestedId && !connection && <div className="source-review"><span>Required service id</span><code>{requestedId}</code><p>This id comes from the harness requirement and will be wired automatically.</p></div>}
         <div className="field"><label htmlFor="connection-name">Name</label><input ref={firstField} id="connection-name" required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></div>
         <div className="field"><label htmlFor="connection-scope">Scope</label><select id="connection-scope" disabled={Boolean(connection)} value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="project">This project</option><option value="user">All local projects</option></select><span className="field-help">Project connections stay beside this harness. User connections can be reused locally.</span></div>
         {kind === "provider" && <>
@@ -140,7 +140,7 @@ function ConnectionForm({
         {(kind === "mcp-http" || kind === "http-api") && (
           <div className="field"><label htmlFor="connection-url">Server URL</label><input id="connection-url" type="url" required placeholder="https://…" value={String(config.url ?? "")} onChange={(event) => update("url", event.target.value)} /></div>
         )}
-        {kind === "mcp-http" && <div className="field"><label htmlFor="connection-mcp-auth">Authentication</label><select id="connection-mcp-auth" value={config.oauth === true ? "oauth" : "token"} onChange={(event) => update("oauth", event.target.value === "oauth")}><option value="oauth">OAuth in browser · auto-discover</option><option value="token">Bearer token</option></select></div>}
+        {kind === "mcp-http" && <div className="field"><label htmlFor="connection-mcp-auth">Sign-in method</label><select id="connection-mcp-auth" value={config.oauth === true ? "oauth" : "token"} onChange={(event) => update("oauth", event.target.value === "oauth")}><option value="oauth">Browser sign-in · details auto-detected</option><option value="token">Bearer token</option></select><span className="field-help">Harnest discovers the OAuth server, scopes, PKCE, and registration details from the MCP URL.</span></div>}
         {kind === "local-runtime" && <>
           <div className="field"><label htmlFor="connection-runtime">Code runtime</label><select id="connection-runtime" value={String(config.runtime ?? "node")} onChange={(event) => setConfig((current) => ({ ...current, runtime: event.target.value, image: DEFAULT_SANDBOX_IMAGES[event.target.value as keyof typeof DEFAULT_SANDBOX_IMAGES] }))}><option value="node">Node.js</option><option value="python">Python</option></select></div>
           <div className="field"><label htmlFor="connection-image">Sandbox image</label><input id="connection-image" required value={String(config.image ?? "")} onChange={(event) => update("image", event.target.value)} /><span className="field-help">Docker or Podman is detected automatically. Connect downloads this image once and runs code with no network or project mount.</span></div>
@@ -401,7 +401,7 @@ export function ConnectionManager({
   return (
     <div className="sheet-backdrop">
       <section className="connection-sheet" role="dialog" aria-modal="true" aria-labelledby="connection-sheet-title">
-        <header className="sheet-header"><div><span className="sheet-eyebrow">Connect once · reuse anywhere</span><h2 id="connection-sheet-title">Connections</h2></div><button className="sheet-close" aria-label="Close connections" disabled={busy} onClick={onClose}>×</button></header>
+        <header className="sheet-header"><div><span className="sheet-eyebrow">Connect once · reuse anywhere</span><h2 id="connection-sheet-title">Services</h2></div><button className="sheet-close" aria-label="Close services" disabled={busy} onClick={onClose}>×</button></header>
         {message && <div className="sheet-message" role="status">{message}</div>}
         {mode === "kind" && <div className="connection-kind-grid">
           {definitions.map((item) => <button key={item.id} className="connection-kind" onClick={() => { setKind(item.id); setMode("form"); }}><strong>{item.label}</strong><span>{item.description}</span></button>)}
@@ -409,7 +409,7 @@ export function ConnectionManager({
         </div>}
         {mode === "form" && <ConnectionForm connection={editing} requestedId={requestedId} kind={kind} definition={definition} busy={busy} onCancel={() => { setEditing(undefined); setMode("list"); }} onSaved={save} />}
         {mode === "list" && <>
-          <div className="connection-toolbar"><label className="sr-only" htmlFor="connection-search">Search connections</label><input ref={search} id="connection-search" type="search" placeholder="Search connections" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="button button-primary" onClick={() => setMode("kind")}>New connection</button></div>
+          <div className="connection-toolbar"><label className="sr-only" htmlFor="connection-search">Search services</label><input ref={search} id="connection-search" type="search" placeholder="Search services" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="button button-primary" onClick={() => setMode("kind")}>Add service</button></div>
           <div className="connection-list">
             {visible.length ? visible.map((connection) => {
               const main = primary(connection);
@@ -432,7 +432,7 @@ export function ConnectionManager({
                   : <button className="button" disabled={busy} onClick={() => setDeleteId(connection.id)}>Delete</button>}
               </div></details>
             </article>;
-            }) : <div className="connection-empty"><strong>{connections.length ? "No connections match" : "No connections yet"}</strong><span>Pick a service, sign in or add its key, and Harnest will test and wire it for you.</span></div>}
+            }) : <div className="connection-empty"><strong>{connections.length ? "No services match" : "No services yet"}</strong><span>Pick a service, sign in or add its key, and Harnest will test and wire it for you.</span></div>}
           </div>
         </>}
       </section>

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AdapterError,
   AdapterRegistry,
   createBuiltinComponentRegistry,
   HarnessRuntime,
@@ -181,6 +182,67 @@ describe("v1.2 Agent Tool loop", () => {
       expect.objectContaining({ text: "[REDACTED]" }),
     ]);
     expect(result.output).toBe("[REDACTED]");
+  });
+
+  it("falls back once on a retryable Provider failure and keeps metered usage", async () => {
+    let primaryCalls = 0;
+    let backupCalls = 0;
+    const primary: ModelAdapter = {
+      id: "primary",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run() {
+        primaryCalls += 1;
+        yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+        throw new AdapterError("primary unavailable", {
+          adapterId: "primary",
+          code: "provider_unavailable",
+          retryable: true,
+        });
+      },
+    };
+    const backup: ModelAdapter = {
+      id: "backup",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run(request) {
+        backupCalls += 1;
+        expect(request.model).toBe("backup-model");
+        yield { type: "usage", usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } };
+        yield { type: "text-delta", text: "backup answer" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const graph = spec();
+    graph.components[0] = {
+      id: "model",
+      type: "model",
+      config: { connectionId: "primary-provider", fallbackConnectionId: "backup-provider" },
+    };
+    const services: RuntimeServices = {
+      async resolveConnection(connectionId) {
+        return { value: connectionId === "primary-provider"
+          ? {
+              adapter: "primary", model: "primary-model", connectionKind: "provider",
+              inputCostPerMillion: 1, outputCostPerMillion: 1,
+            }
+          : {
+              adapter: "backup", model: "backup-model", connectionKind: "provider",
+              inputCostPerMillion: 2, outputCostPerMillion: 2,
+            } };
+      },
+    };
+
+    const result = await new HarnessRuntime(
+      graph,
+      new AdapterRegistry().register(primary).register(backup),
+      { services },
+    ).invoke("recover");
+    expect(result).toMatchObject({ output: "backup answer", usage: { totalTokens: 5 } });
+    expect(result.costUsd).toBeCloseTo(0.000008);
+    expect(primaryCalls).toBe(1);
+    expect(backupCalls).toBe(1);
+    expect(result.trace).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "fallback", from: "primary-provider", to: "backup-provider", turn: 1 }),
+    ]));
   });
 
   it("fails closed when an unmetered Provider turn exceeds the output byte limit", async () => {

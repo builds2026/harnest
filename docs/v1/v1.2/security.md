@@ -33,6 +33,12 @@ Harnest는 graph를 신뢰된 실행 코드로 취급하지 않는다. graph에�
 - 각 provider 응답은 최대 128개 Tool call과 call당 1 MiB argument만 수용한다. Agent는 수신 중에도 구성된 `maxToolCalls`(기본 32, 최대 128)를 적용하고 Tool input snapshot도 1 MiB로 제한한다.
 - Agent는 한 provider turn의 text delta 합계가 8 MiB를 넘으면 실행을 중단한다.
 
+## 배포 번들
+
+- `harnest bundle`은 semantic validation을 통과한 `harnest.yaml`과 project의 `assets/` regular file만 standard ZIP `.harnest`에 저장한다.
+- `.env`, Connection metadata/vault, OAuth token, Trace, Memory, `.harnest/` local state는 탐색하거나 포함하지 않는다.
+- asset link·junction·special file을 거부하고 1,000 files/64 MiB로 제한하며 deterministic path/order/time을 사용한다. 기존 artifact는 덮어쓰지 않는다.
+
 ## Studio HTTP 경계
 
 - Next proxy는 page, asset, API를 포함한 모든 Studio request의 raw `Host`가 URL과 일치하는 literal `127.0.0.1` 또는 `[::1]`인지 검사하며, 다른 Host는 `403`으로 거부한다.

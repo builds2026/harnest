@@ -104,6 +104,15 @@ export type RunEvent =
     iteration: number;
   })
   | (RunEventBase & {
+    type: "fallback";
+    nodeId: string;
+    from: string;
+    to: string;
+    reason: string;
+    turn: number;
+    iteration: number;
+  })
+  | (RunEventBase & {
     type: "evaluation";
     nodeId: string;
     evaluator: string;
@@ -897,6 +906,14 @@ export class HarnessRuntime {
       skill: event.skill,
       ...(event.resources === undefined ? {} : { resources: event.resources }),
       ...(event.trusted === undefined ? {} : { trusted: event.trusted }),
+    });
+    else if (event.type === "fallback") run.emit({
+      ...base,
+      type: "fallback",
+      from: event.from,
+      to: event.to,
+      reason: event.reason,
+      turn: event.turn,
     });
     else if (event.type === "evaluation") run.emit({
       ...base,

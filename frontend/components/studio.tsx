@@ -8,7 +8,9 @@ import {
   validateCandidateConnection,
   type ComponentManifest,
   type Diagnostic,
+  type HarnessAssertion,
   type HarnessSpec,
+  type HarnessTestCase,
   type RunEvent,
 } from "@harnest/core";
 import {
@@ -63,7 +65,14 @@ import { ConnectionManager } from "./connection-manager";
 import { CompatiblePicker } from "./compatible-picker";
 import { CustomToolManager } from "./custom-tool-manager";
 import { SkillManager } from "./skill-manager";
-import { connectionCanRun, missingConnectionSetup, type ConnectionKind, type ConnectionSummary } from "@/lib/connections";
+import {
+  connectionCanRun,
+  connectionKindLabel,
+  missingConnectionSetup,
+  type ConnectionKind,
+  type ConnectionSummary,
+} from "@/lib/connections";
+import { formatExperimentValue, parseExperimentValue } from "@/lib/experiments";
 import {
   CONNECTION_TYPE_CATALOG,
   TEMPLATE_CATALOG,
@@ -96,7 +105,7 @@ type BootState =
   | { phase: "ready"; payload: SpecPayload };
 
 type RunPhase = "idle" | "starting" | "streaming" | "cancelling" | "cancelled" | "success" | "error";
-type DockTab = "yaml" | "problems" | "run" | "tests" | "trace";
+type DockTab = "yaml" | "problems" | "run" | "tests" | "experiments" | "trace";
 
 type AttachmentPicker = { nodeId: string; slot: "tools" | "skills"; pendingItemId?: string };
 type PendingSkillAttach = { nodeId: string; skillId: string };
@@ -132,6 +141,27 @@ interface TestReport {
   cases: TestCaseResult[];
 }
 
+type SimpleTestAssertion = Extract<HarnessAssertion, { value: string }>;
+
+const SIMPLE_TEST_ASSERTIONS: readonly SimpleTestAssertion["type"][] = ["includes", "equals", "matches"];
+
+const testAssertions = (test: HarnessTestCase): readonly HarnessAssertion[] => {
+  if ("assertions" in test && test.assertions) return test.assertions;
+  return test.assertion ? [test.assertion] : [];
+};
+
+const simpleTestAssertion = (test: HarnessTestCase) => testAssertions(test)
+  .find((assertion): assertion is SimpleTestAssertion => "value" in assertion);
+
+const replaceSimpleTestAssertion = (test: HarnessTestCase, assertion: SimpleTestAssertion): HarnessTestCase => {
+  if ("assertions" in test && test.assertions) {
+    const index = test.assertions.findIndex((candidate) => "value" in candidate);
+    if (index < 0) return test;
+    return { ...test, assertions: test.assertions.map((candidate, candidateIndex) => candidateIndex === index ? assertion : candidate) };
+  }
+  return { ...test, assertion };
+};
+
 interface StoredRun {
   runId: string;
   startedAt?: string;
@@ -141,6 +171,44 @@ interface StoredRun {
   costUsd?: number;
   events?: RunEvent[];
 }
+
+interface ExperimentResult {
+  readonly id: string;
+  readonly label: string;
+  readonly ok: boolean;
+  readonly runId?: string;
+  readonly output?: unknown;
+  readonly durationMs?: number;
+  readonly usage?: Record<string, number>;
+  readonly costUsd?: number;
+  readonly quality?: { readonly passed: number; readonly total: number; readonly averageScore?: number };
+  readonly error?: string;
+  readonly diagnostics?: Diagnostic[];
+}
+
+const PALETTE_LABELS: Readonly<Record<PaletteKind, string>> = {
+  components: "Build",
+  tools: "Tools",
+  skills: "Skills",
+  connections: "Services",
+  templates: "Recipes",
+};
+
+const DOCK_LABELS: Readonly<Record<DockTab, string>> = {
+  problems: "Setup",
+  run: "Try",
+  tests: "Tests",
+  experiments: "Compare",
+  trace: "Activity",
+  yaml: "YAML",
+};
+
+const RISK_LABELS: Readonly<Record<string, string>> = {
+  read: "Reads data",
+  write: "Changes data",
+  external: "Contacts an external service",
+  destructive: "Can delete or overwrite data",
+};
 
 interface PendingToolApproval {
   readonly runId: string;
@@ -203,6 +271,7 @@ const eventSummary = (event: RunEvent) => {
     case "skill-activate": return `${String(data.nodeId ?? "Agent")} activated ${String(data.skill ?? data.skillId ?? "skill")}`;
     case "skill-resource": return `${String(data.skill ?? data.skillId ?? "Skill")} loaded ${String(data.resource ?? "resource")}`;
     case "skill-use": return `${String(data.nodeId ?? "Agent")} activated ${String(data.skill ?? "skill")}${Array.isArray(data.resources) ? ` · ${data.resources.length} resource(s)` : ""}${data.trusted === false ? " · scripts untrusted" : ""}`;
+    case "fallback": return `${String(data.from ?? "Primary provider")} → ${String(data.to ?? "fallback provider")} · turn ${String(data.turn ?? "")}`.trim();
     case "evaluation": return `${String(data.nodeId ?? "Evaluator")}: ${data.passed === false ? "failed" : "passed"}`;
     case "run-end": return `Run completed in ${Math.round(Number(data.durationMs ?? 0))}ms`;
     case "error": return String(data.message ?? "Run failed");
@@ -280,6 +349,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   );
   const [activeSubgraph, setActiveSubgraph] = useState<string>();
   const [activeDock, setActiveDock] = useState<DockTab>(initial.exists ? "problems" : "run");
+  const [welcomeDismissed, setWelcomeDismissed] = useState(initial.exists);
   const [paletteKind, setPaletteKind] = useState<PaletteKind>(initial.exists ? "components" : "templates");
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteCategory, setPaletteCategory] = useState("all");
@@ -320,6 +390,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [activeEdgeIds, setActiveEdgeIds] = useState<ReadonlySet<string>>(new Set());
   const [testPhase, setTestPhase] = useState<"idle" | "running" | "error">("idle");
   const [testReport, setTestReport] = useState<TestReport>();
+  const [experimentComponentId, setExperimentComponentId] = useState("");
+  const [experimentField, setExperimentField] = useState("");
+  const [experimentA, setExperimentA] = useState("");
+  const [experimentB, setExperimentB] = useState("");
+  const [experimentPhase, setExperimentPhase] = useState<"idle" | "running" | "error">("idle");
+  const [experimentResults, setExperimentResults] = useState<ExperimentResult[]>([]);
   const [storedRuns, setStoredRuns] = useState<StoredRun[]>([]);
   const [storedRunPhase, setStoredRunPhase] = useState<"idle" | "loading" | "error">("idle");
   const [pendingApprovals, setPendingApprovals] = useState<PendingToolApproval[]>([]);
@@ -331,6 +407,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     edgeIds: new Set(),
   });
   const abortRef = useRef<AbortController | null>(null);
+  const experimentAbortRef = useRef<AbortController | null>(null);
   const autoSetup = useRef(initial.exists);
   const autoSetupProgress = useRef(false);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -460,7 +537,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   const errorDiagnostics = document.diagnostics.filter((item) => item.severity === "error");
   const displayedDiagnostics = document.yamlState === "synced" ? document.diagnostics : document.yamlDiagnostics;
-  const running = runPhase === "starting" || runPhase === "streaming" || runPhase === "cancelling";
+  const runInProgress = runPhase === "starting" || runPhase === "streaming" || runPhase === "cancelling";
+  const experimentRunning = experimentPhase === "running";
+  const running = runInProgress || experimentRunning;
   const graphLocked = running || document.yamlState !== "synced";
   const dirty = document.revision !== document.savedRevision || document.yamlState !== "synced";
   const structurallyValid = useMemo(
@@ -474,6 +553,31 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const canRun = !running && !dirty && serverValidated;
   const selectedNode = viewDraft.nodes.find((node) => node.selected);
   const selectedEdge = viewDraft.edges.find((edge) => edge.selected);
+  const welcome = !welcomeDismissed && !initial.exists && viewDraft.nodes.length === 0;
+  const experimentComponents = useMemo(() => viewDraft.nodes
+    .map((node) => node.data.component)
+    .filter((component) => Object.keys(component.config as Record<string, unknown>).length > 0), [viewDraft.nodes]);
+  const experimentComponent = experimentComponents.find(({ id }) => id === experimentComponentId)
+    ?? experimentComponents[0];
+  const experimentFields = experimentComponent
+    ? Object.keys(experimentComponent.config as Record<string, unknown>).sort()
+    : [];
+  const selectedExperimentField = experimentFields.includes(experimentField)
+    ? experimentField
+    : experimentFields[0] ?? "";
+  const experimentSample = experimentComponent && selectedExperimentField
+    ? (experimentComponent.config as Record<string, unknown>)[selectedExperimentField]
+    : undefined;
+  const canCompare = canRun && Boolean(experimentComponent && selectedExperimentField);
+  const experimentSampleText = formatExperimentValue(experimentSample);
+  useEffect(() => {
+    setExperimentA(experimentSampleText);
+    setExperimentB(typeof experimentSample === "number"
+      ? formatExperimentValue(experimentSample + 0.5)
+      : typeof experimentSample === "boolean"
+        ? formatExperimentValue(!experimentSample)
+        : experimentSampleText);
+  }, [experimentComponent?.id, experimentSample, experimentSampleText, selectedExperimentField]);
   const paletteItems = useMemo<PaletteViewItem[]>(() => {
     if (paletteKind === "components") return catalog.map((manifest) => ({
       key: `components:${manifest.type}`, id: manifest.type, kind: paletteKind, label: manifest.label,
@@ -872,6 +976,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       for (const graph of Object.values(next.subgraphs)) graph.components = graph.components.map(equip) as typeof graph.components;
     }
     dispatch({ type: "replace-draft", draft: specToDraft(next, catalog), touch: "semantic" });
+    setWelcomeDismissed(true);
     setActiveSubgraph(undefined);
     setSelectedTemplateId(template.id);
     setRunInput(template.sampleInput);
@@ -1065,6 +1170,17 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     setActiveDock("yaml");
     setStatusNote(`${file.name} loaded into the YAML draft. Apply it to update the canvas.`);
   }, [editYaml, running]);
+
+  const openYaml = useCallback(async (file?: File) => {
+    if (!file || running) return;
+    const text = await file.text();
+    const parsed = parseYamlDraft(text, catalog);
+    dispatch({ type: "edit-yaml", text, pendingSpec: parsed.spec, diagnostics: parsed.diagnostics, parseOk: parsed.parseOk });
+    if (parsed.spec) dispatch({ type: "apply-yaml" });
+    setWelcomeDismissed(true);
+    setActiveDock(parsed.spec ? "problems" : "yaml");
+    setStatusNote(parsed.spec ? `${file.name} opened` : `${file.name} needs YAML fixes before it can be used`);
+  }, [catalog, running]);
 
   const exportYaml = useCallback(() => {
     const blob = new Blob([document.yamlText], { type: "application/yaml;charset=utf-8" });
@@ -1395,8 +1511,60 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     }
   }, [dirty, loadStoredRuns, serverValidated, testPhase]);
 
+  const runExperiment = useCallback(async () => {
+    if (!canCompare || !experimentComponent || !selectedExperimentField) return;
+    let left: unknown;
+    let right: unknown;
+    try {
+      left = parseExperimentValue(experimentA, experimentSample);
+      right = parseExperimentValue(experimentB, experimentSample);
+    } catch (error) {
+      setExperimentPhase("error");
+      setStatusNote(error instanceof Error ? error.message : "Comparison values are invalid");
+      return;
+    }
+    const controller = new AbortController();
+    experimentAbortRef.current = controller;
+    setActiveDock("experiments");
+    setExperimentPhase("running");
+    setExperimentResults([]);
+    setStatusNote(`Comparing ${experimentComponent.id}.${selectedExperimentField} with the same input…`);
+    try {
+      const response = await fetch("/api/experiments", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          spec: draftToSpec(document.draft),
+          input: runInput,
+          variants: [
+            { id: "a", label: "A", componentId: experimentComponent.id, config: { [selectedExperimentField]: left } },
+            { id: "b", label: "B", componentId: experimentComponent.id, config: { [selectedExperimentField]: right } },
+          ],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(await responseMessage(response));
+      const payload = await response.json() as { results: ExperimentResult[] };
+      setExperimentResults(payload.results);
+      setExperimentPhase(payload.results.every(({ ok }) => ok) ? "idle" : "error");
+      setStatusNote(`Comparison finished · ${payload.results.filter(({ ok }) => ok).length}/${payload.results.length} variants completed`);
+      void loadStoredRuns();
+    } catch (error) {
+      setExperimentPhase(controller.signal.aborted ? "idle" : "error");
+      setStatusNote(controller.signal.aborted ? "Comparison cancelled" : error instanceof Error ? error.message : "Comparison failed");
+    } finally {
+      if (experimentAbortRef.current === controller) experimentAbortRef.current = null;
+    }
+  }, [canCompare, document.draft, experimentA, experimentB, experimentComponent, experimentSample,
+    loadStoredRuns, runInput, selectedExperimentField]);
+
+  const cancelExperiment = useCallback(() => {
+    experimentAbortRef.current?.abort();
+  }, []);
+
   useEffect(() => () => {
     abortRef.current?.abort();
+    experimentAbortRef.current?.abort();
     for (const timer of pulseTimers.current) clearTimeout(timer);
     pulseTimers.current.clear();
   }, []);
@@ -1419,18 +1587,62 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [canSave, save]);
 
-  const wired = viewDraft.nodes.length > 0 && !errorDiagnostics.some((diagnostic) =>
-    /^(?:PORT_|CONNECTION_|GRAPH_|ENTRYPOINT_)/.test(diagnostic.code));
+  useEffect(() => {
+    if (!canSave) return;
+    const timer = setTimeout(() => void save(), 650);
+    return () => clearTimeout(timer);
+  }, [canSave, save]);
+
+  useEffect(() => {
+    if (!canValidate || document.validatedSemanticRevision !== null || document.draft.nodes.length === 0) return;
+    const timer = setTimeout(() => void validate(), 350);
+    return () => clearTimeout(timer);
+  }, [canValidate, document.draft.nodes.length, document.validatedSemanticRevision, validate]);
+
   const completedRun = runPhase === "success";
-  const templateReady = Boolean(selectedTemplateId || initial.exists || viewDraft.nodes.length);
+  const templateReady = viewDraft.nodes.length > 0;
   const requiredConnectionKinds = selectedTemplateId
     ? studioCatalog.templates.find((template) => template.id === selectedTemplateId)?.connectionKinds ?? []
     : [];
-  const connectionReady = requiredConnectionKinds.length
-    ? requiredConnectionKinds.every((kind) => connections.some((connection) => connection.kind === kind && connectionCanRun(connection)))
-    : connections.some(connectionCanRun);
-  const traceReady = trace.length > 0 || storedRuns.length > 0;
-  const statusClass = runPhase === "error" || savePhase === "error" || displayedDiagnostics.some((item) => item.severity === "error")
+  const draftComponents = [
+    ...document.draft.nodes,
+    ...Object.values(document.draft.subgraphs).flatMap((graph) => graph.nodes),
+  ].map((node) => node.data.component);
+  const configuredConnection = missingConnectionSetup(draftComponents, connections, studioCatalog.tools);
+  const requiredConnectionKind = requiredConnectionKinds.find((kind) => !connections.some((connection) =>
+    connection.kind === kind && connectionCanRun(connection)));
+  const nextConnectionSetup = configuredConnection
+    ?? (requiredConnectionKind ? { kind: requiredConnectionKind } : undefined);
+  const connectionReady = !nextConnectionSetup;
+  const finalRunEvent = trace.findLast((event) => event.type === "run-end");
+  const finalRunData = finalRunEvent ? eventData(finalRunEvent) : undefined;
+  const savedTests = draftToSpec(document.draft).tests ?? [];
+  const replaceTests = (tests: HarnessTestCase[]) => {
+    const root = { ...document.draft.root };
+    if (tests.length) root.tests = tests;
+    else delete root.tests;
+    setTestReport(undefined);
+    dispatch({ type: "replace-draft", draft: { ...document.draft, root }, touch: "semantic" });
+  };
+  const updateTest = (index: number, update: (test: HarnessTestCase) => HarnessTestCase) => {
+    replaceTests(savedTests.map((test, testIndex) => testIndex === index ? update(test) : test));
+  };
+  const addTest = () => {
+    const id = uniqueComponentId("case", new Set(savedTests.map((test) => test.id)));
+    const test: HarnessTestCase = {
+      id,
+      input: runInput.trim() || "Hello",
+      assertion: { type: "includes", value: "expected text" },
+    };
+    replaceTests([...savedTests, test]);
+    setActiveDock("tests");
+  };
+  const removeTest = (index: number) => {
+    if (!window.confirm(`Remove test '${savedTests[index]?.id ?? index + 1}'?`)) return;
+    replaceTests(savedTests.filter((_, testIndex) => testIndex !== index));
+  };
+  const statusClass = runPhase === "error" || experimentPhase === "error" || savePhase === "error"
+    || displayedDiagnostics.some((item) => item.severity === "error")
     ? "is-fault"
     : running || document.validationPhase === "checking"
       ? "is-signal"
@@ -1449,7 +1661,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       <button className="button button-primary" disabled={!document.pendingSpec || running} onClick={() => dispatch({ type: "apply-yaml" })}>Apply YAML</button>
     </div>
   );
-  const dockTabs: DockTab[] = ["problems", "run", "tests", "trace", "yaml"];
+  const dockTabs: DockTab[] = ["problems", "run", "tests", "experiments", "trace", "yaml"];
   const moveDockFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, tab: DockTab) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
     event.preventDefault();
@@ -1462,32 +1674,77 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   };
 
   return (
-    <main className="studio-shell">
+    <main className={`studio-shell ${welcome ? "is-welcome" : ""}`}>
       <header className="command-rail">
         <div className="brand-lockup">
           <span className="brand-name">Harnest</span>
           <span className="project-name" title={initial.file}>{initial.file.split(/[\\/]/).pop()}</span>
           {dirty && <span className="dirty-dot" title="Unsaved changes" />}
         </div>
-        <div className="continuity-rail" aria-label="Commissioning progress">
-          <span className={`continuity-step ${templateReady ? "is-pass" : "is-active"}`}><span>Template</span></span>
-          <span className={`continuity-step ${connectionReady ? "is-pass" : templateReady ? "is-active" : ""}`}><span>Connect</span></span>
-          <span className={`continuity-step ${wired ? "is-pass" : connectionReady ? "is-active" : ""}`}><span>Equip</span></span>
-          <span className={`continuity-step ${serverValidated ? "is-pass" : wired ? "is-active" : ""}`}><span>Validate</span></span>
-          <span className={`continuity-step ${running ? "is-active" : completedRun ? "is-pass" : serverValidated ? "is-active" : ""}`}><span>Run</span></span>
-          <span className={`continuity-step ${traceReady ? "is-pass" : completedRun ? "is-active" : ""}`}><span>Trace</span></span>
-        </div>
-        <div className="rail-actions">
-          <button className="button button-rail" disabled={!canSave} onClick={() => void save()}>{savePhase === "saving" ? "Saving…" : "Save"}</button>
-          <button className="button button-rail" disabled={!canValidate} onClick={() => void validate()}>{document.validationPhase === "checking" ? "Checking…" : "Validate"}</button>
-          {running
-            ? <button className="button button-danger" disabled={runPhase === "cancelling"} onClick={cancelRun}>{runPhase === "cancelling" ? "Cancelling…" : "Cancel"}</button>
-            : <button className="button button-rail button-primary" disabled={!canRun} onClick={() => void run()}>Run</button>}
-        </div>
+        {welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
+          <div className="continuity-rail" aria-label="Setup progress">
+            <span className={`continuity-step ${templateReady ? "is-pass" : "is-active"}`}><span>Recipe</span></span>
+            <span className={`continuity-step ${connectionReady ? "is-pass" : templateReady ? "is-active" : ""}`}><span>Services</span></span>
+            <span className={`continuity-step ${serverValidated ? "is-pass" : connectionReady ? "is-active" : ""}`}><span>Ready</span></span>
+            <span className={`continuity-step ${completedRun ? "is-pass" : serverValidated ? "is-active" : ""}`}><span>Result</span></span>
+          </div>
+          <div className="rail-actions">
+            {running ? (
+              <button className="button button-danger" disabled={runPhase === "cancelling"} onClick={experimentRunning ? cancelExperiment : cancelRun}>
+                {runPhase === "cancelling" ? "Cancelling…" : experimentRunning ? "Cancel comparison" : "Cancel run"}
+              </button>
+            ) : nextConnectionSetup ? (
+              <button className="button button-primary" onClick={() => openConnections(
+                nextConnectionSetup.kind,
+                undefined,
+                "id" in nextConnectionSetup ? nextConnectionSetup.id : undefined,
+              )}>Connect {connectionKindLabel(nextConnectionSetup.kind)}</button>
+            ) : errorDiagnostics.length ? (
+              <button className="button button-primary" onClick={() => setActiveDock("problems")}>Review {errorDiagnostics.length} setup issue{errorDiagnostics.length === 1 ? "" : "s"}</button>
+            ) : dirty || savePhase === "saving" ? (
+              <button className="button button-rail" disabled>{savePhase === "saving" ? "Saving changes…" : "Changes queued…"}</button>
+            ) : document.validationPhase === "checking" || document.validatedSemanticRevision === null ? (
+              <button className="button button-rail" disabled>Checking setup…</button>
+            ) : serverValidated ? (
+              <button className="button button-primary" onClick={() => setActiveDock("run")}>Try this harness</button>
+            ) : <button className="button button-rail" disabled>Preparing…</button>}
+          </div>
+        </>}
       </header>
 
+      {welcome ? (
+        <section className="welcome-launchpad" aria-labelledby="welcome-title">
+          <div className="welcome-intro">
+            <span className="sheet-eyebrow">Working harness in minutes</span>
+            <h1 id="welcome-title">Start from the result you want.</h1>
+            <p>Pick a recipe. Harnest builds the graph, asks only for the services it needs, and checks the setup automatically.</p>
+            <div className="welcome-steps" aria-label="What happens next">
+              <span><strong>1</strong> Choose a recipe</span>
+              <span><strong>2</strong> Connect services</span>
+              <span><strong>3</strong> Try a real request</span>
+            </div>
+          </div>
+          <div className="recipe-grid">
+            {studioCatalog.templates.map((template) => (
+              <button className="recipe-card" key={template.id} onClick={() => applyTemplate(template)}>
+                <span className="recipe-meta"><span>{template.category}</span><span>~{Math.max(2, (template.connectionKinds?.length ?? 0) * 2)} min</span></span>
+                <strong>{template.label}</strong>
+                <span className="recipe-outcome">{template.description}</span>
+                <span className="recipe-needs"><small>Needs</small>{template.connectionKinds?.map(connectionKindLabel).join(" + ") || "No external service"}</span>
+                <span className="recipe-sample"><small>Try</small>“{template.sampleInput}”</span>
+                <span className="recipe-action">Use this recipe →</span>
+              </button>
+            ))}
+          </div>
+          <div className="welcome-alternatives">
+            <span>Already have a harness?</span>
+            <label className="button file-button">Open YAML<input type="file" accept=".yaml,.yml,text/yaml" onChange={(event) => void openYaml(event.target.files?.[0])} /></label>
+            <button className="button" onClick={() => { setWelcomeDismissed(true); setPaletteKind("components"); }}>Build from blank</button>
+          </div>
+        </section>
+      ) : <>
       <aside className="palette-panel" aria-label="Studio palette">
-        <div className="panel-heading"><h2>Palette</h2><span className="panel-count">{visiblePalette.length}/{paletteItems.length}</span></div>
+        <div className="panel-heading"><h2>Add to harness</h2><span className="panel-count">{visiblePalette.length}/{paletteItems.length}</span></div>
         <div className="palette-tabs" role="tablist" aria-label="Palette catalogs">
           {PALETTE_KINDS.map((kind) => <button
             key={kind}
@@ -1495,12 +1752,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             aria-selected={paletteKind === kind}
             className={`palette-tab ${paletteKind === kind ? "is-active" : ""}`}
             onClick={() => { setPaletteKind(kind); setPaletteCategory("all"); setPaletteQuery(""); }}
-          >{kind}</button>)}
+          >{PALETTE_LABELS[kind]}</button>)}
         </div>
         {(paletteKind === "tools" || paletteKind === "skills") && <div className="palette-create"><button className="button" onClick={() => paletteKind === "tools" ? setCustomToolOpen(true) : setSkillManagerOpen(true)}>{paletteKind === "tools" ? "New custom tool" : "Manage skills"}</button></div>}
         <div className="palette-filters">
           <label className="sr-only" htmlFor="palette-search">Search palette</label>
-          <input id="palette-search" type="search" placeholder={`Search ${paletteKind}`} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)} />
+          <input id="palette-search" type="search" placeholder={`Search ${PALETTE_LABELS[paletteKind].toLocaleLowerCase()}`} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)} />
           <label className="sr-only" htmlFor="palette-category">Palette category</label>
           <select id="palette-category" value={paletteCategory} onChange={(event) => setPaletteCategory(event.target.value)}>
             <option value="all">All categories</option>
@@ -1553,7 +1810,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           )}
           <span className="utility-label">{viewDraft.nodes.length} components · {viewDraft.edges.length} connections</span>
         </div>
-        {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">First commissioning</span><strong>Start with a proven harness</strong><span>Choose a template, connect its runtime, then validate before the first run.</span><div className="onboarding-templates">{studioCatalog.templates.map((template) => <button key={template.id} onClick={() => applyTemplate(template)}><strong>{template.label}</strong><small>{template.category}</small></button>)}</div><button className="onboarding-blank" onClick={() => setPaletteKind("components")}>Or build from components</button></div>}
+        {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">Blank harness</span><strong>Add the first building block</strong><span>Use Build on the left, or switch to Recipes for a working graph.</span><button className="onboarding-blank" onClick={() => setPaletteKind("templates")}>Browse recipes</button></div>}
         <ReactFlow<HarnessNode, HarnessEdge>
           nodes={displayNodes}
           edges={displayEdges}
@@ -1596,7 +1853,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       </section>
 
       <aside className="inspector-panel" aria-label="Component and connection inspector">
-        <div className="panel-heading"><h2>Inspector</h2><span className="panel-count">{selectedEdge ? "connection" : selectedNode?.data.component.type ?? "none"}</span></div>
+        <div className="panel-heading"><h2>Configure</h2><span className="panel-count">{selectedEdge ? "connection" : selectedNode?.data.component.type ?? "none"}</span></div>
         <Inspector
           node={selectedNode}
           edge={selectedEdge}
@@ -1633,7 +1890,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         />
       </aside>
 
-      <section className="bottom-dock" aria-label="Diagnostics, run, tests, trace, and advanced YAML">
+      <section className="bottom-dock" aria-label="Setup, try, tests, comparisons, activity, and YAML">
         <div className="dock-heading">
           <div className="dock-tabs" role="tablist" aria-label="Studio dock">
             {dockTabs.map((tab) => (
@@ -1648,7 +1905,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
                 onClick={() => setActiveDock(tab)}
                 onKeyDown={(event) => moveDockFocus(event, tab)}
               >
-                {tab === "yaml" ? "Advanced" : tab}{tab === "problems" && displayedDiagnostics.length > 0 && <span className="tab-badge">{displayedDiagnostics.length}</span>}
+                {DOCK_LABELS[tab]}{tab === "problems" && displayedDiagnostics.length > 0 && <span className="tab-badge">{displayedDiagnostics.length}</span>}
               </button>
             ))}
           </div>
@@ -1680,36 +1937,101 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           {activeDock === "run" && (
             <div className="run-pane">
               <div className="run-controls">
-                <label className="field-label" htmlFor="run-input">Run input</label>
+                <div><span className="sheet-eyebrow">Live request</span><strong>Ask this harness</strong></div>
+                <label className="field-label" htmlFor="run-input">Your request</label>
                 <textarea id="run-input" className="run-input" value={runInput} disabled={running} placeholder="Ask the harness something…" onChange={(event) => setRunInput(event.target.value)} />
-                {running
-                  ? <button className="button button-danger" onClick={cancelRun}>Cancel run</button>
-                  : <button className="button button-primary" disabled={!canRun} onClick={() => void run()}>Run saved harness</button>}
-                <div className="run-meta"><span>{runPhase}</span>{runId && <span>{runId}</span>}{runUsage !== undefined && <span>{JSON.stringify(runUsage)}</span>}</div>
+                {runInProgress
+                  ? <button className="button button-danger" onClick={cancelRun}>Cancel request</button>
+                  : <button className="button button-primary" disabled={!canRun} onClick={() => void run()}>Send request</button>}
+                {!canRun && !runInProgress && <small className="run-guidance">Finish the highlighted setup action above; saving and checks happen automatically.</small>}
               </div>
-              <pre className="run-output" aria-live="polite">{runOutput || (running ? "Waiting for the first streamed event…" : "Run output will stream here.")}</pre>
+              <div className="run-result" aria-live="polite">
+                <div className="run-result-heading"><span className="sheet-eyebrow">Answer</span><strong>{runPhase === "success" ? "Completed" : runInProgress ? "Working…" : "Ready when you are"}</strong></div>
+                <pre className="run-output">{runOutput || (runInProgress ? "The harness is running. If a tool needs permission, you will be asked here." : "The answer will appear here.")}</pre>
+                {(runId || runUsage !== undefined) && <details className="run-details"><summary>Run details</summary><div className="run-meta"><span>{finalRunData?.durationMs ? `${Math.round(Number(finalRunData.durationMs))}ms` : runPhase}</span>{typeof finalRunData?.costUsd === "number" && <span>${Number(finalRunData.costUsd).toFixed(6)}</span>}{runUsage !== undefined && <span>{JSON.stringify(runUsage)}</span>}{runId && <span>Run {runId}</span>}</div></details>}
+              </div>
             </div>
           )}
           {activeDock === "tests" && (
             <div className="tests-pane">
               <div className="tests-toolbar">
-                <div><strong>Saved harness tests</strong><span>{draftToSpec(document.draft).tests?.length ?? 0} cases</span></div>
-                <button className="button button-primary" disabled={dirty || !serverValidated || testPhase === "running"} onClick={() => void runTests()}>{testPhase === "running" ? "Running…" : "Run tests"}</button>
-              </div>
-              {testReport ? (
-                <div className="test-report">
-                  <div className={`test-summary ${testReport.ok ? "is-pass" : "is-fault"}`}>{testReport.passed} passed · {testReport.failed} failed</div>
-                  <ul className="test-list">
-                    {testReport.cases.map((test) => (
-                      <li key={test.id} className="test-item">
-                        <span className={`test-state ${test.ok ? "is-pass" : "is-fault"}`}>{test.ok ? "pass" : "fail"}</span>
-                        <span><strong>{test.id}</strong>{test.error && <small>{test.error}</small>}{test.assertions && <small>{JSON.stringify(test.assertions)}</small>}</span>
-                        <span className="trace-meta">{Math.round(test.durationMs)}ms</span>
-                      </li>
-                    ))}
-                  </ul>
+                <div><strong>Test cases</strong><span>{savedTests.length} saved</span></div>
+                <div className="tests-actions">
+                  <button className="button" disabled={running || document.yamlState !== "synced"} onClick={addTest}>Add case</button>
+                  <button className="button button-primary" disabled={!savedTests.length || dirty || !serverValidated || testPhase === "running"} onClick={() => void runTests()}>{testPhase === "running" ? "Running…" : "Run all"}</button>
                 </div>
-              ) : <div className="empty-dock">Run the saved cases to inspect evaluator results.</div>}
+              </div>
+              <div className="tests-workspace">
+                <section className="test-case-list" aria-label="Editable test cases">
+                  {savedTests.length ? savedTests.map((test, index) => {
+                    const assertion = simpleTestAssertion(test);
+                    const assertionCount = testAssertions(test).length;
+                    return <article className="test-case-editor" key={`${index}:${test.id}`}>
+                      <div className="test-case-heading">
+                        <label><span>Case ID</span><input value={test.id} maxLength={64} disabled={running} onChange={(event) => updateTest(index, (current) => ({ ...current, id: event.target.value }))} /></label>
+                        <button className="button" disabled={running} title={`Remove ${test.id}`} onClick={() => removeTest(index)}>Remove</button>
+                      </div>
+                      {typeof test.input === "string" ? <label className="test-case-field"><span>Request</span><textarea value={test.input} disabled={running} onChange={(event) => updateTest(index, (current) => ({ ...current, input: event.target.value }))} /></label>
+                        : <div className="test-case-advanced"><span>Structured request</span><small>This input is preserved. Use YAML to edit objects or arrays.</small></div>}
+                      {assertion ? <div className="test-expectation">
+                        <label><span>Expect</span><select value={assertion.type} disabled={running} onChange={(event) => updateTest(index, (current) => replaceSimpleTestAssertion(current, { ...assertion, type: event.target.value as SimpleTestAssertion["type"] }))}>{SIMPLE_TEST_ASSERTIONS.map((type) => <option value={type} key={type}>{type === "includes" ? "contains text" : type === "equals" ? "equals text" : "matches pattern"}</option>)}</select></label>
+                        <label><span>{assertion.type === "matches" ? "Pattern" : "Expected text"}</span><input value={assertion.value} disabled={running} onChange={(event) => updateTest(index, (current) => replaceSimpleTestAssertion(current, { ...assertion, value: event.target.value }))} /></label>
+                        {assertionCount > 1 && <small>{assertionCount - 1} additional advanced check{assertionCount === 2 ? "" : "s"} stay unchanged.</small>}
+                      </div> : <div className="test-case-advanced"><span>{assertionCount} advanced check{assertionCount === 1 ? "" : "s"}</span><small>This case will still run unchanged.</small><button className="button" onClick={() => setActiveDock("yaml")}>Edit in YAML</button></div>}
+                    </article>;
+                  }) : <div className="empty-dock"><span>No test cases yet.</span><button className="button button-primary" onClick={addTest}>Add your first case</button></div>}
+                </section>
+                {testReport ? (
+                  <div className="test-report">
+                    <div className={`test-summary ${testReport.ok ? "is-pass" : "is-fault"}`}><strong>{Math.round((testReport.passed / Math.max(1, testReport.passed + testReport.failed)) * 100)}% success</strong><span>{testReport.passed} passed · {testReport.failed} failed</span></div>
+                    <ul className="test-list">
+                      {testReport.cases.map((test) => (
+                        <li key={test.id} className="test-item">
+                          <span className={`test-state ${test.ok ? "is-pass" : "is-fault"}`}>{test.ok ? "pass" : "fail"}</span>
+                          <span><strong>{test.id}</strong>{test.error && <small>{test.error}</small>}{test.assertions && <small>{JSON.stringify(test.assertions)}</small>}</span>
+                          <span className="trace-meta">{Math.round(test.durationMs)}ms</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : <div className="empty-dock">{savedTests.length ? "Run all after automatic saving and setup checks finish." : "Add a case to turn a good answer into a repeatable check."}</div>}
+              </div>
+            </div>
+          )}
+          {activeDock === "experiments" && (
+            <div className="experiment-pane">
+              <div className="experiment-config">
+                <div><span className="sheet-eyebrow">A/B comparison</span><strong>Change one setting, keep the input fixed</strong><small>Both variants run against the current saved harness.</small></div>
+                <label className="field-label" htmlFor="experiment-component">Component</label>
+                <select id="experiment-component" value={experimentComponent?.id ?? ""} disabled={experimentRunning} onChange={(event) => { setExperimentComponentId(event.target.value); setExperimentField(""); }}>
+                  {experimentComponents.map((component) => <option key={component.id} value={component.id}>{component.id} · {component.type}</option>)}
+                </select>
+                <label className="field-label" htmlFor="experiment-field">Setting</label>
+                <select id="experiment-field" value={selectedExperimentField} disabled={experimentRunning} onChange={(event) => setExperimentField(event.target.value)}>
+                  {experimentFields.map((field) => <option key={field} value={field}>{field}</option>)}
+                </select>
+                <div className="experiment-values">
+                  <label><span>Variant A</span><textarea value={experimentA} disabled={experimentRunning} onChange={(event) => setExperimentA(event.target.value)} /></label>
+                  <label><span>Variant B</span><textarea value={experimentB} disabled={experimentRunning} onChange={(event) => setExperimentB(event.target.value)} /></label>
+                </div>
+                <label className="field-label" htmlFor="experiment-input">Same input for both</label>
+                <textarea id="experiment-input" className="run-input" value={runInput} disabled={experimentRunning} placeholder="Ask both variants the same thing…" onChange={(event) => setRunInput(event.target.value)} />
+                {experimentRunning
+                  ? <button className="button button-danger" onClick={cancelExperiment}>Cancel comparison</button>
+                  : <button className="button button-primary" disabled={!canCompare} onClick={() => void runExperiment()}>Run A and B</button>}
+                {!canCompare && !experimentRunning && <small className="run-guidance">The harness must be saved and ready before comparing variants.</small>}
+              </div>
+              <div className="experiment-results" aria-live="polite">
+                {experimentResults.length ? experimentResults.map((result) => {
+                  const tokens = result.usage?.totalTokens
+                    ?? (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0);
+                  return <article className={`experiment-result ${result.ok ? "is-pass" : "is-fault"}`} key={result.id}>
+                    <header><span>{result.label}</span><strong>{result.ok ? `${Math.round(result.durationMs ?? 0)}ms` : "Needs attention"}</strong></header>
+                    <pre>{result.ok ? formatOutput(result.output) : result.error ?? result.diagnostics?.map(({ message }) => message).join("\n") ?? "Variant failed"}</pre>
+                    <footer>{result.quality && <span>{result.quality.passed}/{result.quality.total} checks{result.quality.averageScore === undefined ? "" : ` · score ${result.quality.averageScore.toFixed(2)}`}</span>}<span>{tokens ? `${tokens} tokens` : "Usage unavailable"}</span><span>{result.costUsd ? `$${result.costUsd.toFixed(6)}` : "$0 reported"}</span>{result.runId && <span>{result.runId.slice(0, 12)}</span>}</footer>
+                  </article>;
+                }) : <div className="empty-dock">Choose a component setting. Harnest will run A, then B, and show both answers with timing and usage.</div>}
+              </div>
             </div>
           )}
           {activeDock === "trace" && (
@@ -1755,6 +2077,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         <span>{errorDiagnostics.length ? `${errorDiagnostics.length} errors` : document.validationPhase}</span>
         {dirty && <span>unsaved</span>}
       </footer>
+      </>}
 
       <ConnectionManager
         open={connectionManagerOpen}
@@ -1798,16 +2121,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       />
       {pendingApproval && <div className="approval-backdrop">
         <section className="approval-dialog" role="alertdialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description">
-          <header><span className="sheet-eyebrow">One-call execution gate</span><h2 id="approval-title">Approve {pendingApproval.tool}?</h2></header>
+          <header><span className="sheet-eyebrow">Tool permission</span><h2 id="approval-title">Allow {pendingApproval.tool} this time?</h2></header>
           <div className="approval-body">
-            <div className="approval-meter"><span>Risk</span><strong className={`risk-${pendingApproval.risk}`}>{pendingApproval.risk}</strong><span>Turn</span><strong>{pendingApproval.turn ?? "—"}</strong></div>
-            <p id="approval-description">Review the model-generated argument preview. This decision is bound to the immutable JSON digest for this exact node, turn, and call.</p>
-            <div className="approval-meter"><span>Bytes</span><strong>{pendingApproval.inputBytes}</strong><span>Preview</span><strong>{pendingApproval.previewLimited ? "redacted / bounded" : "exact"}</strong></div>
-            {pendingApproval.previewLimited && <p className="field-error">Approval is disabled because the complete arguments cannot be displayed safely. Deny this call and reduce its input.</p>}
-            <p><small>SHA-256 <code>{pendingApproval.inputDigest.slice(7)}</code></small></p>
+            <div className="approval-meter"><span>What it can do</span><strong className={`risk-${pendingApproval.risk}`}>{RISK_LABELS[pendingApproval.risk] ?? pendingApproval.risk}</strong><span>Agent step</span><strong>{pendingApproval.turn ?? "—"}</strong></div>
+            <p id="approval-description">Review the exact arguments the agent wants to send. Allowing this applies to this call only.</p>
+            <div className="approval-meter"><span>Request size</span><strong>{pendingApproval.inputBytes} bytes</strong><span>Preview</span><strong>{pendingApproval.previewLimited ? "Incomplete" : "Complete"}</strong></div>
+            {pendingApproval.previewLimited && <p className="field-error">The complete arguments cannot be shown safely, so this call cannot be allowed. Deny it and reduce the input.</p>}
             <pre>{JSON.stringify(pendingApproval.input, null, 2)}</pre>
+            <details className="approval-advanced"><summary>Advanced verification</summary><small>SHA-256 <code>{pendingApproval.inputDigest.slice(7)}</code></small></details>
           </div>
-          <footer><button className="button" disabled={approvalBusy} onClick={() => void decideApproval(false)}>Deny</button><button className="button button-primary" disabled={approvalBusy || pendingApproval.previewLimited} onClick={() => void decideApproval(true)}>{approvalBusy ? "Sending…" : "Approve once"}</button></footer>
+          <footer><button className="button" disabled={approvalBusy} onClick={() => void decideApproval(false)}>Don&apos;t allow</button><button className="button button-primary" disabled={approvalBusy || pendingApproval.previewLimited} onClick={() => void decideApproval(true)}>{approvalBusy ? "Sending…" : "Allow once"}</button></footer>
         </section>
       </div>}
     </main>

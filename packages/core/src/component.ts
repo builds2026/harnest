@@ -5,14 +5,15 @@ import {
   SAFE_REGEX_MAX_PATTERN_LENGTH,
   type SafeRegexIssue,
 } from "./safe-regex.js";
-import type {
-  AdapterRegistry,
-  FinishReason,
-  ModelEvent,
-  ModelMessage,
-  ModelRequest,
-  ModelToolCall,
-  TokenUsage,
+import {
+  AdapterError,
+  type AdapterRegistry,
+  type FinishReason,
+  type ModelEvent,
+  type ModelMessage,
+  type ModelRequest,
+  type ModelToolCall,
+  type TokenUsage,
 } from "./adapter.js";
 import type {
   ComponentSpec,
@@ -145,6 +146,7 @@ export type ComponentEvent =
   | { type: "tool-approval"; tool: string; callId: string; turn: number; approved: boolean; source?: string; reason?: string }
   | { type: "tool-result"; tool: string; ok: boolean; output?: unknown; error?: string; durationMs: number; callId?: string; turn?: number }
   | { type: "skill-use"; skill: string; resources?: readonly string[]; trusted?: boolean }
+  | { type: "fallback"; from: string; to: string; reason: string; turn: number }
   | { type: "evaluation"; evaluator: string; passed: boolean; score?: number; message?: string }
   | { type: "iteration"; iteration: number; phase: "start" | "end"; output?: unknown };
 
@@ -530,29 +532,35 @@ const providerToolName = (id: string): string => {
   return normalized || "tool";
 };
 
-const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
-  let model = asRecord(inputs.model);
-  if (model && typeof model.connectionId === "string") {
-    if (!context.services.resolveConnection) {
-      throw new ComponentExecutionError("CONNECTION_SERVICE_UNAVAILABLE", "This runtime cannot resolve saved Connections");
-    }
-    const resolved = asRecord((await context.services.resolveConnection(
-      model.connectionId,
-      serviceContext(context),
-    )).value);
-    if (!resolved || resolved.connectionKind !== "provider") {
-      throw new ComponentExecutionError("CONNECTION_INVALID", `Connection '${model.connectionId}' is not a Provider connection`);
-    }
-    const overrides = Object.fromEntries([
-      "model",
-      "temperature",
-      "maxTokens",
-      "inputCostPerMillion",
-      "outputCostPerMillion",
-    ].flatMap((key) => model && model[key] !== undefined ? [[key, model[key]]] : []));
-    // Provider routing and credentials stay bound to the saved Connection; only inference settings may vary per node.
-    model = { ...resolved, ...overrides, connectionId: model.connectionId };
+async function resolveProviderModel(
+  configured: Record<string, unknown>,
+  connectionId: string | undefined,
+  context: ComponentExecutionContext,
+  primary: boolean,
+): Promise<Record<string, unknown>> {
+  if (!connectionId) return configured;
+  if (!context.services.resolveConnection) {
+    throw new ComponentExecutionError("CONNECTION_SERVICE_UNAVAILABLE", "This runtime cannot resolve saved Connections");
   }
+  const resolved = asRecord((await context.services.resolveConnection(connectionId, serviceContext(context))).value);
+  if (!resolved || resolved.connectionKind !== "provider") {
+    throw new ComponentExecutionError("CONNECTION_INVALID", `Connection '${connectionId}' is not a Provider connection`);
+  }
+  const overrides = Object.fromEntries((primary
+    ? ["model", "temperature", "maxTokens", "inputCostPerMillion", "outputCostPerMillion"]
+    : ["temperature", "maxTokens"]
+  ).flatMap((key) => configured[key] !== undefined ? [[key, configured[key]]] : []));
+  return { ...resolved, ...overrides, connectionId };
+}
+
+const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
+  const configuredModel = asRecord(inputs.model);
+  const primaryConnectionId = typeof configuredModel?.connectionId === "string" ? configuredModel.connectionId : undefined;
+  const fallbackConnectionId = typeof configuredModel?.fallbackConnectionId === "string"
+    ? configuredModel.fallbackConnectionId : undefined;
+  let model = configuredModel
+    ? await resolveProviderModel(configuredModel, primaryConnectionId, context, true)
+    : undefined;
   if (!model || typeof model.adapter !== "string" || typeof model.model !== "string") {
     throw new ComponentExecutionError("AGENT_MODEL_INVALID", "Agent requires a model input");
   }
@@ -623,6 +631,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
   const connectedToolIds = new Set(graphBindings.map(({ id }) => id));
   const connectedConnectionIds = new Set([
     ...(typeof model.connectionId === "string" ? [model.connectionId] : []),
+    ...(fallbackConnectionId ? [fallbackConnectionId] : []),
     ...graphBindings.flatMap(({ connectionId }) => connectionId ? [connectionId] : []),
   ]);
   for (const skill of activeSkills) {
@@ -647,7 +656,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       `Skill '${skill.id}' is missing ${missing.join(", ")}`,
     );
   }
-  const adapter = context.adapters.get(model.adapter);
+  let adapter = context.adapters.get(model.adapter);
   const resourceBindings: ToolBinding[] = adapter.capabilities.tools === true && context.services.loadSkillResource
     ? activeSkills.map(({ id }) => ({
         id: `skill-resource.${id}`,
@@ -685,97 +694,147 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
   const toolTimeoutMs = typeof component.config.toolTimeoutMs === "number" ? Math.floor(component.config.toolTimeoutMs) : 30_000;
   const recoverToolErrors = component.config.toolError !== "fail";
   let usage: TokenUsage = {};
+  let costUsd = 0;
+  let costKnown = true;
   let finishReason: FinishReason = "unknown";
   let toolCalls = 0;
   let finalText = "";
   let completed = false;
+  let fallbackUsed = false;
+  let usageKnown = true;
   const seenToolCallIds = new Set<string>();
+  const commitUsage = (turnUsage: TokenUsage, turnModel: Record<string, unknown>) => {
+    usage = sumUsage(usage, turnUsage);
+    const turnUsageKnown = turnUsage.totalTokens !== undefined
+      || (turnUsage.inputTokens !== undefined && turnUsage.outputTokens !== undefined);
+    const turnCostKnown = typeof turnModel.inputCostPerMillion === "number"
+      && typeof turnModel.outputCostPerMillion === "number"
+      && turnUsage.inputTokens !== undefined
+      && turnUsage.outputTokens !== undefined;
+    usageKnown = usageKnown && turnUsageKnown;
+    costKnown = costKnown && turnCostKnown;
+    costUsd += costFor(turnUsage, turnModel);
+  };
   for (let turn = 1; turn <= maxTurns; turn += 1) {
-    const request: ModelRequest = {
-      model: model.model,
-      messages,
-      ...(typeof model.baseUrl === "string" ? { baseUrl: model.baseUrl } : {}),
-      ...(typeof model.apiKey === "string" ? { apiKey: model.apiKey } : {}),
-      ...(typeof model.temperature === "number" ? { temperature: model.temperature } : {}),
-      ...(typeof model.maxTokens === "number" ? { maxTokens: model.maxTokens } : {}),
-      ...(context.responseSchema ? { responseSchema: context.responseSchema } : {}),
-      ...(modelTools.length ? { tools: modelTools } : {}),
-    };
-    const iterator = adapter.run(request, {
-      signal: context.signal,
-      resolveSecret: context.resolveSecret,
-      ...(context.services.fetchProvider ? {
-        fetch: (url, init) => context.services.fetchProvider!(url, init, serviceContext(context)),
-      } : {}),
-    })[Symbol.asyncIterator]();
-    const calls: ModelToolCall[] = [];
+    let calls: ModelToolCall[] = [];
     let turnUsage: TokenUsage = {};
     let text = "";
     let textBytes = 0;
     let finished = false;
-    try {
-      while (true) {
-        const result = await nextWithSignal<ModelEvent>(iterator, context.signal);
-        if (result.done) break;
-        if (result.value.type === "text-delta") {
-          const deltaBytes = boundedUtf8ByteLength(result.value.text, MAX_PROVIDER_TURN_BYTES - textBytes);
-          if (deltaBytes === undefined) throw new ComponentExecutionError(
-            "AGENT_OUTPUT_LIMIT",
-            "Provider output exceeded the 8 MiB per-turn limit",
-          );
-          textBytes += deltaBytes;
-          text += result.value.text;
-        } else if (result.value.type === "tool-call") {
-          if (toolCalls + calls.length >= maxToolCalls) throw new ComponentExecutionError(
-            "AGENT_TOOL_CALL_LIMIT",
-            `Agent exceeded ${maxToolCalls} Tool calls`,
-          );
-          if (!result.value.call.id || seenToolCallIds.has(result.value.call.id)) throw new ComponentExecutionError(
-            "TOOL_CALL_DUPLICATE",
-            `Provider returned a missing or duplicate Tool call id '${result.value.call.id}'`,
-          );
-          seenToolCallIds.add(result.value.call.id);
-          const providerMetadata = result.value.call.providerMetadata;
-          if (providerMetadata !== undefined && !asRecord(providerMetadata)) throw new ComponentExecutionError(
-            "TOOL_CALL_INVALID", "Provider Tool-call metadata must be a JSON object",
-          );
-          calls.push({
-            id: result.value.call.id,
-            name: result.value.call.name,
-            input: snapshotToolInput(result.value.call.input),
-            ...(providerMetadata === undefined ? {} : {
-              providerMetadata: snapshotToolInput(providerMetadata) as Readonly<Record<string, unknown>>,
-            }),
-          });
-        } else if (result.value.type === "usage") {
-          turnUsage = mergedUsage(turnUsage, result.value.usage);
-          const cumulativeUsage = sumUsage(usage, turnUsage);
-          context.emit({ type: "usage", usage: cumulativeUsage, costUsd: costFor(cumulativeUsage, model) });
-          if (typeof component.config.maxTokens === "number"
-            && (cumulativeUsage.totalTokens ?? 0) > component.config.maxTokens) {
-            throw new ComponentExecutionError("AGENT_TOKEN_LIMIT", `Agent exceeded ${component.config.maxTokens} tokens`);
-          }
-          if (typeof component.config.maxCostUsd === "number") {
-            if (typeof model.inputCostPerMillion !== "number" || typeof model.outputCostPerMillion !== "number") {
-              throw new ComponentExecutionError("AGENT_COST_UNAVAILABLE", "Agent cost limit requires model pricing");
+    while (true) {
+      const request: ModelRequest = {
+        model: model.model as string,
+        messages,
+        ...(typeof model.baseUrl === "string" ? { baseUrl: model.baseUrl } : {}),
+        ...(typeof model.apiKey === "string" ? { apiKey: model.apiKey } : {}),
+        ...(typeof model.temperature === "number" ? { temperature: model.temperature } : {}),
+        ...(typeof model.maxTokens === "number" ? { maxTokens: model.maxTokens } : {}),
+        ...(context.responseSchema ? { responseSchema: context.responseSchema } : {}),
+        ...(modelTools.length ? { tools: modelTools } : {}),
+      };
+      let iterator: AsyncIterator<ModelEvent> | undefined;
+      try {
+        iterator = adapter.run(request, {
+          signal: context.signal,
+          resolveSecret: context.resolveSecret,
+          ...(context.services.fetchProvider ? {
+            fetch: (url, init) => context.services.fetchProvider!(url, init, serviceContext(context)),
+          } : {}),
+        })[Symbol.asyncIterator]();
+        while (true) {
+          const result = await nextWithSignal<ModelEvent>(iterator, context.signal);
+          if (result.done) break;
+          if (result.value.type === "text-delta") {
+            const deltaBytes = boundedUtf8ByteLength(result.value.text, MAX_PROVIDER_TURN_BYTES - textBytes);
+            if (deltaBytes === undefined) throw new ComponentExecutionError(
+              "AGENT_OUTPUT_LIMIT",
+              "Provider output exceeded the 8 MiB per-turn limit",
+            );
+            textBytes += deltaBytes;
+            text += result.value.text;
+          } else if (result.value.type === "tool-call") {
+            const call = result.value.call;
+            if (toolCalls + calls.length >= maxToolCalls) throw new ComponentExecutionError(
+              "AGENT_TOOL_CALL_LIMIT",
+              `Agent exceeded ${maxToolCalls} Tool calls`,
+            );
+            if (!call.id || seenToolCallIds.has(call.id)
+              || calls.some(({ id }) => id === call.id)) throw new ComponentExecutionError(
+              "TOOL_CALL_DUPLICATE",
+              `Provider returned a missing or duplicate Tool call id '${call.id}'`,
+            );
+            const providerMetadata = call.providerMetadata;
+            if (providerMetadata !== undefined && !asRecord(providerMetadata)) throw new ComponentExecutionError(
+              "TOOL_CALL_INVALID", "Provider Tool-call metadata must be a JSON object",
+            );
+            calls.push({
+              id: call.id,
+              name: call.name,
+              input: snapshotToolInput(call.input),
+              ...(providerMetadata === undefined ? {} : {
+                providerMetadata: snapshotToolInput(providerMetadata) as Readonly<Record<string, unknown>>,
+              }),
+            });
+          } else if (result.value.type === "usage") {
+            turnUsage = mergedUsage(turnUsage, result.value.usage);
+            const cumulativeUsage = sumUsage(usage, turnUsage);
+            const cumulativeCost = costUsd + costFor(turnUsage, model);
+            context.emit({ type: "usage", usage: cumulativeUsage, costUsd: cumulativeCost });
+            if (typeof component.config.maxTokens === "number"
+              && (cumulativeUsage.totalTokens ?? 0) > component.config.maxTokens) {
+              throw new ComponentExecutionError("AGENT_TOKEN_LIMIT", `Agent exceeded ${component.config.maxTokens} tokens`);
             }
-            if (costFor(cumulativeUsage, model) > component.config.maxCostUsd) {
-              throw new ComponentExecutionError("AGENT_COST_LIMIT", `Agent exceeded $${component.config.maxCostUsd}`);
+            if (typeof component.config.maxCostUsd === "number") {
+              if (typeof model.inputCostPerMillion !== "number" || typeof model.outputCostPerMillion !== "number") {
+                throw new ComponentExecutionError("AGENT_COST_UNAVAILABLE", "Agent cost limit requires model pricing");
+              }
+              if (cumulativeCost > component.config.maxCostUsd) {
+                throw new ComponentExecutionError("AGENT_COST_LIMIT", `Agent exceeded $${component.config.maxCostUsd}`);
+              }
             }
+          } else {
+            finishReason = result.value.reason;
+            finished = true;
           }
-        } else {
-          finishReason = result.value.reason;
-          finished = true;
         }
+        break;
+      } catch (cause) {
+        if (!(cause instanceof AdapterError) || !cause.retryable || !fallbackConnectionId
+          || fallbackUsed || !configuredModel || context.signal.aborted) throw cause;
+        commitUsage(turnUsage, model);
+        const from = typeof model.connectionId === "string" ? model.connectionId : `${adapter.id}:${String(model.model)}`;
+        model = await resolveProviderModel(configuredModel, fallbackConnectionId, context, false);
+        if (typeof model.adapter !== "string" || typeof model.model !== "string") {
+          throw new ComponentExecutionError("AGENT_MODEL_INVALID", `Fallback Connection '${fallbackConnectionId}' has no model`);
+        }
+        adapter = context.adapters.get(model.adapter);
+        if (modelTools.length && adapter.capabilities.tools !== true) {
+          throw new ComponentExecutionError("ADAPTER_TOOLS_UNSUPPORTED", `Fallback Adapter '${model.adapter}' does not support Tool calling`);
+        }
+        fallbackUsed = true;
+        context.emit({
+          type: "fallback",
+          from,
+          to: fallbackConnectionId,
+          reason: asText(context.redact(cause.message)),
+          turn,
+        });
+        calls = [];
+        turnUsage = {};
+        text = "";
+        textBytes = 0;
+        finished = false;
+        finishReason = "unknown";
+      } finally {
+        if (iterator?.return) void iterator.return().catch(() => undefined);
       }
-    } finally {
-      if (iterator.return) void iterator.return().catch(() => undefined);
     }
     text = asText(context.redact(text));
     if (text) context.emit({ type: "text-delta", text });
     if (!finished) throw new ComponentExecutionError("ADAPTER_STREAM_INCOMPLETE", "Adapter stream ended without a finish event");
     if (finishReason === "error") throw new ComponentExecutionError("MODEL_FINISH_ERROR", "Model stopped with an error");
-    usage = sumUsage(usage, turnUsage);
+    commitUsage(turnUsage, model);
+    for (const call of calls) seenToolCallIds.add(call.id);
     finalText = text;
     if (calls.length === 0) {
       if (finishReason === "tool") throw new ComponentExecutionError("TOOL_CALL_MISSING", "Provider stopped for a Tool call without returning one");
@@ -868,14 +927,8 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     }
   }
   if (!completed) throw new ComponentExecutionError("AGENT_TURN_LIMIT", `Agent exceeded ${maxTurns} model turns`);
-  const usageKnown = usage.totalTokens !== undefined
-    || (usage.inputTokens !== undefined && usage.outputTokens !== undefined);
   const totalTokens = usage.totalTokens ?? (usage.inputTokens !== undefined && usage.outputTokens !== undefined
     ? usage.inputTokens + usage.outputTokens : undefined);
-  const costKnown = typeof model.inputCostPerMillion === "number"
-    && typeof model.outputCostPerMillion === "number"
-    && usage.inputTokens !== undefined
-    && usage.outputTokens !== undefined;
   if (typeof component.config.maxTokens === "number") {
     if (!usageKnown || totalTokens === undefined) throw new ComponentExecutionError(
       "AGENT_TOKEN_USAGE_UNAVAILABLE",
@@ -891,7 +944,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       "AGENT_COST_UNAVAILABLE",
       "Agent cost limit requires Provider usage reporting and model pricing",
     );
-    if (costFor(usage, model) > component.config.maxCostUsd) throw new ComponentExecutionError(
+    if (costUsd > component.config.maxCostUsd) throw new ComponentExecutionError(
       "AGENT_COST_LIMIT",
       `Agent exceeded $${component.config.maxCostUsd}`,
     );
@@ -900,7 +953,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     outputs: { response: finalText },
     usage,
     usageKnown,
-    costUsd: costFor(usage, model),
+    costUsd,
     costKnown,
     finishReason,
   };
@@ -1253,12 +1306,19 @@ const validateModelComponent: NonNullable<ComponentDefinition["validate"]> = (co
   const hasConnection = typeof component.config.connectionId === "string" && component.config.connectionId.length > 0;
   const hasLegacy = typeof component.config.adapter === "string" && component.config.adapter.length > 0
     && typeof component.config.model === "string" && component.config.model.length > 0;
-  return hasConnection || hasLegacy ? [] : [componentDiagnostic(
-    "MODEL_CONNECTION_REQUIRED",
-    `${context.path}.config.connectionId`,
-    "Model requires a saved Provider Connection or legacy adapter and model",
+  const diagnostics = hasConnection || hasLegacy ? [] : [componentDiagnostic(
+      "MODEL_CONNECTION_REQUIRED",
+      `${context.path}.config.connectionId`,
+      "Model requires a saved Provider Connection or legacy adapter and model",
+      component.id,
+    )];
+  if (hasConnection && component.config.fallbackConnectionId === component.config.connectionId) diagnostics.push(componentDiagnostic(
+    "MODEL_FALLBACK_DUPLICATE",
+    `${context.path}.config.fallbackConnectionId`,
+    "Fallback Provider must differ from the primary Provider",
     component.id,
-  )];
+  ));
+  return diagnostics;
 };
 
 const validateContextComponent: NonNullable<ComponentDefinition["validate"]> = (component, context) => {
@@ -1401,7 +1461,8 @@ const definitions: readonly ComponentDefinition[] = [
     type: "model", label: "Model", category: "Agent", description: "Provider-independent model configuration",
     ports: { inputs: {}, outputs: { model: { type: "model" } } },
     configSchema: objectSchema({
-      connectionId: { type: "string", minLength: 1 }, adapter: { type: "string", minLength: 1 }, model: { type: "string", minLength: 1 }, apiKey: { type: "string" },
+      connectionId: { type: "string", minLength: 1 }, fallbackConnectionId: { type: "string", minLength: 1 },
+      adapter: { type: "string", minLength: 1 }, model: { type: "string", minLength: 1 }, apiKey: { type: "string" },
       baseUrl: { type: "string", format: "uri" }, temperature: { type: "number", minimum: 0, maximum: 2 },
       maxTokens: { type: "integer", minimum: 1 }, inputCostPerMillion: { type: "number", minimum: 0 },
       outputCostPerMillion: { type: "number", minimum: 0 },

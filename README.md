@@ -4,7 +4,7 @@ Harnest is an open-source Visual Graph Engineering Platform for AI agent harness
 
 ## Quick start
 
-Requirements: Node.js 22 or newer and npm 10 or newer.
+Requirements: Node.js 22.15 or newer and npm 10 or newer.
 
 ```bash
 npm install
@@ -16,6 +16,15 @@ npm run harnest -- studio harnest.yaml -- --allow-modules
 ```
 
 Open `http://127.0.0.1:3000`. The root spec uses a deterministic local Echo Adapter, so it runs without a secret or network connection. For a real Gemini + Web Search + Code Runner graph, open [the full-stack example](./examples/gemini-full-stack/README.md); Studio detects its missing Connections and presents them one at a time.
+
+For a new project, start with no YAML editing:
+
+```bash
+npm run harnest -- init my-agent
+npm run harnest -- studio my-agent/harnest.yaml
+```
+
+Studio starts with outcome-based Recipes. Choose one, add only the requested Services, and send the prepared sample request. YAML saving and runtime validation happen automatically. **Setup** explains blockers, **Try** shows the answer first, **Tests** creates and runs repeatable cases, **Compare** runs two component-setting variants against the same input, and **Activity** keeps the technical trace.
 
 ## Executable v0.2 examples
 
@@ -58,6 +67,44 @@ npm run harnest -- connection test|login|disconnect|revoke|delete <id> [file]
 ```
 
 The second `--` before Harnest options is required when invoking the CLI through `npm run`. `connect` saves, authenticates or approves, and tests in one command. Secrets come from a hidden prompt or one named environment variable and are stored in the OS-protected local vault, never in YAML or command arguments.
+
+MCP Streamable HTTP defaults to browser OAuth. Paste the MCP URL; Harnest discovers Protected Resource Metadata, the authorization server, scopes, PKCE and dynamic registration endpoints. A bearer-token mode remains available for servers that require it.
+
+Model components can select a second saved Provider as a fallback. Harnest switches once only after a retryable primary-provider failure, includes both attempts in usage/cost, and records the transition in Activity.
+
+## Use a harness without Studio
+
+The same runtime can be embedded, served over loopback HTTP, or exposed as an MCP tool:
+
+```bash
+# GET /health, POST /invoke, POST /stream (NDJSON)
+npm run harnest -- serve harnest.yaml -- --port 8787 --allow-modules
+
+# stdio MCP server with invoke_harness
+npm run harnest -- mcp serve harnest.yaml -- --allow-modules
+```
+
+```ts
+import { Harnest } from "@harnest/sdk";
+
+const harness = await Harnest.load("./harnest.yaml", { allowModuleExecution: true });
+try {
+  const result = await harness.invoke("hello");
+  console.log(result.output);
+} finally {
+  await harness.close();
+}
+```
+
+`Harnest.stream()` exposes runtime events and `Harnest.test()` runs the spec's declared cases. Module execution remains opt-in; omit it for specs made only from shipped adapters and built-ins.
+
+Create one deployment artifact containing only the validated spec and project `assets/`:
+
+```bash
+npm run harnest -- bundle harnest.yaml -- --output support-agent.harnest
+```
+
+The `.harnest` file is a deterministic standard ZIP container. It deliberately excludes `.env`, local Connections, credentials, traces, and other `.harnest/` state, and refuses to overwrite an existing artifact.
 
 ## Capabilities and safety
 
@@ -116,11 +163,12 @@ export function register({ components, tools }: RuntimeModuleRegistries) {
 
 ```text
 packages/core               HarnessSpec, registries, compiler, runtime, services, trace SDK
+packages/sdk                high-level load, invoke, stream, test API
 packages/adapter-openai     OpenAI-compatible streaming adapter
 packages/adapter-anthropic  Anthropic Messages streaming adapter
 packages/adapter-gemini     Gemini streaming adapter
 packages/adapter-local      Ollama local streaming adapter
-packages/cli                validate, inspect, run, test, runs, trace, studio, Connections, Skills
+packages/cli                init, bundle, validate, run, test, serve, MCP serve, studio, Services, Skills
 frontend                    Next.js Web Studio
 examples                    RAG, MCP Tool Agent, Loop, provider, and extension specs
 docs/v1/v1.1                v1.1 research, decisions, and verification notes

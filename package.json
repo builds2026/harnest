@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "packageManager": "npm@10.9.2",
+  "engines": { "node": ">=22.15.0" },
   "workspaces": [
     "packages/*",
     "frontend"

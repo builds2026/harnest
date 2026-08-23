@@ -10,6 +10,9 @@
   "include": ["src/**/*.ts"],
   "references": [
     { "path": "../core" },
-    { "path": "../sdk" }
+    { "path": "../adapter-openai" },
+    { "path": "../adapter-anthropic" },
+    { "path": "../adapter-gemini" },
+    { "path": "../adapter-local" }
   ]
 }

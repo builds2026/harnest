@@ -634,6 +634,60 @@ child.on("exit", (code) => process.exit(code ?? 1))
     await expect(second.tokens?.(issuerA)).resolves.toBeUndefined();
   });
 
+  it("allows only authorization hosts declared by protected resource metadata", async () => {
+    const { project, userData } = await temporaryProject();
+    const authorization = createServer((request, response) => {
+      if (!request.url?.includes(".well-known")) return response.writeHead(404).end();
+      const address = authorization.address();
+      if (!address || typeof address === "string") return response.writeHead(500).end();
+      const issuer = `http://127.0.0.1:${address.port}`;
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        issuer,
+        authorization_endpoint: `${issuer}/authorize`,
+        token_endpoint: `${issuer}/token`,
+        registration_endpoint: `${issuer}/register`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      }));
+    });
+    await new Promise<void>((resolveListen) => authorization.listen(0, "127.0.0.1", resolveListen));
+    const authorizationAddress = authorization.address();
+    if (!authorizationAddress || typeof authorizationAddress === "string") throw new Error("Authorization fixture did not bind");
+    const authorizationHost = `127.0.0.1:${authorizationAddress.port}`;
+    const resource = createServer((request, response) => {
+      if (!request.url?.includes(".well-known")) return response.writeHead(401).end();
+      const address = resource.address();
+      if (!address || typeof address === "string") return response.writeHead(500).end();
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        resource: `http://127.0.0.1:${address.port}/mcp`,
+        authorization_servers: [`http://${authorizationHost}`],
+        scopes_supported: ["tools:read"],
+      }));
+    });
+    await new Promise<void>((resolveListen) => resource.listen(0, "127.0.0.1", resolveListen));
+    const resourceAddress = resource.address();
+    if (!resourceAddress || typeof resourceAddress === "string") throw new Error("Resource fixture did not bind");
+    const resourceHost = `127.0.0.1:${resourceAddress.port}`;
+    const manager = new ConnectionManager(project, { userDataDirectory: userData });
+    try {
+      await manager.create({
+        id: "split_oauth_fixture",
+        scope: "project",
+        kind: "mcp",
+        name: "Split OAuth Fixture",
+        config: { transport: "http", url: `http://${resourceHost}/mcp`, oauth: true },
+      });
+      await expect(manager.oauthNetworkHostsFor("split_oauth_fixture", [resourceHost])).resolves.toEqual(
+        expect.arrayContaining([resourceHost, authorizationHost]),
+      );
+    } finally {
+      await Promise.all([
+        new Promise<void>((resolveClose) => resource.close(() => resolveClose())),
+        new Promise<void>((resolveClose) => authorization.close(() => resolveClose())),
+      ]);
+    }
+  });
+
   it("atomically consumes an OAuth callback state exactly once", async () => {
     const { project, userData } = await temporaryProject();
     if (process.platform !== "win32") return;
