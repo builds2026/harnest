@@ -40,6 +40,7 @@ import {
   mcpToolApprovalId,
   openMcpConnection,
   protocolMode,
+  type ContainerMount,
   type McpConnectionHandle,
 } from "./node-connections.js";
 import { NodeSkillStore } from "./node-skills.js";
@@ -552,6 +553,11 @@ export interface NodeRuntimeServiceOptions {
   readonly toolStore?: NodeToolStore;
   readonly skillStore?: NodeSkillStore;
   readonly approvedToolIds?: readonly string[];
+  /** Project-contained directories exposed only to approved process sandboxes. */
+  readonly sandboxWorkspace?: {
+    readonly inputDirectory?: string;
+    readonly outputDirectory?: string;
+  };
   readonly requestToolApproval?: (
     request: ToolApprovalRequest,
     context: ServiceExecutionContext,
@@ -919,11 +925,12 @@ export class NodeRuntimeServices implements RuntimeServices {
     const engine = await canonicalExecutable(profile.config.engine, profile.id);
     const name = `harnest-${randomUUID()}`;
     const engineEnvironment = containerEngineEnvironment();
+    const mounts = request.toolId === "builtin.code-runner" ? await this.#sandboxMounts() : [];
     try {
       return await runBoundedProcess({
         ...request,
         command: engine.path,
-        args: containerRunArguments(profile, name, command, [], imageId),
+        args: containerRunArguments(profile, name, command, [], imageId, mounts),
         cwd: dirname(engine.path),
         environment: engineEnvironment,
       });
@@ -934,6 +941,31 @@ export class NodeRuntimeServices implements RuntimeServices {
         maxOutputBytes: 64 * 1_024, signal: new AbortController().signal, environment: engineEnvironment,
       }).catch(() => undefined);
     }
+  }
+
+  async #sandboxMounts(): Promise<ContainerMount[]> {
+    const configured = this.#options.sandboxWorkspace;
+    if (!configured) return [];
+    const root = await this.#root;
+    const mounts: ContainerMount[] = [];
+    for (const [directory, target, readOnly] of [
+      [configured.inputDirectory, "/mnt/data", true],
+      [configured.outputDirectory, "/mnt/output", false],
+    ] as const) {
+      if (!directory) continue;
+      const lexical = resolve(directory);
+      if (!isInside(root, lexical)) throw new Error("Sandbox workspace must stay inside the project");
+      const lexicalInfo = await lstat(lexical);
+      if (!lexicalInfo.isDirectory() || lexicalInfo.isSymbolicLink()) {
+        throw new Error("Sandbox workspace must be a regular directory");
+      }
+      const canonical = await realpath(lexical);
+      if (canonical === root || !isInside(root, canonical) || !(await stat(canonical)).isDirectory()) {
+        throw new Error("Sandbox workspace resolves outside the project");
+      }
+      mounts.push({ source: canonical, target, readOnly });
+    }
+    return mounts;
   }
 
   async #executeModule(request: ModuleExecutionRequest): Promise<unknown> {

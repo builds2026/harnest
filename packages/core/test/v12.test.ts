@@ -47,6 +47,42 @@ const sumTools = () => new ToolRegistry().register({
 });
 
 describe("v1.2 Agent Tool loop", () => {
+  it("passes bounded conversation history and selected sandbox files without changing the graph", async () => {
+    const requests: ModelRequest[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run(request) {
+        requests.push(request);
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const graph = spec();
+    const snapshot = structuredClone(graph);
+    await new HarnessRuntime(graph, new AdapterRegistry().register(adapter)).invoke("current", {
+      session: {
+        messages: [
+          { role: "user", content: "too old" },
+          { role: "assistant", content: "previous answer" },
+          { role: "user", content: "recent question" },
+        ],
+        attachments: [{ id: "file_12345678", name: "input.csv", mimeType: "text/csv", size: 9, sandboxPath: "/mnt/data/file.csv" }],
+        sandboxOutputPath: "/mnt/output",
+        maxHistoryMessages: 2,
+      },
+    });
+
+    expect(requests[0]?.messages).toEqual([
+      expect.objectContaining({ role: "system", content: expect.stringContaining("/mnt/data/file.csv") }),
+      { role: "assistant", content: "previous answer" },
+      { role: "user", content: "recent question" },
+      { role: "user", content: "current" },
+    ]);
+    expect(requests[0]?.messages[0]?.content).toContain("/mnt/output");
+    expect(graph).toEqual(snapshot);
+  });
+
   it("routes provider requests through the host outbound boundary", async () => {
     let fetchCalls = 0;
     const adapter: ModelAdapter = {

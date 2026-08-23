@@ -1045,12 +1045,19 @@ export async function detectContainerEngine(): Promise<string> {
   );
 }
 
+export interface ContainerMount {
+  readonly source: string;
+  readonly target: "/mnt/data" | "/mnt/output";
+  readonly readOnly: boolean;
+}
+
 export function containerRunArguments(
   profile: ConnectionProfile,
   name: string,
   command: readonly string[],
   environmentNames: readonly string[] = [],
   imageIdentity?: string,
+  mounts: readonly ContainerMount[] = [],
 ): string[] {
   if (profile.config.sandbox !== "container" || typeof profile.config.image !== "string") throw new ConnectionError(
     "CONNECTION_TYPE_MISMATCH", `Connection '${profile.id}' is not a container sandbox`, profile.id,
@@ -1058,12 +1065,22 @@ export function containerRunArguments(
   const memoryMb = typeof profile.config.memoryMb === "number" ? profile.config.memoryMb : 256;
   const cpus = typeof profile.config.cpus === "number" ? profile.config.cpus : 1;
   const pids = typeof profile.config.pids === "number" ? profile.config.pids : 64;
+  for (const mount of mounts) {
+    if (!isAbsolute(mount.source) || mount.source.includes("\0") || mount.source.includes(",")
+      || (mount.target !== "/mnt/data" && mount.target !== "/mnt/output")) throw new ConnectionError(
+      "CONNECTION_INVALID", "Sandbox mount is invalid", profile.id,
+    );
+  }
   return [
     "run", "--rm", "--name", name, "--pull", "never", "--network", "none", "--read-only",
     "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", String(pids),
     "--memory", `${memoryMb}m`, "--cpus", String(cpus), "--stop-timeout", "1",
     "--tmpfs", "/workspace:rw,nosuid,nodev,size=64m", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
     "--workdir", "/workspace", "--user", "65534:65534",
+    ...mounts.flatMap((mount) => [
+      "--mount",
+      `type=bind,source=${mount.source},target=${mount.target}${mount.readOnly ? ",readonly" : ""}`,
+    ]),
     ...environmentNames.flatMap((name) => ["--env", name]),
     imageIdentity ?? profile.config.image,
     ...command,

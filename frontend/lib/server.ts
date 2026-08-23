@@ -22,6 +22,7 @@ import {
   NodeRuntimeServices,
   loadAdapterModules,
   loadRuntimeModules,
+  type NodeRuntimeServiceOptions,
 } from "@harnest/core/node";
 import {
   hostCapabilityDiagnosticsFor,
@@ -45,6 +46,7 @@ export async function fileExists(filePath: string) {
 
 export async function runtimeResourcesFor(spec: HarnessSpec, options: {
   readonly requestToolApproval?: RuntimeServices["requestToolApproval"];
+  readonly sandboxWorkspace?: NodeRuntimeServiceOptions["sandboxWorkspace"];
 } = {}) {
   const adapters = new AdapterRegistry();
   const components = createBuiltinComponentRegistry();
@@ -57,6 +59,7 @@ export async function runtimeResourcesFor(spec: HarnessSpec, options: {
       request: ToolApprovalRequest,
       context: Parameters<NonNullable<RuntimeServices["requestToolApproval"]>>[1],
     ) => ToolApprovalDecision | Promise<ToolApprovalDecision> } : {}),
+    ...(options.sandboxWorkspace ? { sandboxWorkspace: options.sandboxWorkspace } : {}),
   });
   try {
     for (const definition of await services.toolDefinitions()) if (!tools.has(definition.id)) tools.register(definition);

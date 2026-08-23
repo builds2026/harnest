@@ -53,18 +53,16 @@ import {
   type HarnessDraft,
   type HarnessEdge,
   type HarnessNode,
-  type NodeRunState,
 } from "@/lib/studio-state";
 import { catalogMap, colorFor, glyphFor, validationRegistryFor } from "@/lib/component-catalog";
 import { EMPTY_SPEC } from "@/lib/default-spec";
-import { readNdjson } from "@/lib/ndjson";
-import { traceViewKey, visibleActiveEdgeId, visibleTraceId } from "@/lib/trace-view";
 import { HarnessNodeComponent } from "./harness-node";
 import { Inspector } from "./inspector";
 import { ConnectionManager } from "./connection-manager";
 import { CompatiblePicker } from "./compatible-picker";
 import { CustomToolManager } from "./custom-tool-manager";
 import { SkillManager } from "./skill-manager";
+import { Playground } from "./playground";
 import {
   connectionCanRun,
   connectionKindLabel,
@@ -104,8 +102,7 @@ type BootState =
   | { phase: "error"; message: string }
   | { phase: "ready"; payload: SpecPayload };
 
-type RunPhase = "idle" | "starting" | "streaming" | "cancelling" | "cancelled" | "success" | "error";
-type DockTab = "yaml" | "problems" | "run" | "tests" | "experiments" | "trace";
+type DockTab = "yaml" | "problems" | "tests" | "experiments" | "trace";
 
 type AttachmentPicker = { nodeId: string; slot: "tools" | "skills"; pendingItemId?: string };
 type PendingSkillAttach = { nodeId: string; skillId: string };
@@ -196,32 +193,11 @@ const PALETTE_LABELS: Readonly<Record<PaletteKind, string>> = {
 
 const DOCK_LABELS: Readonly<Record<DockTab, string>> = {
   problems: "Setup",
-  run: "Try",
   tests: "Tests",
   experiments: "Compare",
   trace: "Activity",
   yaml: "YAML",
 };
-
-const RISK_LABELS: Readonly<Record<string, string>> = {
-  read: "Reads data",
-  write: "Changes data",
-  external: "Contacts an external service",
-  destructive: "Can delete or overwrite data",
-};
-
-interface PendingToolApproval {
-  readonly runId: string;
-  readonly nodeId: string;
-  readonly callId: string;
-  readonly turn: number;
-  readonly tool: string;
-  readonly risk: string;
-  readonly input: unknown;
-  readonly inputDigest: string;
-  readonly inputBytes: number;
-  readonly previewLimited: boolean;
-}
 
 const responseMessage = async (response: Response) => {
   const payload = await response.json().catch(() => null) as
@@ -337,6 +313,7 @@ export default function Studio() {
 }
 
 function StudioReady({ initial }: { initial: SpecPayload }) {
+  const [surface, setSurface] = useState<"builder" | "playground">("builder");
   const [catalog, setCatalog] = useState<readonly ComponentManifest[]>(
     () => initial.catalog?.length ? initial.catalog : BUILTIN_COMPONENT_MANIFESTS,
   );
@@ -348,7 +325,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     () => createDocumentState(initial.spec ?? EMPTY_SPEC, catalog, initial.yaml, initial.diagnostics),
   );
   const [activeSubgraph, setActiveSubgraph] = useState<string>();
-  const [activeDock, setActiveDock] = useState<DockTab>(initial.exists ? "problems" : "run");
+  const [activeDock, setActiveDock] = useState<DockTab>("problems");
   const [welcomeDismissed, setWelcomeDismissed] = useState(initial.exists);
   const [paletteKind, setPaletteKind] = useState<PaletteKind>(initial.exists ? "components" : "templates");
   const [paletteQuery, setPaletteQuery] = useState("");
@@ -379,15 +356,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     : initial.exists ? "Harness loaded" : "New harness — add a component to begin");
   const [dropTarget, setDropTarget] = useState(false);
   const [runInput, setRunInput] = useState("");
-  const [runPhase, setRunPhase] = useState<RunPhase>("idle");
   const [runId, setRunId] = useState("");
-  const [runOutput, setRunOutput] = useState("");
-  const [runUsage, setRunUsage] = useState<unknown>();
   const [trace, setTrace] = useState<RunEvent[]>([]);
-  const [nodeRunStates, setNodeRunStates] = useState<Record<string, NodeRunState>>({});
-  const [nodeIterations, setNodeIterations] = useState<Record<string, number>>({});
-  const [nodeAttempts, setNodeAttempts] = useState<Record<string, number>>({});
-  const [activeEdgeIds, setActiveEdgeIds] = useState<ReadonlySet<string>>(new Set());
   const [testPhase, setTestPhase] = useState<"idle" | "running" | "error">("idle");
   const [testReport, setTestReport] = useState<TestReport>();
   const [experimentComponentId, setExperimentComponentId] = useState("");
@@ -398,15 +368,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [experimentResults, setExperimentResults] = useState<ExperimentResult[]>([]);
   const [storedRuns, setStoredRuns] = useState<StoredRun[]>([]);
   const [storedRunPhase, setStoredRunPhase] = useState<"idle" | "loading" | "error">("idle");
-  const [pendingApprovals, setPendingApprovals] = useState<PendingToolApproval[]>([]);
-  const pendingApproval = pendingApprovals[0];
-  const [approvalBusy, setApprovalBusy] = useState(false);
-  const pulseTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
-  const traceView = useRef<{ subgraph?: string; nodeIds: ReadonlySet<string>; edgeIds: ReadonlySet<string> }>({
-    nodeIds: new Set(),
-    edgeIds: new Set(),
-  });
-  const abortRef = useRef<AbortController | null>(null);
   const experimentAbortRef = useRef<AbortController | null>(null);
   const autoSetup = useRef(initial.exists);
   const autoSetupProgress = useRef(false);
@@ -510,13 +471,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     nodes: activeGraph.nodes,
     edges: activeGraph.edges,
   } : document.draft, [activeGraph, document.draft]);
-  useEffect(() => {
-    traceView.current = {
-      ...(activeSubgraph ? { subgraph: activeSubgraph } : {}),
-      nodeIds: new Set(viewDraft.nodes.map((node) => node.id)),
-      edgeIds: new Set(viewDraft.edges.map((edge) => edge.id)),
-    };
-  }, [activeSubgraph, viewDraft.edges, viewDraft.nodes]);
   const replaceViewDraft = useCallback((draft: HarnessDraft, touch: "none" | "layout" | "semantic") => {
     if (!activeSubgraph) {
       dispatch({ type: "replace-draft", draft, touch });
@@ -537,9 +491,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   const errorDiagnostics = document.diagnostics.filter((item) => item.severity === "error");
   const displayedDiagnostics = document.yamlState === "synced" ? document.diagnostics : document.yamlDiagnostics;
-  const runInProgress = runPhase === "starting" || runPhase === "streaming" || runPhase === "cancelling";
   const experimentRunning = experimentPhase === "running";
-  const running = runInProgress || experimentRunning;
+  const running = experimentRunning;
   const graphLocked = running || document.yamlState !== "synced";
   const dirty = document.revision !== document.savedRevision || document.yamlState !== "synced";
   const structurallyValid = useMemo(
@@ -620,20 +573,18 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         && (activeSubgraph
           ? item.path.startsWith(`$.subgraphs.${activeSubgraph}.`)
           : !item.path.startsWith("$.subgraphs."))),
-      runState: nodeRunStates[traceViewKey(activeSubgraph, node.id)] ?? "idle",
-      iteration: nodeIterations[traceViewKey(activeSubgraph, node.id)],
-      attempt: nodeAttempts[traceViewKey(activeSubgraph, node.id)],
+      runState: "idle" as const,
       onAddAttachment: (nodeId: string, slot: "tools" | "skills") => setAttachmentPicker({ nodeId, slot }),
     },
-  })), [activeSubgraph, document.diagnostics, nodeAttempts, nodeIterations, nodeRunStates, viewDraft.nodes]);
+  })), [activeSubgraph, document.diagnostics, viewDraft.nodes]);
 
   const displayEdges = useMemo(() => viewDraft.edges.map((edge) => ({
     ...edge,
     label: edge.data?.connection ? edgeLabel(edge.data.connection) : undefined,
-    className: activeEdgeIds.has(traceViewKey(activeSubgraph, edge.id)) ? "is-running" : "",
-    animated: activeEdgeIds.has(traceViewKey(activeSubgraph, edge.id)),
-    data: { ...edge.data!, running: activeEdgeIds.has(traceViewKey(activeSubgraph, edge.id)) },
-  })), [activeEdgeIds, activeSubgraph, viewDraft.edges]);
+    className: "",
+    animated: false,
+    data: { ...edge.data!, running: false },
+  })), [viewDraft.edges]);
 
   const onNodesChange: OnNodesChange<HarnessNode> = useCallback((changes) => {
     if (graphLocked && changes.some((change) => change.type !== "select" && change.type !== "dimensions")) return;
@@ -1244,19 +1195,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     }
   }, [canSave, document.draft, document.revision]);
 
-  const pulseEdge = useCallback((edgeId: string) => {
-    setActiveEdgeIds((current) => new Set(current).add(edgeId));
-    const timer = setTimeout(() => {
-      setActiveEdgeIds((current) => {
-        const next = new Set(current);
-        next.delete(edgeId);
-        return next;
-      });
-      pulseTimers.current.delete(timer);
-    }, 700);
-    pulseTimers.current.add(timer);
-  }, []);
-
   const loadStoredRuns = useCallback(async () => {
     setStoredRunPhase("loading");
     try {
@@ -1289,204 +1227,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       setStoredRunPhase("error");
     }
   }, []);
-
-  const applyRunEvent = useCallback((event: RunEvent) => {
-    setTrace((events) => [...events, event]);
-    const data = eventData(event);
-    const scopedNodeId = typeof data.nodeId === "string"
-      ? visibleTraceId(data.nodeId, traceView.current.subgraph, traceView.current.nodeIds)
-      : undefined;
-    switch (data.type) {
-      case "run-start":
-        setRunId(String(data.runId));
-        setRunPhase("streaming");
-        break;
-      case "node-start": {
-        if (!scopedNodeId) break;
-        const nodeId = traceViewKey(traceView.current.subgraph, scopedNodeId);
-        setNodeRunStates((states) => ({ ...states, [nodeId]: "running" }));
-        if (typeof data.iteration === "number") setNodeIterations((values) => ({ ...values, [nodeId]: data.iteration as number }));
-        if (typeof data.attempt === "number") setNodeAttempts((values) => ({ ...values, [nodeId]: data.attempt as number }));
-        break;
-      }
-      case "text-delta":
-        setRunOutput((output) => output + String(data.text ?? ""));
-        break;
-      case "tool-call":
-        if (data.risk !== "read" && typeof data.runId === "string" && typeof data.nodeId === "string"
-          && typeof data.callId === "string" && typeof data.turn === "number") {
-          setApprovalBusy(true);
-          void fetch("/api/approvals", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              action: "inspect",
-              runId: data.runId,
-              nodeId: data.nodeId,
-              callId: data.callId,
-              turn: data.turn,
-            }),
-          }).then(async (response) => {
-            if (!response.ok) throw new Error(await responseMessage(response));
-            return response.json() as Promise<{ approval: PendingToolApproval }>;
-          }).then(({ approval }) => {
-            setPendingApprovals((current) => current.some((item) => item.runId === approval.runId
-              && item.nodeId === approval.nodeId && item.turn === approval.turn && item.callId === approval.callId)
-              ? current : [...current, approval]);
-            setApprovalBusy(false);
-          }).catch((error: unknown) => {
-            setApprovalBusy(false);
-            setStatusNote(error instanceof Error ? error.message : "Approval details could not be loaded.");
-          });
-        }
-        break;
-      case "tool-approval":
-        if (typeof data.runId === "string" && typeof data.nodeId === "string"
-          && typeof data.callId === "string" && typeof data.turn === "number") {
-          setPendingApprovals((current) => current.filter((item) => !(item.runId === data.runId
-            && item.nodeId === data.nodeId && item.turn === data.turn && item.callId === data.callId)));
-          setApprovalBusy(false);
-        }
-        break;
-      case "usage":
-        setRunUsage(data.usage);
-        break;
-      case "node-end": {
-        if (!scopedNodeId) break;
-        const nodeId = traceViewKey(traceView.current.subgraph, scopedNodeId);
-        setNodeRunStates((states) => ({ ...states, [nodeId]: "success" }));
-        if (typeof data.iteration === "number") setNodeIterations((values) => ({ ...values, [nodeId]: data.iteration as number }));
-        break;
-      }
-      case "node-skip":
-        if (scopedNodeId) {
-          const key = traceViewKey(traceView.current.subgraph, scopedNodeId);
-          setNodeRunStates((states) => ({ ...states, [key]: "idle" }));
-        }
-        break;
-      case "retry":
-        if (scopedNodeId && typeof data.attempt === "number") {
-          const key = traceViewKey(traceView.current.subgraph, scopedNodeId);
-          setNodeAttempts((values) => ({ ...values, [key]: data.attempt as number }));
-        }
-        break;
-      case "iteration":
-        if (scopedNodeId && typeof data.iteration === "number") {
-          const key = traceViewKey(traceView.current.subgraph, scopedNodeId);
-          setNodeIterations((values) => ({ ...values, [key]: data.iteration as number }));
-        }
-        break;
-      case "edge": {
-        const edgeId = typeof data.edgeId === "string" && typeof data.active === "boolean"
-          ? visibleActiveEdgeId(
-            { edgeId: data.edgeId, active: data.active },
-            traceView.current.subgraph,
-            traceView.current.edgeIds,
-          )
-          : undefined;
-        if (edgeId) pulseEdge(traceViewKey(traceView.current.subgraph, edgeId));
-        break;
-      }
-      case "run-end":
-        setRunOutput(formatOutput(data.output));
-        setRunUsage(data.usage);
-        setRunPhase("success");
-        setPendingApprovals([]);
-        setStatusNote(`Run ${String(data.runId)} completed in ${Math.round(Number(data.durationMs ?? 0))}ms`);
-        void loadStoredRuns();
-        break;
-      case "error":
-        if (scopedNodeId) {
-          const key = traceViewKey(traceView.current.subgraph, scopedNodeId);
-          setNodeRunStates((states) => ({ ...states, [key]: "error" }));
-        }
-        setRunPhase("error");
-        setPendingApprovals([]);
-        setStatusNote(String(data.message ?? "Run failed"));
-        break;
-    }
-  }, [loadStoredRuns, pulseEdge]);
-
-  const run = useCallback(async () => {
-    if (!canRun) {
-      setActiveDock("run");
-      return;
-    }
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setActiveDock("run");
-    setRunPhase("starting");
-    setRunId("");
-    setRunOutput("");
-    setRunUsage(undefined);
-    setTrace([]);
-    setNodeRunStates({});
-    setNodeIterations({});
-    setNodeAttempts({});
-    setActiveEdgeIds(new Set());
-    setPendingApprovals([]);
-    setStatusNote("Starting saved harness…");
-    let terminalEvent = false;
-    try {
-      const response = await fetch("/api/run", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ input: runInput }),
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(await responseMessage(response));
-      await readNdjson<RunEvent>(response, (event) => {
-        if (event.type === "run-end" || event.type === "error") terminalEvent = true;
-        applyRunEvent(event);
-      });
-      if (!terminalEvent && !controller.signal.aborted) {
-        setRunPhase("error");
-        setStatusNote("The run stream ended before a final event arrived.");
-      }
-    } catch (error) {
-      if (controller.signal.aborted) {
-        setRunPhase("cancelled");
-        setStatusNote("Run cancelled");
-      } else {
-        setRunPhase("error");
-        setStatusNote(error instanceof Error ? error.message : "Run failed");
-      }
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-    }
-  }, [applyRunEvent, canRun, runInput]);
-
-  const cancelRun = useCallback(() => {
-    if (!abortRef.current) return;
-    setRunPhase("cancelling");
-    setStatusNote("Cancelling run…");
-    setPendingApprovals([]);
-    abortRef.current.abort();
-  }, []);
-
-  const decideApproval = useCallback(async (approved: boolean) => {
-    if (!pendingApproval || approvalBusy) return;
-    setApprovalBusy(true);
-    try {
-      const response = await fetch("/api/approvals", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          runId: pendingApproval.runId,
-          nodeId: pendingApproval.nodeId,
-          callId: pendingApproval.callId,
-          turn: pendingApproval.turn,
-          inputDigest: pendingApproval.inputDigest,
-          approved,
-        }),
-      });
-      if (!response.ok) throw new Error(await responseMessage(response));
-      setStatusNote(`${pendingApproval.tool} ${approved ? "approved for this call" : "denied"}.`);
-    } catch (error) {
-      setApprovalBusy(false);
-      setStatusNote(error instanceof Error ? error.message : "Approval decision could not be delivered.");
-    }
-  }, [approvalBusy, pendingApproval]);
 
   const runTests = useCallback(async () => {
     if (dirty || !serverValidated || testPhase === "running") return;
@@ -1563,10 +1303,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   }, []);
 
   useEffect(() => () => {
-    abortRef.current?.abort();
     experimentAbortRef.current?.abort();
-    for (const timer of pulseTimers.current) clearTimeout(timer);
-    pulseTimers.current.clear();
   }, []);
 
   useEffect(() => {
@@ -1599,7 +1336,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     return () => clearTimeout(timer);
   }, [canValidate, document.draft.nodes.length, document.validatedSemanticRevision, validate]);
 
-  const completedRun = runPhase === "success";
+  const completedRun = trace.some((event) => event.type === "run-end");
   const templateReady = viewDraft.nodes.length > 0;
   const requiredConnectionKinds = selectedTemplateId
     ? studioCatalog.templates.find((template) => template.id === selectedTemplateId)?.connectionKinds ?? []
@@ -1614,8 +1351,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const nextConnectionSetup = configuredConnection
     ?? (requiredConnectionKind ? { kind: requiredConnectionKind } : undefined);
   const connectionReady = !nextConnectionSetup;
-  const finalRunEvent = trace.findLast((event) => event.type === "run-end");
-  const finalRunData = finalRunEvent ? eventData(finalRunEvent) : undefined;
   const savedTests = draftToSpec(document.draft).tests ?? [];
   const replaceTests = (tests: HarnessTestCase[]) => {
     const root = { ...document.draft.root };
@@ -1641,7 +1376,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     if (!window.confirm(`Remove test '${savedTests[index]?.id ?? index + 1}'?`)) return;
     replaceTests(savedTests.filter((_, testIndex) => testIndex !== index));
   };
-  const statusClass = runPhase === "error" || experimentPhase === "error" || savePhase === "error"
+  const statusClass = experimentPhase === "error" || savePhase === "error"
     || displayedDiagnostics.some((item) => item.severity === "error")
     ? "is-fault"
     : running || document.validationPhase === "checking"
@@ -1661,7 +1396,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       <button className="button button-primary" disabled={!document.pendingSpec || running} onClick={() => dispatch({ type: "apply-yaml" })}>Apply YAML</button>
     </div>
   );
-  const dockTabs: DockTab[] = ["problems", "run", "tests", "experiments", "trace", "yaml"];
+  const dockTabs: DockTab[] = ["problems", "tests", "experiments", "trace", "yaml"];
   const moveDockFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, tab: DockTab) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
     event.preventDefault();
@@ -1674,14 +1409,18 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   };
 
   return (
-    <main className={`studio-shell ${welcome ? "is-welcome" : ""}`}>
+    <main className={`studio-shell ${surface === "playground" ? "is-playground" : welcome ? "is-welcome" : ""}`}>
       <header className="command-rail">
         <div className="brand-lockup">
           <span className="brand-name">Harnest</span>
           <span className="project-name" title={initial.file}>{initial.file.split(/[\\/]/).pop()}</span>
           {dirty && <span className="dirty-dot" title="Unsaved changes" />}
         </div>
-        {welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
+        <nav className="surface-tabs" aria-label="Harnest workspace">
+          <button className={surface === "builder" ? "is-active" : ""} aria-current={surface === "builder" ? "page" : undefined} onClick={() => setSurface("builder")}>Builder</button>
+          <button className={surface === "playground" ? "is-active" : ""} aria-current={surface === "playground" ? "page" : undefined} onClick={() => setSurface("playground")}>Harnest Playground</button>
+        </nav>
+        {surface === "playground" ? <div className="playground-rail-context"><span>Immutable runtime</span><strong>{serverValidated ? "Ready" : "Setup required"}</strong></div> : welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
           <div className="continuity-rail" aria-label="Setup progress">
             <span className={`continuity-step ${templateReady ? "is-pass" : "is-active"}`}><span>Recipe</span></span>
             <span className={`continuity-step ${connectionReady ? "is-pass" : templateReady ? "is-active" : ""}`}><span>Services</span></span>
@@ -1690,9 +1429,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           </div>
           <div className="rail-actions">
             {running ? (
-              <button className="button button-danger" disabled={runPhase === "cancelling"} onClick={experimentRunning ? cancelExperiment : cancelRun}>
-                {runPhase === "cancelling" ? "Cancelling…" : experimentRunning ? "Cancel comparison" : "Cancel run"}
-              </button>
+              <button className="button button-danger" onClick={cancelExperiment}>Cancel comparison</button>
             ) : nextConnectionSetup ? (
               <button className="button button-primary" onClick={() => openConnections(
                 nextConnectionSetup.kind,
@@ -1706,13 +1443,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             ) : document.validationPhase === "checking" || document.validatedSemanticRevision === null ? (
               <button className="button button-rail" disabled>Checking setup…</button>
             ) : serverValidated ? (
-              <button className="button button-primary" onClick={() => setActiveDock("run")}>Try this harness</button>
+              <button className="button button-primary" onClick={() => setSurface("playground")}>Open Playground</button>
             ) : <button className="button button-rail" disabled>Preparing…</button>}
           </div>
         </>}
       </header>
 
-      {welcome ? (
+      {surface === "playground" ? <Playground onOpenBuilder={() => setSurface("builder")} /> : welcome ? (
         <section className="welcome-launchpad" aria-labelledby="welcome-title">
           <div className="welcome-intro">
             <span className="sheet-eyebrow">Working harness in minutes</span>
@@ -1890,7 +1627,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         />
       </aside>
 
-      <section className="bottom-dock" aria-label="Setup, try, tests, comparisons, activity, and YAML">
+      <section className="bottom-dock" aria-label="Setup, tests, comparisons, activity, and YAML">
         <div className="dock-heading">
           <div className="dock-tabs" role="tablist" aria-label="Studio dock">
             {dockTabs.map((tab) => (
@@ -1934,24 +1671,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               ))}
             </ul>
           ) : <div className="empty-dock">No validation issues in the current harness.</div>)}
-          {activeDock === "run" && (
-            <div className="run-pane">
-              <div className="run-controls">
-                <div><span className="sheet-eyebrow">Live request</span><strong>Ask this harness</strong></div>
-                <label className="field-label" htmlFor="run-input">Your request</label>
-                <textarea id="run-input" className="run-input" value={runInput} disabled={running} placeholder="Ask the harness something…" onChange={(event) => setRunInput(event.target.value)} />
-                {runInProgress
-                  ? <button className="button button-danger" onClick={cancelRun}>Cancel request</button>
-                  : <button className="button button-primary" disabled={!canRun} onClick={() => void run()}>Send request</button>}
-                {!canRun && !runInProgress && <small className="run-guidance">Finish the highlighted setup action above; saving and checks happen automatically.</small>}
-              </div>
-              <div className="run-result" aria-live="polite">
-                <div className="run-result-heading"><span className="sheet-eyebrow">Answer</span><strong>{runPhase === "success" ? "Completed" : runInProgress ? "Working…" : "Ready when you are"}</strong></div>
-                <pre className="run-output">{runOutput || (runInProgress ? "The harness is running. If a tool needs permission, you will be asked here." : "The answer will appear here.")}</pre>
-                {(runId || runUsage !== undefined) && <details className="run-details"><summary>Run details</summary><div className="run-meta"><span>{finalRunData?.durationMs ? `${Math.round(Number(finalRunData.durationMs))}ms` : runPhase}</span>{typeof finalRunData?.costUsd === "number" && <span>${Number(finalRunData.costUsd).toFixed(6)}</span>}{runUsage !== undefined && <span>{JSON.stringify(runUsage)}</span>}{runId && <span>Run {runId}</span>}</div></details>}
-              </div>
-            </div>
-          )}
           {activeDock === "tests" && (
             <div className="tests-pane">
               <div className="tests-toolbar">
@@ -2119,20 +1838,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         onClose={() => setSkillManagerOpen(false)}
         onChanged={() => refreshStudioCatalog().catch(() => setStatusNote("Skill installed, but the catalog could not be refreshed."))}
       />
-      {pendingApproval && <div className="approval-backdrop">
-        <section className="approval-dialog" role="alertdialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description">
-          <header><span className="sheet-eyebrow">Tool permission</span><h2 id="approval-title">Allow {pendingApproval.tool} this time?</h2></header>
-          <div className="approval-body">
-            <div className="approval-meter"><span>What it can do</span><strong className={`risk-${pendingApproval.risk}`}>{RISK_LABELS[pendingApproval.risk] ?? pendingApproval.risk}</strong><span>Agent step</span><strong>{pendingApproval.turn ?? "—"}</strong></div>
-            <p id="approval-description">Review the exact arguments the agent wants to send. Allowing this applies to this call only.</p>
-            <div className="approval-meter"><span>Request size</span><strong>{pendingApproval.inputBytes} bytes</strong><span>Preview</span><strong>{pendingApproval.previewLimited ? "Incomplete" : "Complete"}</strong></div>
-            {pendingApproval.previewLimited && <p className="field-error">The complete arguments cannot be shown safely, so this call cannot be allowed. Deny it and reduce the input.</p>}
-            <pre>{JSON.stringify(pendingApproval.input, null, 2)}</pre>
-            <details className="approval-advanced"><summary>Advanced verification</summary><small>SHA-256 <code>{pendingApproval.inputDigest.slice(7)}</code></small></details>
-          </div>
-          <footer><button className="button" disabled={approvalBusy} onClick={() => void decideApproval(false)}>Don&apos;t allow</button><button className="button button-primary" disabled={approvalBusy || pendingApproval.previewLimited} onClick={() => void decideApproval(true)}>{approvalBusy ? "Sending…" : "Allow once"}</button></footer>
-        </section>
-      </div>}
     </main>
   );
 }

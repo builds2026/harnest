@@ -24,7 +24,9 @@ npm run harnest -- init my-agent
 npm run harnest -- studio my-agent/harnest.yaml
 ```
 
-Studio starts with outcome-based Recipes. Choose one, add only the requested Services, and send the prepared sample request. YAML saving and runtime validation happen automatically. **Setup** explains blockers, **Try** shows the answer first, **Tests** creates and runs repeatable cases, **Compare** runs two component-setting variants against the same input, and **Activity** keeps the technical trace.
+Studio starts with outcome-based Recipes. Choose one and add only the requested Services; YAML saving and runtime validation happen automatically. **Setup** explains blockers, **Tests** creates repeatable cases, **Compare** runs two component-setting variants, and **Activity** keeps the technical trace. The top-level **Harnest Playground** provides the service-like chat surface: conversation history, observable execution timelines, per-run model/tool/skill controls, file uploads, and live sandbox output without changing `harnest.yaml`.
+
+When the harness declares an enabled Code Runner, Playground uploads can be selected for a run. Only the selected files are copied into the isolated container at `/mnt/data` (read-only); user-facing outputs written to `/mnt/output` return to the Sandbox explorer. See [the Playground guide](./docs/v1/v1.2/playground.md).
 
 ## Executable v0.2 examples
 

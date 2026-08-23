@@ -13,6 +13,7 @@ import {
   type ComponentExecutionResult,
   type ComponentRegistry,
   type RuntimeMetrics,
+  type RunSessionContext,
   type RuntimeServices,
 } from "./component.js";
 import {
@@ -184,6 +185,8 @@ export interface RuntimeOptions {
 export interface RunOptions {
   signal?: AbortSignal;
   initialState?: Readonly<Record<string, unknown>>;
+  /** Host-provided conversation and file metadata. It never changes HarnessSpec. */
+  session?: RunSessionContext;
 }
 
 export class RuntimeError extends Error {
@@ -226,6 +229,7 @@ interface RunContext {
   readonly emit: (event: RunEvent) => void;
   readonly resolveSecret: (reference: string) => string | undefined;
   readonly redact: (value: unknown) => unknown;
+  readonly session?: RunSessionContext;
 }
 
 interface PreparedNode {
@@ -461,7 +465,16 @@ export class HarnessRuntime {
     for (const reference of declaredReferences) resolveSecret(reference);
     const redact = (value: unknown) => sanitize(value, secrets, new WeakSet<object>(), 0, 64_000);
     const emit = (event: RunEvent) => queue.push(sanitizeEvent(event, secrets));
-    const context: RunContext = { runId, signal, secrets, metrics, emit, resolveSecret, redact };
+    const context: RunContext = {
+      runId,
+      signal,
+      secrets,
+      metrics,
+      emit,
+      resolveSecret,
+      redact,
+      ...(options.session ? { session: options.session } : {}),
+    };
     const startEvent = sanitizeEvent({
       type: "run-start",
       runId,
@@ -767,6 +780,7 @@ export class HarnessRuntime {
           nodeId,
           iteration,
           runInput: graphInput,
+          ...(run.session ? { session: run.session } : {}),
           state,
           adapters: this.#registry,
           tools: this.#tools,

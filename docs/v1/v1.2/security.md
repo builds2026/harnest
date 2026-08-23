@@ -44,6 +44,15 @@ Harnest는 graph를 신뢰된 실행 코드로 취급하지 않는다. graph에�
 - Next proxy는 page, asset, API를 포함한 모든 Studio request의 raw `Host`가 URL과 일치하는 literal `127.0.0.1` 또는 `[::1]`인지 검사하며, 다른 Host는 `403`으로 거부한다.
 - Mutation API는 추가로 같은 scheme·host·port의 literal-loopback `Origin`을 요구한다. Origin 없는 요청과 cross-origin 요청은 거부한다.
 - inbound Host/Origin과 outbound DNS/IP pinning은 서로 다른 경계로 각각 적용한다.
+- Playground mutation도 같은 Origin을 요구한다. upload는 bounded `Content-Length`가 없거나 66 MiB를 넘으면 parsing 전에 거부한다.
+
+## Playground file/session 경계
+
+- session/file/workspace id를 제한하고 project 안의 regular non-link directory/file만 canonical realpath로 다시 확인한다. public DTO에는 storage path와 SHA-256을 노출하지 않는다.
+- 선택한 upload만 run 전용 input directory로 복사해 container `/mnt/data`에 read-only mount한다. output directory만 `/mnt/output` writable이며 기존 no-network/read-only-root/cap-drop/non-root/resource 정책을 유지한다.
+- upload는 file당 64 MiB, session당 100 files/256 MiB, run당 32 selected files다. artifact는 depth 5/100 files/file당 64 MiB/session 256 MiB 경계에서 symlink·special file을 제외하고 초과 output은 제거한다.
+- local session은 activity 기준 30일 뒤 실제 directory를 삭제하며 사용자가 삭제할 수도 있다. Provider replay는 최근 20 messages/64 KiB로 제한하고 credential redaction을 다시 거친다.
+- text preview는 256 KiB Range만 읽고, untrusted media response에 private no-store, `nosniff`, CSP sandbox를 적용한다. model에게 host path를 주지 않고 container path만 전달한다.
 
 ## Trace 저장소
 
@@ -65,4 +74,5 @@ Harnest는 graph를 신뢰된 실행 코드로 취급하지 않는다. graph에�
 - **Host runtime extension sandbox:** 검토 후 로드한 `runtime.modules` adapter/component는 Harnest process 권한을 가진다. 모델 호출용 stored TypeScript Tool의 container 경계와 혼동하면 안 된다.
 - **임의 proxy/transport:** 제공 Adapter와 Connection은 pinned fetch를 사용한다. 제3자 host extension이 context transport를 무시하고 직접 socket/global fetch를 열면 그 extension의 권한이다.
 - **원격 multi-user Studio:** Studio HTTP host는 literal loopback 단일 사용자 운영만 지원한다. multi-tenant service는 Core를 별도 인증·tenant isolation·secret service 안에 embed해야 한다.
+- **Provider cache hit:** bounded conversation replay는 Harnest가 보장하지만 Gemini/OpenAI/Anthropic 등의 implicit/explicit prompt cache hit, retention, 할인은 Provider 계약이며 현재 공통 cache service 보장이 아니다.
 - **외부 IdP/provider 검증:** 실제 vendor consent 정책, rate limit, provider-native 오류 behavior는 해당 external E2E가 필요하다.

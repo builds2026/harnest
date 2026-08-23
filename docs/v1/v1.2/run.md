@@ -102,10 +102,12 @@ Studio는 `127.0.0.1`에 server를 띄운다. 모든 request는 URL과 일치하
 1. 첫 화면에서 RAG, Web Research, Coding Agent, MCP Agent, Evaluation Loop 중 원하는 결과의 **Recipe**를 고른다. 각 card는 필요한 Service와 sample input을 먼저 보여준다.
 2. 필요한 **Service** sheet가 자동으로 열린다. credential 또는 endpoint만 넣고 **Connect**하면 저장·OAuth/승인·test·Tool discovery가 이어진다. MCP OAuth는 URL에서 resource metadata, authorization server와 scope를 자동 탐색한다.
 3. Studio가 YAML을 자동 저장하고 runtime validation을 연속 실행한다. 상단의 한 개 next action과 **Setup** tab만 따라가면 된다.
-4. **Try**에 준비된 input을 보내고 answer를 먼저 확인한다. 위험 Tool은 정확한 argument와 사람이 읽을 수 있는 권한 설명을 보고 **Allow once** 또는 **Don’t allow**를 고른다.
+4. 상단 **Harnest Playground**에서 새 대화를 열고 요청을 보낸다. 중앙에는 answer와 공개 가능한 실행 timeline, 하단에는 이 Harness가 선언한 모델·Tool/MCP/Skill과 파일 입력, 우측에는 upload·sandbox output·지원 범위가 표시된다. 위험 Tool은 정확한 argument와 사람이 읽을 수 있는 권한 설명을 보고 **Allow once** 또는 **Don’t allow**를 고른다.
 5. **Tests**에서 case ID·request·문자열 기대값을 추가·수정·삭제하고 자동 저장/check 뒤 **Run all**로 성공률과 case latency를 본다. object input, Output Schema, Tool-call·latency·iteration 같은 고급 assertion은 YAML에 그대로 보존된다.
 6. **Compare**는 같은 input의 A/B component setting을 실행하고 answer·evaluator 품질·비용·속도를 나란히 보여준다. **Activity**는 turn·Tool·approval·fallback·usage·run history를 보여준다.
 7. **YAML**은 import/export나 고급 편집이 필요할 때만 사용한다.
+
+Playground 선택은 저장 Harness를 바꾸지 않는다. Code Runner가 있는 Harness만 file attachment를 표시하며 선택한 파일만 container `/mnt/data`에 read-only로 전달한다. 결과 파일은 `/mnt/output`에 저장해야 Sandbox explorer에 돌아온다. 대화 기록·파일 보존·context/cost ceiling은 [Playground 문서](./playground.md)를 따른다.
 
 Model을 선택하면 **Fallback provider**에서 primary와 다른 저장 Provider 하나를 고를 수 있다. primary Adapter가 retryable 오류를 보고한 경우에만 한 번 전환하며 두 attempt의 사용량·비용과 이유가 Activity에 남는다.
 

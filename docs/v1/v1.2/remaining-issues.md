@@ -12,7 +12,8 @@
 
 - Windows에서 DPAPI vault를 검증했다. macOS Keychain과 Linux Secret Service backend는 해당 OS CI에서 동일 lifecycle을 실행해야 한다.
 - Docker CLI는 설치돼 있지만 daemon이 실행 중이지 않아 실제 image pull/container E2E를 수행하지 못했다. fake engine integration은 image digest approval, no-network/read-only/cap-drop/non-root/resource arguments, timeout과 process tree cleanup을 검증한다.
-- in-app browser로 새 Recipe launchpad, 자동 저장/검증, Service form, Morit MCP OAuth auto-discovery 설정, Try, A/B Compare, Test/Activity와 기존 Skill/Tool 흐름을 검증했다. 실제 OAuth consent popup 완료와 canvas pointer edge 재배선은 별도 시각 회귀 대상이다.
+- in-app browser로 새 Recipe launchpad, 자동 저장/검증, Service form, Morit MCP OAuth auto-discovery 설정, Harnest Playground 3-pane/toggle/upload/text preview/Code Runner capability gating/mobile layout, A/B Compare, Test/Activity와 기존 Skill/Tool 흐름을 검증했다. 실제 OAuth consent popup 완료와 canvas pointer edge 재배선은 별도 시각 회귀 대상이다.
+- Playground의 실제 `/mnt/data` → Code Runner → `/mnt/output` container E2E는 실행 중인 Docker/Podman daemon이 필요하다. 현재 자동화는 selected-file staging, mount argument, artifact/live scan과 경계를 검증하고 실제 daemon 검증을 위 플랫폼 항목과 함께 남긴다.
 
 ## 의도한 배포 경계
 

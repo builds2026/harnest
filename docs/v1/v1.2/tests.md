@@ -16,7 +16,8 @@
 | Agent Skills | parser/precedence/progressive disclosure, provenance tamper, local install, mocked Git/npm materialization+integrity+hostile archive, exact script hash approval/change invalidation |
 | Studio logic | graph/YAML state, declarative Test round-trip, trace lens, capability scoping, 5 Templates, primary/fallback Connection staging, exact Built-in ID, non-mutating typed experiment variant와 evaluator quality summary |
 | SDK/CLI | high-level load/invoke/test, init overwrite refusal, standard ZIP `.harnest` bundle/overwrite refusal, validate/run/test/runs/trace, loopback HTTP invoke, stdio MCP list/call, Connection·Skill lifecycle, exact Tool approval |
-| Studio HTTP | literal-loopback Host/Origin 허용, DNS Host rebinding request 거부, body bounds, secret-safe DTO, Compare input validation |
+| Studio HTTP | literal-loopback Host/Origin 허용, DNS Host rebinding request 거부, body bounds, secret-safe DTO, Compare input validation, Playground upload의 Content-Length/size/Range/CSP/삭제 경계 |
+| Playground | 실제 선언 모델·Plugin만 노출, subgraph-scoped component ID, Spec clone override 불변성, bounded history, selected-file staging, read-only input/writable output mount, live/final artifact scan |
 
 ## 최종 명령 결과
 
@@ -26,8 +27,8 @@
 | --- | --- |
 | `npm run lint` | 통과 — ESLint 오류·경고 없음 |
 | `npm run typecheck` | 통과 — package project references + Studio `tsc --noEmit` |
-| `npm test` | 통과 — **25 files, 181 passed, 1 platform-conditional skipped (182 total)** |
-| `npm run build` | 통과 — package + Studio production build, static pages **16/16**, warning 없음 |
+| `npm test` | 통과 — **28 files, 187 passed, 1 platform-conditional skipped (188 total)** |
+| `npm run build` | 통과 — package + Studio production build, static pages **19/19**, Playground 포함 17 app routes, warning 없음 |
 | production Host smoke | 통과 — literal `Host: 127.0.0.1:3456` 200, `Host: evil.example` 403 |
 
 ## 실제 Studio E2E
@@ -38,7 +39,9 @@ in-app browser와 임시 project에서 다음을 실제 클릭했다.
 - MCP Agent 선택 즉시 graph 생성·자동 저장·자동 check, Google AI Studio Service form, Morit MCP URL과 기본 browser OAuth auto-discovery form까지 이어지는 next-action 확인
 - 별도 Save/Validate 조작 없이 `Recipe → Services → Ready → Result` 상태와 Setup blocker 전환 확인
 - root Echo graph의 Prompt `template` A/B를 같은 input으로 실제 순차 실행: **136ms / 134ms**, 두 answer·token·run id 나란히 표시
-- Try에서 같은 Echo graph 실행 **120ms**, answer 우선 표시와 접힌 Run details 확인
+- 상단 Harnest Playground의 3-pane layout, History/Files 접기, 선언 모델·Tool 목록, 실행 timeline과 source Harness 불변 안내 확인
+- 실제 `README.md` upload → Files 목록/안전한 text preview → run 선택 chip 반영 확인. Code Runner를 끄면 첨부 control과 선택이 함께 비활성화되고 다시 켜면 복구되는 capability gating 확인
+- 680×900 viewport에서 양 side panel이 기본 접히고 Files를 열 때 History가 닫힌 상태를 유지하며, composer와 상단 surface navigation이 계속 사용 가능한지 확인
 - Tests에서 case 추가·request/expected text 수정 → 자동 저장·자동 check → 실제 Runtime 일괄 실행 **2 passed · 0 failed, 100% success**(158ms/116ms) 확인
 - 기본 narrow viewport와 1440×900에서 navigation, palette overflow, canvas/Configure/dock 배치 확인
 

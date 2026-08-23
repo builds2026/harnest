@@ -20,7 +20,7 @@ import {
   mcpToolApprovalId,
   NodeRuntimeServices,
 } from "../src/node.js";
-import { credentialBackendCommand, pinnedLookup } from "../src/node-connections.js";
+import { containerRunArguments, credentialBackendCommand, pinnedLookup } from "../src/node-connections.js";
 
 const temporaryRoots: string[] = [];
 
@@ -43,6 +43,26 @@ const context: ServiceExecutionContext = {
 afterEach(async () => {
   vi.unstubAllGlobals();
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe("container sandbox arguments", () => {
+  it("mounts selected input read-only and output writable while rejecting ambiguous sources", () => {
+    const profile = {
+      id: "python", scope: "project", kind: "local-runtime", name: "Python",
+      config: { sandbox: "container", image: "python:3.13-alpine" },
+      credentialFields: [], status: { state: "connected" }, createdAt: "now", updatedAt: "now",
+    } as const;
+    const args = containerRunArguments(profile, "sandbox", ["python", "-"], [], undefined, [
+      { source: process.cwd(), target: "/mnt/data", readOnly: true },
+      { source: process.cwd(), target: "/mnt/output", readOnly: false },
+    ]);
+    expect(args).toContain(`type=bind,source=${process.cwd()},target=/mnt/data,readonly`);
+    expect(args).toContain(`type=bind,source=${process.cwd()},target=/mnt/output`);
+    expect(args).toEqual(expect.arrayContaining(["--network", "none", "--read-only", "--cap-drop", "ALL"]));
+    expect(() => containerRunArguments(profile, "sandbox", ["python", "-"], [], undefined, [
+      { source: `${process.cwd()},other`, target: "/mnt/data", readOnly: true },
+    ])).toThrow(/mount is invalid/);
+  });
 });
 
 describe.sequential("ConnectionManager credential boundary", () => {
@@ -203,9 +223,11 @@ describe.sequential("ConnectionManager credential boundary", () => {
     const engineDirectory = join(project, "fake-container-engine");
     await mkdir(engineDirectory);
     const engine = join(engineDirectory, "docker.exe");
+    const invocationLog = join(engineDirectory, "invocations.ndjson");
     await copyFile(process.execPath, engine);
     await writeFile(join(engineDirectory, "image"), `console.log("sha256:${"a".repeat(64)}")\n`, "utf8");
     await writeFile(join(engineDirectory, "run"), `const { spawn } = require("node:child_process")
+require("node:fs").appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify(process.argv) + "\\n")
 if (!process.argv.includes("sha256:${"a".repeat(64)}")) process.exit(2)
 const child = spawn(process.execPath, ["-"], { stdio: ["pipe", "inherit", "inherit"] })
 process.stdin.pipe(child.stdin)
@@ -231,7 +253,14 @@ child.on("exit", (code) => process.exit(code ?? 1))
     });
     await expect(manager.test(connection.id)).resolves.toMatchObject({ status: { state: "connected" } });
     await manager.approveProcess(connection.id);
-    const services = new NodeRuntimeServices(project, { connectionManager: manager });
+    const inputDirectory = join(project, ".harnest", "sandbox-input");
+    const outputDirectory = join(project, ".harnest", "sandbox-output");
+    await Promise.all([mkdir(inputDirectory), mkdir(outputDirectory)]);
+    const services = new NodeRuntimeServices(project, {
+      connectionManager: manager,
+      sandboxWorkspace: { inputDirectory, outputDirectory },
+      allowModuleExecution: true,
+    });
     await expect(services.executeTool({
       id: "builtin.code-runner",
       source: "builtin",
@@ -239,6 +268,22 @@ child.on("exit", (code) => process.exit(code ?? 1))
     }, { runtime: "node", code: "console.log(2 + 3)" }, context)).resolves.toMatchObject({
       value: { stdout: "5\n", exitCode: 0 },
     });
+    const invocations = async () => (await readFile(invocationLog, "utf8")).trim().split(/\r?\n/u)
+      .map((line) => JSON.parse(line) as string[]);
+    expect((await invocations()).at(-1)).toEqual(expect.arrayContaining([
+      expect.stringContaining("target=/mnt/data,readonly"),
+      expect.stringContaining("target=/mnt/output"),
+    ]));
+    const unsafeServices = new NodeRuntimeServices(project, {
+      connectionManager: manager,
+      sandboxWorkspace: { inputDirectory: project },
+    });
+    await expect(unsafeServices.executeTool({
+      id: "builtin.code-runner",
+      source: "builtin",
+      connectionId: connection.id,
+    }, { runtime: "node", code: "console.log('unsafe')" }, context)).rejects.toThrow("outside the project");
+    await unsafeServices.close();
     await writeFile(join(project, "custom-tool.ts"), "export default ({ value }: { value: number }) => ({ doubled: value * 2 })\n", "utf8");
     await services.toolStore.save({
       manifestVersion: "1",
@@ -252,13 +297,12 @@ child.on("exit", (code) => process.exit(code ?? 1))
       source: "module",
       module: "./custom-tool.ts",
     });
-    const moduleServices = new NodeRuntimeServices(project, { connectionManager: manager, allowModuleExecution: true });
-    await expect(moduleServices.executeTool({
+    await expect(services.executeTool({
       id: "custom.isolated-module",
       source: "module",
       connectionId: connection.id,
     }, { value: 4 }, context)).resolves.toMatchObject({ value: { doubled: 8 } });
-    await moduleServices.close();
+    expect((await invocations()).at(-1)?.some((value) => value.includes("target=/mnt/"))).toBe(false);
     await services.close();
   });
 

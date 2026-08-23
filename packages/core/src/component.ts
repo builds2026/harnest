@@ -90,6 +90,28 @@ export interface ServiceResult {
   readonly state?: Readonly<Record<string, unknown>>;
 }
 
+export interface RunConversationMessage {
+  readonly role: "user" | "assistant";
+  readonly content: string;
+}
+
+export interface RunAttachment {
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number;
+  /** Path exposed inside an approved sandbox, never a host path. */
+  readonly sandboxPath?: string;
+}
+
+export interface RunSessionContext {
+  readonly messages?: readonly RunConversationMessage[];
+  readonly attachments?: readonly RunAttachment[];
+  readonly sandboxOutputPath?: string;
+  readonly maxHistoryMessages?: number;
+  readonly maxHistoryBytes?: number;
+}
+
 export interface RuntimeServices {
   /** Optional synchronous resolver for secrets that were unlocked by a service operation. */
   resolveSecret?(reference: string): string | undefined;
@@ -173,6 +195,7 @@ export interface ComponentExecutionContext {
   readonly nodeId: string;
   readonly iteration: number;
   readonly runInput: unknown;
+  readonly session?: RunSessionContext;
   readonly state: Readonly<Record<string, unknown>>;
   readonly adapters: AdapterRegistry;
   readonly tools: ToolRegistry;
@@ -610,8 +633,39 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     typeof component.config.system === "string" ? component.config.system : "",
     ...skillInstructions,
   ].filter(Boolean).join("\n\n");
+  const maxHistoryMessages = Math.min(100, Math.max(0, Math.floor(context.session?.maxHistoryMessages ?? 20)));
+  const maxHistoryBytes = Math.min(1_048_576, Math.max(0, Math.floor(context.session?.maxHistoryBytes ?? 65_536)));
+  let historyBytes = 0;
+  const history = [...(context.session?.messages ?? [])].reverse().flatMap((message) => {
+    if ((message.role !== "user" && message.role !== "assistant") || typeof message.content !== "string") return [];
+    const content = asText(context.redact(message.content));
+    const bytes = boundedUtf8ByteLength(content, maxHistoryBytes - historyBytes);
+    if (bytes === undefined) return [];
+    historyBytes += bytes;
+    return [{ role: message.role, content } satisfies ModelMessage];
+  }).slice(0, maxHistoryMessages).reverse();
+  const attachments = (context.session?.attachments ?? []).slice(0, 32).flatMap((attachment) => {
+    if (!attachment || typeof attachment.id !== "string" || typeof attachment.name !== "string"
+      || typeof attachment.mimeType !== "string" || !Number.isFinite(attachment.size) || attachment.size < 0) return [];
+    return [{
+      id: attachment.id,
+      name: asText(context.redact(attachment.name)).slice(0, 255),
+      mimeType: attachment.mimeType.slice(0, 127),
+      size: Math.floor(attachment.size),
+      ...(typeof attachment.sandboxPath === "string" ? { sandboxPath: attachment.sandboxPath } : {}),
+    }];
+  });
+  const attachmentInstruction = attachments.length ? [
+    "Files selected by the user are available for this run. Use only paths listed below and only through connected tools.",
+    ...attachments.map((attachment) => `- ${JSON.stringify(attachment.name)} (${attachment.mimeType}, ${attachment.size} bytes)${attachment.sandboxPath ? ` at ${attachment.sandboxPath}` : ""}`),
+    ...(context.session?.sandboxOutputPath
+      ? [`Save files intended for the user under ${context.session.sandboxOutputPath}.`]
+      : []),
+  ].join("\n") : "";
   const messages: ModelMessage[] = [
     ...(system ? [{ role: "system" as const, content: system }] : []),
+    ...(attachmentInstruction ? [{ role: "system" as const, content: attachmentInstruction }] : []),
+    ...history,
     { role: "user", content: enriched },
   ];
   if (context.responseSchema) messages.unshift({
