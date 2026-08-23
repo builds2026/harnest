@@ -24,7 +24,7 @@ npm run harnest -- init my-agent
 npm run harnest -- studio my-agent/harnest.yaml
 ```
 
-Studio starts with outcome-based Recipes. Choose one and add only the requested Services; YAML saving and runtime validation happen automatically. **Setup** explains blockers, **Tests** creates repeatable cases, **Compare** runs two component-setting variants, and **Activity** keeps the technical trace. The top-level **Harnest Playground** provides the service-like chat surface: conversation history, observable execution timelines, per-run model/tool/skill controls, file uploads, and live sandbox output without changing `harnest.yaml`.
+Studio starts with outcome-based Recipes. Choose one and add only the requested Services; YAML saving and runtime validation happen automatically. Add compatible nodes from the `+` beside a typed port, use the collapsed workbench for **Setup**, **Tests**, **Compare**, **Activity**, and **YAML**, and open **Integrate** for the generated production contract. The top-level **Harnest Playground** provides the service-like chat surface: conversation history, observable execution timelines, per-run model/tool/skill controls, file uploads, and live sandbox output without changing `harnest.yaml`.
 
 When the harness declares an enabled Code Runner, Playground uploads can be selected for a run. Only the selected files are copied into the isolated container at `/mnt/data` (read-only); user-facing outputs written to `/mnt/output` return to the Sandbox explorer. See [the Playground guide](./docs/v1/v1.2/playground.md).
 
@@ -79,10 +79,13 @@ Model components can select a second saved Provider as a fallback. Harnest switc
 The same runtime can be embedded, served over loopback HTTP, or exposed as an MCP tool:
 
 ```bash
-# GET /health, POST /invoke, POST /stream (NDJSON)
+# Secret-free contract for CI or deployment tooling
+npm run harnest -- contract harnest.yaml -- --json
+
+# GET /health, GET /contract, POST /invoke, POST /stream (NDJSON)
 npm run harnest -- serve harnest.yaml -- --port 8787 --allow-modules
 
-# stdio MCP server with invoke_harness
+# stdio MCP server with describe_harness + invoke_harness
 npm run harnest -- mcp serve harnest.yaml -- --allow-modules
 ```
 
@@ -91,6 +94,7 @@ import { Harnest } from "@harnest/sdk";
 
 const harness = await Harnest.load("./harnest.yaml", { allowModuleExecution: true });
 try {
+  console.log(harness.contract);
   const result = await harness.invoke("hello");
   console.log(result.output);
 } finally {
@@ -175,6 +179,7 @@ frontend                    Next.js Web Studio
 examples                    RAG, MCP Tool Agent, Loop, provider, and extension specs
 docs/v1/v1.1                v1.1 research, decisions, and verification notes
 docs/v1/v1.2                v1.2 implementation, security, run, and verification notes
+docs/v1/v1.3                v1.3 UX research, design system, implementation, and verification
 ```
 
 ## Development checks
@@ -186,4 +191,4 @@ npm run lint
 npm run build
 ```
 
-See the [v1.2 implementation report](./docs/v1/v1.2/implementation.md), [security boundary](./docs/v1/v1.2/security.md), and [verification report](./docs/v1/v1.2/tests.md).
+See the [v1.3 implementation report](./docs/v1/v1.3/implementation.md), [design system](./docs/v1/v1.3/design-system.md), and [verification report](./docs/v1/v1.3/tests.md). The v1.2 [security boundary](./docs/v1/v1.2/security.md) remains authoritative for runtime isolation.

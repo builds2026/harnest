@@ -2,6 +2,7 @@
 
 import {
   BUILTIN_COMPONENT_MANIFESTS,
+  describeHarness,
   parseSpec,
   stringifySpec,
   skillConnectionRequirement,
@@ -10,6 +11,7 @@ import {
   type Diagnostic,
   type HarnessAssertion,
   type HarnessSpec,
+  type HarnessIntegrationContract,
   type HarnessTestCase,
   type RunEvent,
 } from "@harnest/core";
@@ -42,6 +44,7 @@ import {
 } from "react";
 import {
   createDocumentState,
+  compatiblePortInsertions,
   draftToSpec,
   isEntrypointCandidate,
   parseYamlDraft,
@@ -53,6 +56,9 @@ import {
   type HarnessDraft,
   type HarnessEdge,
   type HarnessNode,
+  type NodeRunState,
+  type CanvasPortAnchor,
+  type CanvasPortInsertion,
 } from "@/lib/studio-state";
 import { catalogMap, colorFor, glyphFor, validationRegistryFor } from "@/lib/component-catalog";
 import { EMPTY_SPEC } from "@/lib/default-spec";
@@ -312,8 +318,89 @@ export default function Studio() {
   );
 }
 
+function IntegrationWorkspace({
+  contract,
+  diagnostics,
+  connections,
+  connectionsLoaded,
+  verified,
+  file,
+  onOpenBuilder,
+  onOpenConnections,
+}: {
+  contract: HarnessIntegrationContract;
+  diagnostics: readonly Diagnostic[];
+  connections: readonly ConnectionSummary[];
+  connectionsLoaded: boolean;
+  verified: boolean;
+  file: string;
+  onOpenBuilder: () => void;
+  onOpenConnections: () => void;
+}) {
+  const [copied, setCopied] = useState<string>();
+  const filename = file.split(/[\\/]/).pop() ?? "harnest.yaml";
+  const missingConnections = connectionsLoaded
+    ? contract.requiredConnections.filter((id) => !connections.some((connection) => connection.id === id && connectionCanRun(connection)))
+    : [];
+  const errors = diagnostics.filter(({ severity }) => severity === "error");
+  const ready = verified && missingConnections.length === 0 && errors.length === 0;
+  const blockerCount = errors.length + missingConnections.length + Number(!verified);
+  const snippets = [
+    { id: "sdk", label: "TypeScript SDK", code: `const harness = await Harnest.load(${JSON.stringify(filename)});\nconst result = await harness.invoke(input);\nawait harness.close();` },
+    { id: "cli", label: "CLI", code: `harnest validate ${filename}\nharnest run ${filename} --input '{"message":"hello"}'` },
+    { id: "http", label: "HTTP", code: `harnest serve ${filename} --port 8787\ncurl -X POST http://127.0.0.1:8787/invoke \\\n  -H 'content-type: application/json' \\\n  -d '{"input":"hello"}'` },
+    { id: "mcp", label: "MCP", code: `harnest mcp serve ${filename}` },
+  ] as const;
+  const copy = async (id: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(id);
+    } catch {
+      setCopied(`error:${id}`);
+    }
+    window.setTimeout(() => setCopied((current) => current === id || current === `error:${id}` ? undefined : current), 1_500);
+  };
+  const download = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(contract, null, 2)], { type: "application/json" }));
+    const link = globalThis.document.createElement("a");
+    link.href = url;
+    link.download = `${filename.replace(/\.ya?ml$/i, "")}.contract.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return <section className="integrate-workspace" aria-labelledby="integrate-title">
+    <header className="integrate-hero">
+      <div><span className="sheet-eyebrow">Portable Integration Contract</span><h1 id="integrate-title">One harness. Four production surfaces.</h1><p>This page is generated from the current HarnessSpec—not a deployment mock. Change the graph and the contract changes with it.</p></div>
+      <div className={`contract-readiness ${ready ? "is-ready" : "is-blocked"}`}><span>{ready ? "Ready to integrate" : connectionsLoaded ? "Action required" : "Checking connections"}</span><strong>{ready ? `${contract.componentCount} components verified` : `${blockerCount} blocker(s)`}</strong><small>HarnessSpec {contract.specVersion} · contract v{contract.contractVersion}</small></div>
+    </header>
+
+    <div className="contract-metrics" aria-label="Harness contract summary">
+      <div><span>Graph</span><strong>{contract.graphCount}</strong><small>{contract.componentCount} components · {contract.connectionCount} edges</small></div>
+      <div><span>Tests</span><strong>{contract.tests.count}</strong><small>{contract.tests.assertionTypes.join(" · ") || "No assertions declared"}</small></div>
+      <div><span>Services</span><strong>{contract.requiredConnections.length}</strong><small>{contract.requiredConnections.join(" · ") || "No named Connections"}</small></div>
+      <div><span>Output</span><strong>{contract.output?.format ?? "custom"}</strong><small>{contract.output?.schemaDeclared ? "JSON Schema declared" : `Entrypoint · ${contract.entrypoint}`}</small></div>
+    </div>
+
+    <div className="contract-layout">
+      <section className="contract-capabilities"><header><div><span className="sheet-eyebrow">Runtime truth</span><h2>Declared capabilities</h2></div><button className="button" onClick={download}>Download JSON</button></header>
+        <div className="capability-grid">{contract.capabilities.length ? contract.capabilities.map((capability) => <span key={capability}>{capability.replaceAll("-", " ")}</span>) : <p>No optional runtime capabilities are declared.</p>}</div>
+        {contract.capabilities.includes("code-sandbox") && <div className="sandbox-contract"><strong>File → Code Runner contract</strong><div><span>Upload</span><i>→</i><span>/mnt/data · read-only</span><i>→</i><span>isolated runner</span><i>→</i><span>/mnt/output · artifacts</span></div><p>Only files selected for a run are mounted. Generated files are indexed and returned to the Playground for preview or download.</p></div>}
+        <div className="contract-list"><h3>Required Connections</h3>{contract.requiredConnections.length ? contract.requiredConnections.map((id) => {
+          const connection = connections.find((candidate) => candidate.id === id);
+          const running = connection ? connectionCanRun(connection) : false;
+          return <div key={id}><span className={`contract-state ${running ? "is-ready" : "is-blocked"}`} aria-hidden="true" /><span><strong>{id}</strong><small>{connection ? `${connectionKindLabel(connection.kind)} · ${connection.status.replaceAll("_", " ")}` : "Connection has not been created"}</small></span>{!running && <button className="button" onClick={onOpenConnections}>Connect</button>}</div>;
+        }) : <p>No named provider or tool Connections are required by this spec.</p>}</div>
+        {!ready && <div className="contract-blockers" role="status"><strong>Integration blockers</strong><ul>{!verified && <li>{connectionsLoaded ? "Save and complete runtime validation for the current HarnessSpec." : "Reusable Connections are still loading."}</li>}{missingConnections.map((id) => <li key={id}>Connect and test <code>{id}</code>.</li>)}{errors.slice(0, 6).map((diagnostic, index) => <li key={`${diagnostic.code}:${index}`}>{diagnostic.message}</li>)}</ul><button className="button" onClick={onOpenBuilder}>Resolve in Builder</button></div>}
+      </section>
+
+      <section className="integration-snippets"><header><span className="sheet-eyebrow">Use the same contract anywhere</span><h2>Integration recipes</h2></header>{snippets.map((snippet) => <article key={snippet.id}><div><strong>{snippet.label}</strong><button type="button" onClick={() => void copy(snippet.id, snippet.code)}>{copied === snippet.id ? "Copied" : copied === `error:${snippet.id}` ? "Copy failed" : "Copy"}</button></div><pre><code>{snippet.code}</code></pre></article>)}</section>
+    </div>
+  </section>;
+}
+
 function StudioReady({ initial }: { initial: SpecPayload }) {
-  const [surface, setSurface] = useState<"builder" | "playground">("builder");
+  const [surface, setSurface] = useState<"builder" | "playground" | "integrate">("builder");
   const [catalog, setCatalog] = useState<readonly ComponentManifest[]>(
     () => initial.catalog?.length ? initial.catalog : BUILTIN_COMPONENT_MANIFESTS,
   );
@@ -325,9 +412,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     () => createDocumentState(initial.spec ?? EMPTY_SPEC, catalog, initial.yaml, initial.diagnostics),
   );
   const [activeSubgraph, setActiveSubgraph] = useState<string>();
-  const [activeDock, setActiveDock] = useState<DockTab>("problems");
+  const [activeDock, setActiveDockState] = useState<DockTab>("problems");
+  const [dockOpen, setDockOpen] = useState(false);
+  const setActiveDock = useCallback((tab: DockTab) => {
+    setActiveDockState(tab);
+    setDockOpen(true);
+  }, []);
   const [welcomeDismissed, setWelcomeDismissed] = useState(initial.exists);
   const [paletteKind, setPaletteKind] = useState<PaletteKind>(initial.exists ? "components" : "templates");
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteCategory, setPaletteCategory] = useState("all");
   const [studioCatalog, setStudioCatalog] = useState<StudioCatalogPayload>({
@@ -372,7 +466,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const autoSetup = useRef(initial.exists);
   const autoSetupProgress = useRef(false);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const fittedGraph = useRef<string | undefined>(undefined);
   const reactFlow = useReactFlow<HarnessNode, HarnessEdge>();
+  useEffect(() => {
+    const stored = localStorage.getItem("harnest.studio.theme");
+    const next = stored === "light" || stored === "dark"
+      ? stored
+      : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    setTheme(next);
+    globalThis.document.documentElement.dataset.theme = next;
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
     void fetch("/api/catalog", { signal: controller.signal })
@@ -471,7 +574,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     nodes: activeGraph.nodes,
     edges: activeGraph.edges,
   } : document.draft, [activeGraph, document.draft]);
-  const replaceViewDraft = useCallback((draft: HarnessDraft, touch: "none" | "layout" | "semantic") => {
+  const integrationContract = useMemo(() => describeHarness(draftToSpec(document.draft)), [document.draft]);
+  const replaceViewDraft = useCallback((draft: HarnessDraft, touch: "none" | "transient" | "layout" | "semantic") => {
     if (!activeSubgraph) {
       dispatch({ type: "replace-draft", draft, touch });
       return;
@@ -504,6 +608,24 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const canValidate = !running && !dirty && document.yamlState === "synced" && document.validationPhase !== "checking";
   const canSave = !running && structurallyValid && dirty && savePhase !== "saving";
   const canRun = !running && !dirty && serverValidated;
+  const canUndo = !graphLocked && document.historyPast.length > 0;
+  const canRedo = !graphLocked && document.historyFuture.length > 0;
+  useEffect(() => {
+    const handleHistoryShortcut = (event: globalThis.KeyboardEvent) => {
+      const target = event.target;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || !(target instanceof HTMLElement)
+        || target.matches("input, textarea, select, [contenteditable=true]")) return;
+      const key = event.key.toLocaleLowerCase();
+      if (key !== "z" && key !== "y") return;
+      const redo = key === "y" || (key === "z" && event.shiftKey);
+      if (redo ? !canRedo : !canUndo) return;
+      event.preventDefault();
+      dispatch({ type: redo ? "redo" : "undo" });
+      setStatusNote(redo ? "Change restored" : "Change undone");
+    };
+    window.addEventListener("keydown", handleHistoryShortcut);
+    return () => window.removeEventListener("keydown", handleHistoryShortcut);
+  }, [canRedo, canUndo]);
   const selectedNode = viewDraft.nodes.find((node) => node.selected);
   const selectedEdge = viewDraft.edges.find((edge) => edge.selected);
   const welcome = !welcomeDismissed && !initial.exists && viewDraft.nodes.length === 0;
@@ -565,18 +687,111 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         || left.label.localeCompare(right.label));
   }, [favorites, paletteCategory, paletteItems, paletteQuery, recents]);
 
-  const displayNodes = useMemo(() => viewDraft.nodes.map((node) => ({
-    ...node,
-    data: {
+  const insertAtPort = useCallback((anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => {
+    if (graphLocked) return;
+    const anchorNode = viewDraft.nodes.find((node) => node.id === anchor.nodeId);
+    const manifest = manifests.get(insertion.type);
+    if (!anchorNode || !manifest) {
+      setStatusNote("The compatible component is no longer available. Refresh the catalog and try again.");
+      return;
+    }
+    const id = uniqueComponentId(insertion.type, new Set(viewDraft.nodes.map((node) => node.id)));
+    const component = { id, type: insertion.type, config: structuredClone(manifest.defaultConfig) } as HarnessComponent;
+    const candidate: HarnessConnection = anchor.direction === "output" ? {
+      from: { component: anchor.nodeId, port: anchor.port },
+      to: { component: id, port: insertion.connectPort },
+    } : {
+      from: { component: id, port: insertion.connectPort },
+      to: { component: anchor.nodeId, port: anchor.port },
+    };
+    const upgraded = viewDraft.root.version === "0.1" && !LEGACY_COMPONENT_TYPES.has(insertion.type);
+    const root = {
+      ...viewDraft.root,
+      ...(upgraded ? { version: "0.2" as const } : {}),
+      ...(manifest.category === "Output" ? { entrypoint: id } : {}),
+    };
+    const node: HarnessNode = {
+      id,
+      type: "harness",
+      position: {
+        x: anchorNode.position.x + (anchor.direction === "output" ? 360 : -360),
+        y: anchorNode.position.y + Math.min(160, viewDraft.nodes.filter((item) => Math.abs(item.position.x - anchorNode.position.x) < 80).length * 24),
+      },
+      data: { component, manifest },
+      selected: true,
+    };
+    const draft = {
+      ...viewDraft,
+      root,
+      nodes: [...viewDraft.nodes.map((current) => ({ ...current, selected: false })), node],
+    };
+    const validation = validateCandidateConnection(draftToSpec(draft), candidate, { components: validationComponents });
+    if (!validation.ok) {
+      setStatusNote(validation.diagnostics[0]?.message ?? "That component can no longer be connected at this port.");
+      return;
+    }
+    const connection = { ...candidate, id: `connection_${crypto.randomUUID().slice(0, 8)}` };
+    const edge: HarnessEdge = {
+      id: connection.id,
+      type: "smoothstep",
+      source: connection.from.component,
+      sourceHandle: connection.from.port,
+      target: connection.to.component,
+      targetHandle: connection.to.port,
+      data: { connection },
+    };
+    replaceViewDraft({ ...draft, edges: [...viewDraft.edges, edge] }, "semantic");
+    setStatusNote(`${manifest.label} ${id} added and connected · Undo with Ctrl/⌘ Z`);
+  }, [graphLocked, manifests, replaceViewDraft, validationComponents, viewDraft]);
+
+  const portInsertions = useMemo(() => Object.fromEntries(viewDraft.nodes.flatMap((node) => [
+    ...Object.keys(node.data.manifest.ports.inputs).map((port) => {
+      const key = `${node.id}:input:${port}`;
+      return [key, compatiblePortInsertions(viewDraft, catalog, { nodeId: node.id, direction: "input", port })] as const;
+    }),
+    ...Object.keys(node.data.manifest.ports.outputs).map((port) => {
+      const key = `${node.id}:output:${port}`;
+      return [key, compatiblePortInsertions(viewDraft, catalog, { nodeId: node.id, direction: "output", port })] as const;
+    }),
+  ])), [catalog, viewDraft]);
+
+  const displayNodes = useMemo(() => viewDraft.nodes.map((node) => {
+    const nodeEvents = trace.filter((event) => (event as RunEvent & { nodeId?: string }).nodeId?.split("/").at(-1) === node.id);
+    const ended = nodeEvents.findLast((event) => event.type === "node-end") as (RunEvent & { durationMs?: number }) | undefined;
+    const failed = nodeEvents.findLast((event) => event.type === "error") as (RunEvent & { message?: string }) | undefined;
+    const runState: NodeRunState = failed ? "error" : ended ? "success" : nodeEvents.some((event) => event.type === "node-start") ? "running" : "idle";
+    return {
+      ...node,
+      data: {
       ...node.data,
       diagnostics: document.diagnostics.filter((item) => item.componentId === node.id
         && (activeSubgraph
           ? item.path.startsWith(`$.subgraphs.${activeSubgraph}.`)
           : !item.path.startsWith("$.subgraphs."))),
-      runState: "idle" as const,
+      runState,
+      ...(nodeEvents.length ? { lastRun: {
+        ...(runId ? { runId } : {}),
+        state: runState,
+        ...(typeof ended?.durationMs === "number" ? { durationMs: ended.durationMs } : {}),
+        eventCount: nodeEvents.length,
+        ...(failed?.message ? { error: failed.message } : {}),
+      } } : {}),
+      locked: graphLocked,
+      portInsertions: Object.fromEntries([
+        ...Object.keys(node.data.manifest.ports.inputs).flatMap((port) => {
+          const options = portInsertions[`${node.id}:input:${port}`];
+          return options?.length ? [[`input:${port}`, options] as const] : [];
+        }),
+        ...Object.keys(node.data.manifest.ports.outputs).flatMap((port) => {
+          const options = portInsertions[`${node.id}:output:${port}`];
+          return options?.length ? [[`output:${port}`, options] as const] : [];
+        }),
+      ]),
+      onInsertAtPort: insertAtPort,
       onAddAttachment: (nodeId: string, slot: "tools" | "skills") => setAttachmentPicker({ nodeId, slot }),
-    },
-  })), [activeSubgraph, document.diagnostics, viewDraft.nodes]);
+      },
+    };
+  }), [activeSubgraph, document.diagnostics, graphLocked, insertAtPort, portInsertions, runId, trace, viewDraft.nodes]);
 
   const displayEdges = useMemo(() => viewDraft.edges.map((edge) => ({
     ...edge,
@@ -585,6 +800,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     animated: false,
     data: { ...edge.data!, running: false },
   })), [viewDraft.edges]);
+
+  useEffect(() => {
+    const graph = activeSubgraph ?? "root";
+    if (!viewDraft.nodes.length || fittedGraph.current === graph) return undefined;
+    const timer = window.setTimeout(() => {
+      fittedGraph.current = graph;
+      void reactFlow.fitView({ padding: 0.25 });
+    }, 100);
+    return () => window.clearTimeout(timer);
+  }, [activeSubgraph, reactFlow, viewDraft.nodes.length]);
 
   const onNodesChange: OnNodesChange<HarnessNode> = useCallback((changes) => {
     if (graphLocked && changes.some((change) => change.type !== "select" && change.type !== "dimensions")) return;
@@ -596,7 +821,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     if (removed && !nodes.some((node) => node.id === draft.root.entrypoint)) {
       draft = { ...draft, root: { ...draft.root, entrypoint: chooseEntrypoint(draft) } };
     }
-    replaceViewDraft(draft, removed ? "semantic" : finishedMove ? "layout" : "none");
+    const dragging = changes.some((change) => change.type === "position" && change.dragging === true);
+    replaceViewDraft(draft, removed ? "semantic" : finishedMove ? "layout" : dragging ? "transient" : "none");
   }, [graphLocked, replaceViewDraft, viewDraft]);
 
   const onEdgesChange: OnEdgesChange<HarnessEdge> = useCallback((changes) => {
@@ -1409,7 +1635,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   };
 
   return (
-    <main className={`studio-shell ${surface === "playground" ? "is-playground" : welcome ? "is-welcome" : ""}`}>
+    <main className={`studio-shell ${paletteOpen ? "is-palette-open" : ""} ${dockOpen ? "is-dock-open" : ""} ${surface === "playground" ? "is-playground" : surface === "integrate" ? "is-integrate" : welcome ? "is-welcome" : ""}`}>
       <header className="command-rail">
         <div className="brand-lockup">
           <span className="brand-name">Harnest</span>
@@ -1419,8 +1645,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         <nav className="surface-tabs" aria-label="Harnest workspace">
           <button className={surface === "builder" ? "is-active" : ""} aria-current={surface === "builder" ? "page" : undefined} onClick={() => setSurface("builder")}>Builder</button>
           <button className={surface === "playground" ? "is-active" : ""} aria-current={surface === "playground" ? "page" : undefined} onClick={() => setSurface("playground")}>Harnest Playground</button>
+          <button className={surface === "integrate" ? "is-active" : ""} aria-current={surface === "integrate" ? "page" : undefined} onClick={() => setSurface("integrate")}>Integrate</button>
         </nav>
-        {surface === "playground" ? <div className="playground-rail-context"><span>Immutable runtime</span><strong>{serverValidated ? "Ready" : "Setup required"}</strong></div> : welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
+        {surface === "playground" ? <div className="playground-rail-context"><span>Immutable runtime</span><strong>{serverValidated ? "Ready" : "Setup required"}</strong></div> : surface === "integrate" ? <div className="playground-rail-context"><span>Integration contract</span><strong>{integrationContract.integrationSurfaces.length} surfaces</strong></div> : welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
           <div className="continuity-rail" aria-label="Setup progress">
             <span className={`continuity-step ${templateReady ? "is-pass" : "is-active"}`}><span>Recipe</span></span>
             <span className={`continuity-step ${connectionReady ? "is-pass" : templateReady ? "is-active" : ""}`}><span>Services</span></span>
@@ -1447,9 +1674,21 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             ) : <button className="button button-rail" disabled>Preparing…</button>}
           </div>
         </>}
+        <button
+          className="theme-toggle"
+          type="button"
+          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          onClick={() => setTheme((current) => {
+            const next = current === "dark" ? "light" : "dark";
+            globalThis.document.documentElement.dataset.theme = next;
+            localStorage.setItem("harnest.studio.theme", next);
+            return next;
+          })}
+        ><span aria-hidden="true">{theme === "dark" ? "☀" : "◐"}</span></button>
       </header>
 
-      {surface === "playground" ? <Playground onOpenBuilder={() => setSurface("builder")} /> : welcome ? (
+      {surface === "playground" ? <Playground onOpenBuilder={() => setSurface("builder")} /> : surface === "integrate" ? <IntegrationWorkspace contract={integrationContract} diagnostics={document.diagnostics} connections={connections} connectionsLoaded={connectionsLoaded} verified={!dirty && serverValidated} file={initial.file} onOpenBuilder={() => setSurface("builder")} onOpenConnections={() => openConnections()} /> : welcome ? (
         <section className="welcome-launchpad" aria-labelledby="welcome-title">
           <div className="welcome-intro">
             <span className="sheet-eyebrow">Working harness in minutes</span>
@@ -1476,12 +1715,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           <div className="welcome-alternatives">
             <span>Already have a harness?</span>
             <label className="button file-button">Open YAML<input type="file" accept=".yaml,.yml,text/yaml" onChange={(event) => void openYaml(event.target.files?.[0])} /></label>
-            <button className="button" onClick={() => { setWelcomeDismissed(true); setPaletteKind("components"); }}>Build from blank</button>
+            <button className="button" onClick={() => { setWelcomeDismissed(true); setPaletteKind("components"); setPaletteOpen(true); }}>Build from blank</button>
           </div>
         </section>
       ) : <>
-      <aside className="palette-panel" aria-label="Studio palette">
-        <div className="panel-heading"><h2>Add to harness</h2><span className="panel-count">{visiblePalette.length}/{paletteItems.length}</span></div>
+      {paletteOpen && <aside className="palette-panel" aria-label="Studio palette">
+        <div className="panel-heading"><h2>Component catalog</h2><span><span className="panel-count">{visiblePalette.length}/{paletteItems.length}</span><button className="panel-close" type="button" aria-label="Close component catalog" onClick={() => setPaletteOpen(false)}>×</button></span></div>
         <div className="palette-tabs" role="tablist" aria-label="Palette catalogs">
           {PALETTE_KINDS.map((kind) => <button
             key={kind}
@@ -1525,7 +1764,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             </div>
           )) : <div className="palette-empty">No {paletteKind} match this filter.{paletteKind === "connections" && <button className="button button-primary" onClick={() => openConnections()}>New connection</button>}</div>}
         </div>
-      </aside>
+      </aside>}
 
       <section
         ref={canvasRef}
@@ -1537,6 +1776,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         onDrop={handleDrop}
       >
         <div className="canvas-toolbar">
+          <button className="catalog-toggle" type="button" aria-expanded={paletteOpen} onClick={() => setPaletteOpen((current) => !current)}>＋ Add</button>
           <button className={`graph-crumb ${activeSubgraph ? "" : "is-active"}`} disabled={!activeSubgraph} onClick={() => setActiveSubgraph(undefined)}>Root</button>
           {activeSubgraph && <><span aria-hidden="true">›</span><span className="graph-crumb is-active">{activeSubgraph}</span></>}
           {Object.keys(document.draft.subgraphs).length > 0 && (
@@ -1545,9 +1785,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               {Object.keys(document.draft.subgraphs).map((name) => <option key={name} value={name}>{name}</option>)}
             </select>
           )}
+          <span className="canvas-history" role="group" aria-label="Canvas history">
+            <button type="button" disabled={!canUndo} aria-label="Undo last canvas change" title="Undo (Ctrl/⌘ Z)" onClick={() => { dispatch({ type: "undo" }); setStatusNote("Change undone"); }}>↶</button>
+            <button type="button" disabled={!canRedo} aria-label="Redo last canvas change" title="Redo (Ctrl/⌘ Shift Z)" onClick={() => { dispatch({ type: "redo" }); setStatusNote("Change restored"); }}>↷</button>
+          </span>
           <span className="utility-label">{viewDraft.nodes.length} components · {viewDraft.edges.length} connections</span>
         </div>
-        {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">Blank harness</span><strong>Add the first building block</strong><span>Use Build on the left, or switch to Recipes for a working graph.</span><button className="onboarding-blank" onClick={() => setPaletteKind("templates")}>Browse recipes</button></div>}
+        {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">Blank harness</span><strong>Add the first building block</strong><span>Open the catalog, or start from a recipe for a working graph.</span><button className="onboarding-blank" onClick={() => { setPaletteKind("templates"); setPaletteOpen(true); }}>Browse recipes</button></div>}
         <ReactFlow<HarnessNode, HarnessEdge>
           nodes={displayNodes}
           edges={displayEdges}
@@ -1583,9 +1827,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             "handle.ariaLabel": "Typed connection port",
           }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#b7c2c8" />
+          <Background variant={BackgroundVariant.Dots} gap={20} size={1} color={theme === "dark" ? "#353b47" : "#c7ced8"} />
           <Controls position="bottom-left" showInteractive={false} />
-          <MiniMap position="bottom-right" pannable zoomable nodeColor={(node) => colorFor((node.data as HarnessNode["data"]).manifest.category)} maskColor="rgb(231 236 239 / 72%)" />
+          <MiniMap position="bottom-right" pannable zoomable nodeColor={(node) => colorFor((node.data as HarnessNode["data"]).manifest.category)} maskColor={theme === "dark" ? "rgb(15 17 22 / 78%)" : "rgb(244 246 249 / 76%)"} />
         </ReactFlow>
       </section>
 
@@ -1627,7 +1871,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         />
       </aside>
 
-      <section className="bottom-dock" aria-label="Setup, tests, comparisons, activity, and YAML">
+      <section className={`bottom-dock ${dockOpen ? "" : "is-collapsed"}`} aria-label="Setup, tests, comparisons, activity, and YAML">
         <div className="dock-heading">
           <div className="dock-tabs" role="tablist" aria-label="Studio dock">
             {dockTabs.map((tab) => (
@@ -1637,6 +1881,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
                 role="tab"
                 aria-controls={`dock-panel-${tab}`}
                 aria-selected={activeDock === tab}
+                aria-expanded={activeDock === tab ? dockOpen : undefined}
                 tabIndex={activeDock === tab ? 0 : -1}
                 className={`dock-tab ${activeDock === tab ? "is-active" : ""}`}
                 onClick={() => setActiveDock(tab)}
@@ -1646,7 +1891,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               </button>
             ))}
           </div>
-          {dockTools}
+          {dockOpen && dockTools}
+          <button className="dock-toggle" type="button" aria-label={dockOpen ? "Collapse workbench" : "Expand workbench"} aria-expanded={dockOpen} onClick={() => setDockOpen((current) => !current)}>{dockOpen ? "⌄" : "⌃"}</button>
         </div>
         <div id={`dock-panel-${activeDock}`} role="tabpanel" aria-labelledby={`dock-tab-${activeDock}`} className="dock-content" tabIndex={0}>
           {activeDock === "yaml" && (

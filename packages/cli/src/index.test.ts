@@ -457,6 +457,14 @@ describe("harnest CLI", () => {
     });
   });
 
+  it("prints the secret-free Integration Contract as JSON", async () => {
+    const directory = join(testRoot, "initialized");
+    const result = await exec(process.execPath, [cli, "contract", join(directory, "harnest.yaml"), "--json"], { cwd: root });
+    const contract = JSON.parse(result.stdout) as { specVersion: string; capabilities: string[]; integrationSurfaces: Array<{ id: string }> };
+    expect(contract).toMatchObject({ specVersion: "0.2", capabilities: ["conversation"] });
+    expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http", "mcp"]);
+  });
+
   it("packages harnest.yaml and assets as a standard single-file bundle", async () => {
     const directory = join(testRoot, "bundled");
     await exec(process.execPath, [cli, "init", directory], { cwd: root });
@@ -520,6 +528,9 @@ describe("harnest CLI", () => {
         api.once("error", reject);
         inspect();
       });
+      const contract = await fetch(`http://127.0.0.1:${port}/contract`);
+      expect(contract.status).toBe(200);
+      await expect(contract.json()).resolves.toMatchObject({ specVersion: "0.1", integrationSurfaces: expect.any(Array) });
       const response = await fetch(`http://127.0.0.1:${port}/invoke`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -542,7 +553,9 @@ describe("harnest CLI", () => {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toContain("invoke_harness");
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["invoke_harness", "describe_harness"]));
+      const described = await client.callTool({ name: "describe_harness", arguments: {} });
+      expect(described.structuredContent).toMatchObject({ specVersion: "0.1", contractVersion: "1" });
       const called = await client.callTool({ name: "invoke_harness", arguments: { message: "MCP hello" } });
       expect(called.content).toContainEqual(expect.objectContaining({ type: "text", text: expect.stringContaining("MCP hello") }));
     } finally {

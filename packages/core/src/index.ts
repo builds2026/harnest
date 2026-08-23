@@ -1,6 +1,7 @@
 export * from "./adapter.js";
 export * from "./component.js";
 export * from "./connection.js";
+export * from "./contract.js";
 export * from "./graph.js";
 export * from "./parsers.js";
 export * from "./runtime.js";

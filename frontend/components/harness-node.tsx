@@ -1,21 +1,70 @@
 "use client";
 
 import type { PortDefinition } from "@harnest/core";
+import { Popover } from "@base-ui/react/popover";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { memo, type CSSProperties } from "react";
+import { memo, useMemo, useRef, useState, type CSSProperties } from "react";
 import { colorFor, componentSummary, glyphFor } from "@/lib/component-catalog";
-import type { HarnessNode } from "@/lib/studio-state";
+import type { CanvasPortAnchor, CanvasPortInsertion, HarnessNode } from "@/lib/studio-state";
+
+function PortInsertMenu({
+  anchor,
+  options,
+  onInsert,
+}: {
+  anchor: CanvasPortAnchor;
+  options: readonly CanvasPortInsertion[];
+  onInsert: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const search = useRef<HTMLInputElement>(null);
+  const visible = useMemo(() => {
+    const value = query.trim().toLocaleLowerCase();
+    return options.filter((option) => !value || `${option.label} ${option.type} ${option.category} ${option.description}`
+      .toLocaleLowerCase().includes(value));
+  }, [options, query]);
+  const directionLabel = anchor.direction === "output" ? "after" : "before";
+
+  return <Popover.Root open={open} onOpenChange={(next) => { setOpen(next); if (!next) setQuery(""); }} modal="trap-focus">
+    <Popover.Trigger
+      className="port-add nodrag nopan"
+      aria-label={`Add a compatible component ${directionLabel} ${anchor.nodeId}.${anchor.port}`}
+      title={`Add compatible component ${directionLabel} this port`}
+    >+</Popover.Trigger>
+    <Popover.Portal>
+      <Popover.Positioner side={anchor.direction === "output" ? "right" : "left"} align="center" sideOffset={12} collisionPadding={12}>
+        <Popover.Popup className="port-picker" initialFocus={search}>
+          <header><span>Connect {directionLabel}</span><strong>{anchor.nodeId}.{anchor.port}</strong></header>
+          <label><span className="sr-only">Search compatible components</span><input ref={search} type="search" placeholder="Search components…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+          <div className="port-picker-list">
+            {visible.length ? visible.map((option) => <button
+              key={`${option.type}:${option.connectPort}`}
+              type="button"
+              onClick={() => { onInsert(anchor, option); setOpen(false); }}
+            ><span className="port-picker-glyph" style={{ "--port-color": colorFor(option.category) } as CSSProperties}>{glyphFor(option.label)}</span><span><strong>{option.label}</strong><small>{option.category} · {option.connectPort}:{option.connectType}</small><small>{option.description}</small></span></button>) : <p>No compatible component matches this search.</p>}
+          </div>
+          <Popover.Close className="sr-only">Close compatible component menu</Popover.Close>
+        </Popover.Popup>
+      </Popover.Positioner>
+    </Popover.Portal>
+  </Popover.Root>;
+}
 
 function PortRow({
+  nodeId,
   direction,
   name,
   definition,
-  onAdd,
+  insertions,
+  onInsert,
 }: {
+  nodeId: string;
   direction: "input" | "output";
   name: string;
   definition: PortDefinition;
-  onAdd?: () => void;
+  insertions?: readonly CanvasPortInsertion[];
+  onInsert?: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
 }) {
   const color = colorFor(definition.type);
   const style = { "--port-color": color } as CSSProperties;
@@ -33,8 +82,9 @@ function PortRow({
         />
       )}
       <span>{input ? `${name}:${definition.type}` : ""}</span>
-      {input && onAdd && <button className="port-add nodrag nopan" type="button" aria-label={`Add compatible ${name}`} title={`Add compatible ${name}`} onClick={onAdd}>+</button>}
+      {input && insertions && onInsert && <PortInsertMenu anchor={{ nodeId, direction, port: name }} options={insertions} onInsert={onInsert} />}
       <span>{input ? "" : `${name}:${definition.type}`}</span>
+      {!input && insertions && onInsert && <PortInsertMenu anchor={{ nodeId, direction, port: name }} options={insertions} onInsert={onInsert} />}
       {!input && (
         <Handle
           id={name}
@@ -82,14 +132,12 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
         {inputs.map(([name, definition]) => (
           <PortRow
             key={`input-${name}`}
+            nodeId={component.id}
             direction="input"
             name={name}
             definition={definition}
-            onAdd={manifest.type === "agent" && /tool/i.test(name)
-              ? () => data.onAddAttachment?.(component.id, "tools")
-              : manifest.type === "agent" && /skill/i.test(name)
-                ? () => data.onAddAttachment?.(component.id, "skills")
-                : undefined}
+            insertions={data.locked ? undefined : data.portInsertions?.[`input:${name}`]}
+            onInsert={data.onInsertAtPort}
           />
         ))}
         {manifest.type === "agent" && !inputs.some(([name]) => /skill/i.test(name)) && (
@@ -100,7 +148,7 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
         )}
         <div className="node-summary" title={componentSummary(component, manifest)}>{componentSummary(component, manifest)}</div>
         {outputs.map(([name, definition]) => (
-          <PortRow key={`output-${name}`} direction="output" name={name} definition={definition} />
+          <PortRow key={`output-${name}`} nodeId={component.id} direction="output" name={name} definition={definition} insertions={data.locked ? undefined : data.portInsertions?.[`output:${name}`]} onInsert={data.onInsertAtPort} />
         ))}
       </div>
     </div>

@@ -44,6 +44,7 @@ describe("Harnest SDK", () => {
 
     const harness = await Harnest.load(file, { adapters: [adapter], persistRuns: false });
     try {
+      expect(harness.contract).toMatchObject({ specVersion: "0.2", entrypoint: "output", capabilities: ["conversation"] });
       const result = await harness.invoke("hello");
       expect(result.output).toBe("Answer hello");
       expect(result.runId).toMatch(/^[0-9a-f-]{36}$/);

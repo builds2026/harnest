@@ -1,6 +1,7 @@
 import {
   parseSpec,
   stringifySpec,
+  validateCandidateConnection,
   validateSpec,
   type ComponentManifest,
   type Diagnostic,
@@ -22,7 +23,17 @@ export type HarnessNodeData = Record<string, unknown> & {
   runState?: NodeRunState;
   iteration?: number;
   attempt?: number;
+  lastRun?: {
+    readonly runId?: string;
+    readonly state: NodeRunState;
+    readonly durationMs?: number;
+    readonly eventCount: number;
+    readonly error?: string;
+  };
   onAddAttachment?: (nodeId: string, slot: "tools" | "skills") => void;
+  portInsertions?: Readonly<Record<string, readonly CanvasPortInsertion[]>>;
+  onInsertAtPort?: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
+  locked?: boolean;
 };
 
 export type HarnessEdgeData = Record<string, unknown> & {
@@ -32,6 +43,21 @@ export type HarnessEdgeData = Record<string, unknown> & {
 
 export type HarnessNode = Node<HarnessNodeData, "harness">;
 export type HarnessEdge = Edge<HarnessEdgeData>;
+
+export interface CanvasPortAnchor {
+  readonly nodeId: string;
+  readonly direction: "input" | "output";
+  readonly port: string;
+}
+
+export interface CanvasPortInsertion {
+  readonly type: string;
+  readonly label: string;
+  readonly description: string;
+  readonly category: string;
+  readonly connectPort: string;
+  readonly connectType: string;
+}
 
 export const isEntrypointCandidate = (node: HarnessNode, edges: readonly HarnessEdge[]) =>
   node.data.manifest.category === "Output" || !edges.some((edge) => edge.source === node.id);
@@ -74,10 +100,18 @@ export interface StudioDocumentState {
   semanticRevision: number;
   savedRevision: number;
   validatedSemanticRevision: number | null;
+  historyPast: readonly StudioHistoryEntry[];
+  historyFuture: readonly StudioHistoryEntry[];
+  transientDraft?: HarnessDraft;
+}
+
+export interface StudioHistoryEntry {
+  readonly draft: HarnessDraft;
+  readonly touch: "layout" | "semantic";
 }
 
 export type StudioDocumentAction =
-  | { type: "replace-draft"; draft: HarnessDraft; touch: "none" | "layout" | "semantic" }
+  | { type: "replace-draft"; draft: HarnessDraft; touch: "none" | "transient" | "layout" | "semantic" }
   | {
       type: "edit-yaml";
       text: string;
@@ -91,7 +125,11 @@ export type StudioDocumentAction =
   | { type: "validation-result"; semanticRevision: number; diagnostics: Diagnostic[] }
   | { type: "host-diagnostics"; diagnostics: Diagnostic[] }
   | { type: "set-catalog"; catalog: readonly ComponentManifest[] }
-  | { type: "save-result"; revision: number };
+  | { type: "save-result"; revision: number }
+  | { type: "undo" }
+  | { type: "redo" };
+
+const MAX_HISTORY = 100;
 
 const edgeId = (connection: HarnessConnection, index: number) =>
   connection.id ??
@@ -194,6 +232,42 @@ export function draftToSpec(draft: HarnessDraft): HarnessSpec {
   } as HarnessSpec;
 }
 
+export function compatiblePortInsertions(
+  draft: HarnessDraft,
+  catalog: readonly ComponentManifest[],
+  anchor: CanvasPortAnchor,
+): CanvasPortInsertion[] {
+  const source = draft.nodes.find((node) => node.id === anchor.nodeId);
+  if (!source) return [];
+  const base = draftToSpec(draft);
+  if (anchor.direction === "output" && base.entrypoint === anchor.nodeId) return [];
+  const anchorType = (anchor.direction === "output"
+    ? source.data.manifest.ports.outputs[anchor.port]
+    : source.data.manifest.ports.inputs[anchor.port])?.type;
+  const registry = validationRegistryFor(catalog);
+  const existingIds = new Set(draft.nodes.map((node) => node.id));
+  return catalog.flatMap((manifest): CanvasPortInsertion[] => {
+    const id = uniqueComponentId(manifest.type, existingIds);
+    const component = { id, type: manifest.type, config: structuredClone(manifest.defaultConfig) } as HarnessComponent;
+    const candidateSpec = { ...base, components: [...base.components, component] } as HarnessSpec;
+    const ports = anchor.direction === "output" ? manifest.ports.inputs : manifest.ports.outputs;
+    return Object.entries(ports).flatMap(([port, definition]) => {
+      const connection: HarnessConnection = anchor.direction === "output"
+        ? { from: { component: anchor.nodeId, port: anchor.port }, to: { component: id, port } }
+        : { from: { component: id, port }, to: { component: anchor.nodeId, port: anchor.port } };
+      return validateCandidateConnection(candidateSpec, connection, { components: registry }).ok ? [{
+        type: manifest.type,
+        label: manifest.label,
+        description: manifest.description ?? manifest.type,
+        category: manifest.category,
+        connectPort: port,
+        connectType: definition.type,
+      }] : [];
+    });
+  }).sort((left, right) => Number(right.connectType === anchorType) - Number(left.connectType === anchorType)
+    || left.category.localeCompare(right.category) || left.label.localeCompare(right.label));
+}
+
 function localValidation(spec: HarnessSpec, catalog: readonly ComponentManifest[]) {
   const result = validateSpec(spec, { components: validationRegistryFor(catalog) });
   return {
@@ -223,6 +297,8 @@ export function createDocumentState(
     semanticRevision: 0,
     savedRevision: 0,
     validatedSemanticRevision: null,
+    historyPast: [],
+    historyFuture: [],
   };
 }
 
@@ -247,9 +323,15 @@ export function studioDocumentReducer(
   switch (action.type) {
     case "replace-draft": {
       if (action.touch === "none") return { ...state, draft: action.draft };
+      if (action.touch === "transient") return {
+        ...state,
+        draft: action.draft,
+        transientDraft: state.transientDraft ?? state.draft,
+      };
 
       const spec = draftToSpec(action.draft);
       const validation = action.touch === "semantic" ? localValidation(spec, state.catalog) : null;
+      const previous = state.transientDraft ?? state.draft;
       return {
         ...state,
         draft: action.draft,
@@ -263,6 +345,9 @@ export function studioDocumentReducer(
         semanticRevision: state.semanticRevision + (action.touch === "semantic" ? 1 : 0),
         validatedSemanticRevision:
           action.touch === "semantic" ? null : state.validatedSemanticRevision,
+        historyPast: [...state.historyPast, { draft: previous, touch: action.touch }].slice(-MAX_HISTORY),
+        historyFuture: [],
+        transientDraft: undefined,
       };
     }
     case "edit-yaml":
@@ -284,9 +369,11 @@ export function studioDocumentReducer(
     case "apply-yaml": {
       if (!state.pendingSpec) return state;
       const validation = localValidation(state.pendingSpec, state.catalog);
+      const draft = specToDraft(state.pendingSpec, state.catalog);
       return {
         ...state,
-        draft: specToDraft(state.pendingSpec, state.catalog),
+        draft,
+        yamlText: stringifySpec(state.pendingSpec),
         yamlState: "synced",
         yamlDiagnostics: [],
         pendingSpec: null,
@@ -295,6 +382,9 @@ export function studioDocumentReducer(
         revision: state.revision + 1,
         semanticRevision: state.semanticRevision + 1,
         validatedSemanticRevision: null,
+        historyPast: [...state.historyPast, { draft: state.draft, touch: "semantic" as const }].slice(-MAX_HISTORY),
+        historyFuture: [],
+        transientDraft: undefined,
       };
     }
     case "validation-start":
@@ -329,6 +419,50 @@ export function studioDocumentReducer(
       return action.revision === state.revision
         ? { ...state, savedRevision: action.revision }
         : state;
+    case "undo": {
+      const previous = state.historyPast.at(-1);
+      if (!previous) return state;
+      const spec = draftToSpec(previous.draft);
+      const validation = previous.touch === "semantic" ? localValidation(spec, state.catalog) : null;
+      return {
+        ...state,
+        draft: previous.draft,
+        yamlText: stringifySpec(spec),
+        yamlState: "synced",
+        yamlDiagnostics: [],
+        pendingSpec: null,
+        diagnostics: validation?.diagnostics ?? state.diagnostics,
+        validationPhase: validation?.phase ?? state.validationPhase,
+        revision: state.revision + 1,
+        semanticRevision: state.semanticRevision + (previous.touch === "semantic" ? 1 : 0),
+        validatedSemanticRevision: previous.touch === "semantic" ? null : state.validatedSemanticRevision,
+        historyPast: state.historyPast.slice(0, -1),
+        historyFuture: [...state.historyFuture, { draft: state.draft, touch: previous.touch }].slice(-MAX_HISTORY),
+        transientDraft: undefined,
+      };
+    }
+    case "redo": {
+      const next = state.historyFuture.at(-1);
+      if (!next) return state;
+      const spec = draftToSpec(next.draft);
+      const validation = next.touch === "semantic" ? localValidation(spec, state.catalog) : null;
+      return {
+        ...state,
+        draft: next.draft,
+        yamlText: stringifySpec(spec),
+        yamlState: "synced",
+        yamlDiagnostics: [],
+        pendingSpec: null,
+        diagnostics: validation?.diagnostics ?? state.diagnostics,
+        validationPhase: validation?.phase ?? state.validationPhase,
+        revision: state.revision + 1,
+        semanticRevision: state.semanticRevision + (next.touch === "semantic" ? 1 : 0),
+        validatedSemanticRevision: next.touch === "semantic" ? null : state.validatedSemanticRevision,
+        historyPast: [...state.historyPast, { draft: state.draft, touch: next.touch }].slice(-MAX_HISTORY),
+        historyFuture: state.historyFuture.slice(0, -1),
+        transientDraft: undefined,
+      };
+    }
   }
 }
 

@@ -9,10 +9,12 @@ import {
   HarnessRuntime,
   ToolRegistry,
   createBuiltinComponentRegistry,
+  describeHarness,
   runHarnessTests,
   validateSpec,
   type Diagnostic,
   type HarnessSpec,
+  type HarnessIntegrationContract,
   type HarnessTestOptions,
   type HarnessTestReport,
   type ModelAdapter,
@@ -41,6 +43,10 @@ export class Harnest {
   readonly file: string;
   readonly spec: HarnessSpec;
   readonly diagnostics: readonly Diagnostic[];
+
+  get contract(): HarnessIntegrationContract {
+    return describeHarness(this.spec);
+  }
   readonly #adapters: AdapterRegistry;
   readonly #components: ReturnType<typeof createBuiltinComponentRegistry>;
   readonly #tools: ToolRegistry;

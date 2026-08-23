@@ -21,6 +21,7 @@ import {
   AdapterRegistry,
   compileSpec,
   createBuiltinComponentRegistry,
+  describeHarness,
   DEFAULT_PROVIDER_MODELS,
   DEFAULT_SANDBOX_IMAGES,
   FIRECRAWL_CONNECTION_CONFIG,
@@ -61,6 +62,7 @@ Usage:
   harnest bundle [file] [--output <file>]
   harnest validate <file>
   harnest inspect <file>
+  harnest contract <file> [--json]
   harnest run <file> --input <value> [capabilities]
   harnest test <file> [capabilities]
   harnest runs [file] [--limit <number>]
@@ -376,6 +378,25 @@ async function inspect(file: string, allowModules: boolean): Promise<void> {
   }
 }
 
+async function contract(file: string, json: boolean): Promise<void> {
+  const loaded = await loadSpecFile(resolve(file));
+  if (!loaded.ok) {
+    printDiagnostics(loaded.diagnostics);
+    throw new Error("Spec could not be loaded");
+  }
+  const value = describeHarness(loaded.spec);
+  if (json) {
+    console.log(JSON.stringify(value, null, 2));
+    return;
+  }
+  console.log(`HarnessSpec ${value.specVersion} · ${value.componentCount} components · ${value.graphCount} graph(s)`);
+  console.log(`Capabilities: ${value.capabilities.join(", ") || "none"}`);
+  console.log(`Connections: ${value.requiredConnections.join(", ") || "none"}`);
+  console.log(`Tests: ${value.tests.count} · ${value.tests.assertionTypes.join(", ") || "none"}`);
+  console.log("Integrate:");
+  for (const surface of value.integrationSurfaces) console.log(`  ${surface.label}: ${surface.example}`);
+}
+
 function inputValue(raw: string): unknown {
   try {
     return JSON.parse(raw);
@@ -583,10 +604,14 @@ async function serve(file: string, portValue: string, capabilities: CapabilityVa
       writeJson(response, 200, { ok: true, file: harness.file });
       return;
     }
+    if (request.method === "GET" && pathname === "/contract") {
+      writeJson(response, 200, harness.contract);
+      return;
+    }
     if (request.method !== "POST" || (pathname !== "/invoke" && pathname !== "/stream")) {
-      writeJson(response, pathname === "/health" || pathname === "/invoke" || pathname === "/stream" ? 405 : 404, {
+      writeJson(response, pathname === "/health" || pathname === "/contract" || pathname === "/invoke" || pathname === "/stream" ? 405 : 404, {
         ok: false,
-        error: pathname === "/health" || pathname === "/invoke" || pathname === "/stream"
+        error: pathname === "/health" || pathname === "/contract" || pathname === "/invoke" || pathname === "/stream"
           ? "Method not allowed"
           : "Not found",
       });
@@ -634,7 +659,7 @@ async function serve(file: string, portValue: string, capabilities: CapabilityVa
       server.listen(port, "127.0.0.1", () => resolveListen());
     });
     console.log(`Harnest API ready at http://127.0.0.1:${port}`);
-    console.log("POST /invoke or /stream with {\"input\": ...}");
+    console.log("GET /contract · POST /invoke or /stream with {\"input\": ...}");
     await new Promise<void>((resolveStop) => {
       process.once("SIGINT", resolveStop);
       process.once("SIGTERM", resolveStop);
@@ -680,9 +705,17 @@ async function mcpServe(file: string, capabilities: CapabilityValues): Promise<v
         return { isError: true, content: [{ type: "text", text: "Harness invocation failed" }] };
       }
     });
+    server.registerTool("describe_harness", {
+      title: "Describe harness contract",
+      description: "Return the secret-free capabilities and integration contract for this harness.",
+      inputSchema: z.object({}),
+    }, async () => ({
+      content: [{ type: "text", text: JSON.stringify(harness.contract, null, 2) }],
+      structuredContent: harness.contract,
+    }));
     return server;
   }, { onerror: (error) => console.error(error) });
-  console.error(`Serving ${resolve(file)} as MCP Tool 'invoke_harness' over stdio`);
+  console.error(`Serving ${resolve(file)} as MCP Tools 'describe_harness' and 'invoke_harness' over stdio`);
   try {
     await new Promise<void>((resolveStop) => {
       process.stdin.once("end", resolveStop);
@@ -1238,6 +1271,18 @@ async function main(): Promise<void> {
     if (!file) throw new Error(`${command} requires a file`);
     if (command === "validate") await validate(file, values["allow-modules"] ?? false);
     else await inspect(file, values["allow-modules"] ?? false);
+    return;
+  }
+
+  if (command === "contract") {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      strict: true,
+      options: { json: { type: "boolean" } },
+    });
+    if (positionals.length !== 1) throw new Error("contract requires one file");
+    await contract(positionals[0]!, values.json ?? false);
     return;
   }
 

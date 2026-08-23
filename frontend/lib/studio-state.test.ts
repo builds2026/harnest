@@ -2,6 +2,7 @@ import { BUILTIN_COMPONENT_MANIFESTS, stringifySpec, type HarnessSpec } from "@h
 import { describe, expect, it } from "vitest";
 
 import {
+  compatiblePortInsertions,
   createDocumentState,
   draftToSpec,
   isEntrypointCandidate,
@@ -127,5 +128,40 @@ describe("Studio document state", () => {
     };
 
     expect(draftToSpec(createDocumentState(withTests, BUILTIN_COMPONENT_MANIFESTS).draft).tests).toEqual(withTests.tests);
+  });
+
+  it("offers only components that can connect to the selected typed port", () => {
+    const draft = createDocumentState(spec, BUILTIN_COMPONENT_MANIFESTS).draft;
+
+    expect(compatiblePortInsertions(draft, BUILTIN_COMPONENT_MANIFESTS, {
+      nodeId: "model", direction: "output", port: "model",
+    })).toEqual(expect.arrayContaining([expect.objectContaining({ type: "agent", connectPort: "model" })]));
+    expect(compatiblePortInsertions(draft, BUILTIN_COMPONENT_MANIFESTS, {
+      nodeId: "output", direction: "input", port: "value",
+    })).toEqual([]);
+    expect(compatiblePortInsertions(draft, BUILTIN_COMPONENT_MANIFESTS, {
+      nodeId: "output", direction: "output", port: "value",
+    })).toEqual([]);
+  });
+
+  it("undoes semantic edits and treats a drag as one layout change", () => {
+    const initial = createDocumentState(spec, BUILTIN_COMPONENT_MANIFESTS);
+    const changed = structuredClone(initial.draft);
+    changed.nodes[1]!.data.component.config = { template: "Changed {{input}}" };
+    const edited = studioDocumentReducer(initial, { type: "replace-draft", draft: changed, touch: "semantic" });
+    const undone = studioDocumentReducer(edited, { type: "undo" });
+    const redone = studioDocumentReducer(undone, { type: "redo" });
+
+    expect(undone.draft.nodes[1]!.data.component.config).toEqual({ template: "Answer {{input}}" });
+    expect(redone.draft.nodes[1]!.data.component.config).toEqual({ template: "Changed {{input}}" });
+
+    const moving = structuredClone(initial.draft);
+    moving.nodes[0]!.position = { x: 30, y: 40 };
+    const transient = studioDocumentReducer(initial, { type: "replace-draft", draft: moving, touch: "transient" });
+    const moved = structuredClone(transient.draft);
+    moved.nodes[0]!.position = { x: 90, y: 100 };
+    const committed = studioDocumentReducer(transient, { type: "replace-draft", draft: moved, touch: "layout" });
+
+    expect(studioDocumentReducer(committed, { type: "undo" }).draft.nodes[0]!.position).toEqual({ x: 10, y: 20 });
   });
 });

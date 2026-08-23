@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useId, useState } from "react";
+import { Tabs } from "@base-ui/react/tabs";
 import type { InspectorField } from "@harnest/core";
 import { configValue, withConfigValue } from "@/lib/component-catalog";
 import type {
@@ -178,6 +179,7 @@ const connectionKindsFor = (
 
 const advancedField = (component: HarnessComponent, field: InspectorField) => {
   if (component.type === "model") return ["adapter", "baseUrl", "inputCostPerMillion", "outputCostPerMillion"].includes(field.path);
+  if (component.type === "agent") return ["timeoutMs", "maxToolCalls", "toolTimeoutMs", "maxTokens", "maxCostUsd", "allowTools", "denyTools", "toolError"].includes(field.path);
   if (component.type === "mcp-tool") return ["transport", "protocol", "command", "args", "url", "headers", "timeoutMs"].includes(field.path);
   if (component.type === "tool") return ["tool", "action", "source", "inputSchema", "outputSchema"].includes(field.path);
   return field.control === "json" && (field.path === "schema" || field.path === "inputSchema" || field.path === "outputSchema");
@@ -339,27 +341,40 @@ export function Inspector({
   const editableFields = manifest.inspector.filter((field) => field.path !== "connectionId" && field.path !== "apiKey");
   const primaryFields = editableFields.filter((field) => !advancedField(component, field));
   const advancedFields = editableFields.filter((field) => advancedField(component, field));
+  const lastRun = node.data.lastRun;
 
   return (
     <div className="inspector-body">
       <div className="component-id"><span>{component.id}</span><span>{manifest.label}{entrypoint === component.id ? " · entrypoint" : ""}</span></div>
-      <fieldset disabled={locked} className="inspector-fieldset">
-        <div className="field-grid">
-          {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
-          {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">This legacy Model contains a plaintext API key. Move it to a write-only Provider Connection, then remove it in Advanced YAML.</div>}
-          {primaryFields.length
-            ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
-            : <div className="field-help">This component has no editable configuration.</div>}
-          {advancedFields.length > 0 && <details className="advanced-panel"><summary>Advanced</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
-        </div>
-      </fieldset>
-      <div className="inspector-actions is-split">
-        <span>
-          {subgraph && onOpenSubgraph && <button className="button" disabled={locked} onClick={() => onOpenSubgraph(subgraph)}>{subgraphs?.includes(subgraph) ? "Open subgraph" : "Create subgraph"}</button>}
-          {canSetEntrypoint && entrypoint !== component.id && <button className="button" disabled={locked} onClick={onSetEntrypoint}>Set as entrypoint</button>}
-        </span>
-        <button className="button" disabled={locked} onClick={onDelete}>Delete component</button>
-      </div>
+      <Tabs.Root key={component.id} defaultValue="settings" className="inspector-tabs">
+        <Tabs.List className="inspector-tab-list" aria-label={`${component.id} inspector`}>
+          <Tabs.Tab value="settings">Settings</Tabs.Tab>
+          <Tabs.Tab value="last-run">Last run{lastRun ? <span className={`tab-state is-${lastRun.state}`} /> : null}</Tabs.Tab>
+          <Tabs.Indicator className="inspector-tab-indicator" />
+        </Tabs.List>
+        <Tabs.Panel value="settings" className="inspector-tab-panel">
+          <fieldset disabled={locked} className="inspector-fieldset">
+            <div className="field-grid">
+              {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
+              {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">This legacy Model contains a plaintext API key. Move it to a write-only Provider Connection, then remove it in Advanced YAML.</div>}
+              {primaryFields.length
+                ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
+                : <div className="field-help">This component has no editable configuration.</div>}
+              {advancedFields.length > 0 && <details className="advanced-panel"><summary>Advanced</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
+            </div>
+          </fieldset>
+          <div className="inspector-actions is-split">
+            <span>
+              {subgraph && onOpenSubgraph && <button className="button" disabled={locked} onClick={() => onOpenSubgraph(subgraph)}>{subgraphs?.includes(subgraph) ? "Open subgraph" : "Create subgraph"}</button>}
+              {canSetEntrypoint && entrypoint !== component.id && <button className="button" disabled={locked} onClick={onSetEntrypoint}>Set as entrypoint</button>}
+            </span>
+            <button className="button" disabled={locked} onClick={onDelete}>Delete component</button>
+          </div>
+        </Tabs.Panel>
+        <Tabs.Panel value="last-run" className="inspector-tab-panel">
+          {lastRun ? <div className="last-run-summary"><div className={`last-run-state is-${lastRun.state}`}><span>{lastRun.state}</span><strong>{lastRun.durationMs === undefined ? "In progress" : `${Math.round(lastRun.durationMs)} ms`}</strong></div><dl><div><dt>Run</dt><dd>{lastRun.runId ?? "Current trace"}</dd></div><div><dt>Events</dt><dd>{lastRun.eventCount}</dd></div><div><dt>Validation</dt><dd>{node.data.diagnostics?.length ? `${node.data.diagnostics.length} issue(s)` : "No node issues"}</dd></div></dl>{lastRun.error && <p role="alert">{lastRun.error}</p>}</div> : <div className="inspector-run-empty"><span>◇</span><strong>No run data for this component</strong><p>Run this harness in Playground or the Test dock. The next node execution will appear here without changing the spec.</p></div>}
+        </Tabs.Panel>
+      </Tabs.Root>
     </div>
   );
 }

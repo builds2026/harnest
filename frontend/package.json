@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@base-ui/react": "^1.7.0",
     "@harnest/adapter-anthropic": "0.1.0",
     "@harnest/adapter-gemini": "0.1.0",
     "@harnest/adapter-local": "0.1.0",
