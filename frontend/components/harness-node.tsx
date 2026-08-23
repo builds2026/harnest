@@ -9,15 +9,16 @@ import type { CanvasPortAnchor, CanvasPortInsertion, HarnessNode } from "@/lib/s
 
 function PortInsertMenu({
   anchor,
-  options,
+  getOptions,
   onInsert,
 }: {
   anchor: CanvasPortAnchor;
-  options: readonly CanvasPortInsertion[];
+  getOptions: (anchor: CanvasPortAnchor) => readonly CanvasPortInsertion[];
   onInsert: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [options, setOptions] = useState<readonly CanvasPortInsertion[]>([]);
   const search = useRef<HTMLInputElement>(null);
   const visible = useMemo(() => {
     const value = query.trim().toLocaleLowerCase();
@@ -26,7 +27,11 @@ function PortInsertMenu({
   }, [options, query]);
   const directionLabel = anchor.direction === "output" ? "after" : "before";
 
-  return <Popover.Root open={open} onOpenChange={(next) => { setOpen(next); if (!next) setQuery(""); }} modal="trap-focus">
+  return <Popover.Root open={open} onOpenChange={(next) => {
+    setOpen(next);
+    if (next) setOptions(getOptions(anchor));
+    else setQuery("");
+  }} modal="trap-focus">
     <Popover.Trigger
       className="port-add nodrag nopan"
       aria-label={`Add a compatible component ${directionLabel} ${anchor.nodeId}.${anchor.port}`}
@@ -56,19 +61,23 @@ function PortRow({
   direction,
   name,
   definition,
-  insertions,
+  canInsert,
+  getInsertions,
   onInsert,
 }: {
   nodeId: string;
   direction: "input" | "output";
   name: string;
   definition: PortDefinition;
-  insertions?: readonly CanvasPortInsertion[];
+  canInsert?: (anchor: CanvasPortAnchor) => boolean;
+  getInsertions?: (anchor: CanvasPortAnchor) => readonly CanvasPortInsertion[];
   onInsert?: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
 }) {
   const color = colorFor(definition.type);
   const style = { "--port-color": color } as CSSProperties;
   const input = direction === "input";
+  const anchor = { nodeId, direction, port: name } as const;
+  const insertable = canInsert?.(anchor) ?? false;
 
   return (
     <div className={`port-row is-${direction}`} style={style}>
@@ -82,9 +91,9 @@ function PortRow({
         />
       )}
       <span>{input ? `${name}:${definition.type}` : ""}</span>
-      {input && insertions && onInsert && <PortInsertMenu anchor={{ nodeId, direction, port: name }} options={insertions} onInsert={onInsert} />}
+      {input && insertable && getInsertions && onInsert && <PortInsertMenu anchor={anchor} getOptions={getInsertions} onInsert={onInsert} />}
       <span>{input ? "" : `${name}:${definition.type}`}</span>
-      {!input && insertions && onInsert && <PortInsertMenu anchor={{ nodeId, direction, port: name }} options={insertions} onInsert={onInsert} />}
+      {!input && insertable && getInsertions && onInsert && <PortInsertMenu anchor={anchor} getOptions={getInsertions} onInsert={onInsert} />}
       {!input && (
         <Handle
           id={name}
@@ -136,7 +145,8 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
             direction="input"
             name={name}
             definition={definition}
-            insertions={data.locked ? undefined : data.portInsertions?.[`input:${name}`]}
+            canInsert={data.locked ? undefined : data.canInsertAtPort}
+            getInsertions={data.locked ? undefined : data.getPortInsertions}
             onInsert={data.onInsertAtPort}
           />
         ))}
@@ -148,7 +158,7 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
         )}
         <div className="node-summary" title={componentSummary(component, manifest)}>{componentSummary(component, manifest)}</div>
         {outputs.map(([name, definition]) => (
-          <PortRow key={`output-${name}`} nodeId={component.id} direction="output" name={name} definition={definition} insertions={data.locked ? undefined : data.portInsertions?.[`output:${name}`]} onInsert={data.onInsertAtPort} />
+          <PortRow key={`output-${name}`} nodeId={component.id} direction="output" name={name} definition={definition} canInsert={data.locked ? undefined : data.canInsertAtPort} getInsertions={data.locked ? undefined : data.getPortInsertions} onInsert={data.onInsertAtPort} />
         ))}
       </div>
     </div>

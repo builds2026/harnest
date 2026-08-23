@@ -10,6 +10,7 @@ Its signature is a continuous **Design → Verify → Integrate** path:
 - the Canvas offers typed next actions at the exact port;
 - the workbench opens only when tests, comparison, activity, or YAML are needed;
 - Integrate renders the production contract and blockers from the same spec.
+- Settings groups workspace appearance, reusable services, extensions, and runtime boundaries without duplicating their existing managers.
 
 This relationship is specific to Harnest and would not make sense on a generic admin dashboard.
 
@@ -39,6 +40,6 @@ Body and display text use system `Segoe UI Variable` / `Aptos`; identifiers, por
 
 ## Responsive and motion behavior
 
-At desktop widths, Canvas and Inspector remain visible while the catalog is optional. Below 880 px, the grid becomes a vertical flow; Playground history/files become overlay panels. Integrate collapses from two columns to one and its metrics from four to two to one. Controls keep native keyboard semantics and visible focus rings.
+At desktop widths, Canvas and Inspector remain visible while the catalog is optional. Below 900 px, the grid becomes a vertical flow; Playground history/files collapse away from the primary conversation. Integrate collapses from two columns to one and its metrics from four to two to one. Settings becomes a full-height sheet whose section navigation remains reachable as horizontal tabs. Controls keep native keyboard semantics and visible focus rings.
 
 All nonessential transitions are disabled by `prefers-reduced-motion`. Motion is limited to short menu/tab/hover feedback and does not encode required information.

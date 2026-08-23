@@ -4,12 +4,14 @@
 
 | Requirement | Implementation |
 | --- | --- |
-| Contextual Canvas insertion | Every available input/output port derives options with `compatiblePortInsertions()`. The Base UI Popover searches only connections accepted by Core validation; selection adds one node and edge atomically. Terminal entrypoints and full fan-in ports expose no invalid action. |
+| Contextual Canvas insertion | Every available input/output port derives options with `compatiblePortInsertions()` only when its picker opens. The Base UI Popover searches only connections accepted by Core validation; selection adds one node and edge atomically. Terminal entrypoints and full fan-in ports expose no invalid action. |
 | Keyboard, errors, undo/redo | Popover focus/Escape behavior comes from Base UI. Connection validation errors go to the live Studio status. Canvas changes support toolbar buttons and Ctrl/⌘ Z, Ctrl/⌘ Shift Z, or Ctrl/⌘ Y. Drag updates are coalesced into one history entry. |
 | Reduced drag-and-drop dependence | The component catalog is collapsed by default and opened from `+ Add`. Drag-and-drop remains available as a secondary workflow. |
 | Dify-inspired Inspector | Common settings remain visible; detailed policy/schema fields use Advanced disclosure. Settings and actual Last run data are keyboard-navigable Base UI tabs. |
-| Shared design system | Canvas, Inspector, Header, catalog, workbench, Playground, and Integrate use common surface/state/type tokens. Light/dark themes persist locally and honor reduced motion. |
+| Shared design system | Canvas, Inspector, Header, catalog, workbench, Playground, Integrate, service/tool/skill managers, and Settings use common semantic surface/state/type tokens. Light/dark themes persist locally and honor reduced motion. |
 | Responsive and keyboard behavior | Builder, Playground, and Integrate fit a 390 px viewport without horizontal overflow. Catalog cards clamp long metadata, and the catalog closes through either its named button or Escape. |
+| Builder performance | React Flow owns transient drag frames while Studio commits one layout update at drag end. Semantic graph changes synchronize into the Flow store, unchanged node presentation objects are reused, diagnostics/trace are grouped once, and only visible nodes render when zoomed. |
+| Settings and setup DX | The global settings control opens a real Base UI dialog with Workspace, Services, Tools & skills, and Runtime sections. Every count, status, capability, and action comes from live project state and opens the existing manager rather than a placeholder screen. |
 | Workflow completion | Recipes, reusable Connections, automatic save/validation, tests, A/B Compare, persisted Activity, YAML import/export, Playground, and recovery states remain wired to existing runtime APIs. |
 | Differentiation | Core `describeHarness()` creates the secret-free Portable Integration Contract. It is exposed through Studio, CLI, SDK, HTTP, and MCP. |
 | Agent Skills interoperability | Skill frontmatter accepts the specification's space-delimited `allowed-tools` string and normalizes the common bounded YAML string-list form. Invalid installed skills stay disabled and their parser warnings are visible in Skill Manager. |

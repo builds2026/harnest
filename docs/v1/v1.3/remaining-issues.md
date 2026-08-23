@@ -2,6 +2,8 @@
 
 No known requirement-blocking implementation issue remains in the v1.3 scope.
 
+The current uncommitted root `harnest.yaml` is an authoring draft, not a release fixture: `skill_1.skill` and `loop_1.subgraph` are empty, and the Loop cannot reach the entrypoint. Studio and CLI surface those four diagnostics correctly. The file was deliberately left untouched because it belongs to the user's worktree.
+
 The following checks require external state and are therefore release-environment tasks, not mocked successes:
 
 - Complete a real third-party OAuth consent popup for an MCP server that publishes discovery metadata.

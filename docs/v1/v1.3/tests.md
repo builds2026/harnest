@@ -11,8 +11,9 @@ Verification date: 2026-08-24.
 | `npm run lint` | PASS |
 | `npm run build` | PASS — Next production build, 19 pages/routes generated |
 | `npm audit` | PASS — 0 vulnerabilities |
-| `harnest validate harnest.yaml` | PASS |
-| Root Integration Contract | PASS — 4 components, 3 connections, conversation capability, SDK/CLI/HTTP/MCP surfaces |
+| Four checked-in runnable examples | PASS with explicit `--allow-modules` — custom adapter, evaluation loop, MCP Tool agent, and RAG |
+| Current root authoring draft | EXPECTED BLOCKED — the user's uncommitted Skill and Loop have empty required values; validation reports four precise diagnostics without modifying the file |
+| Root Integration Contract | PASS — parse-safe description of the current draft: 6 components, 5 connections, and SDK/CLI/HTTP/MCP surfaces |
 
 The final repository-wide commands are:
 
@@ -51,6 +52,14 @@ The live checks used temporary sessions, Connections, specifications, and contai
 - Verified the Canvas catalog opens from `+ Add`, closes with its button or Escape, and retains search/category/favorites/drag workflows.
 - Checked Builder, Playground, and Integrate at 390 × 844 and the default desktop viewport. No horizontal overflow remained.
 - Checked the rendered surfaces for duplicate IDs, unlabeled visible controls/dialogs, unnamed buttons/links, and images without `alt`; all result sets were empty.
+
+## Builder scale and design-system checks
+
+- Loaded a generated 121-node graph in the real Studio. Warm development reloads were 1,462–1,549 ms; node selection, tab changes, and catalog changes stayed at the browser-control floor of 277–282 ms, matching the six-node baseline.
+- Dragged a node in the 121-node graph and confirmed immediate movement, one save request at drag end, one undo/redo history item, and correct position restoration. Adding and undoing a node also synchronized correctly into React Flow's internal store.
+- Confirmed viewport culling reduced mounted nodes from 121 at fit-to-view to 54 after zooming. Port compatibility and connection commits remain covered by the passing automated Studio/Core tests.
+- Inspected Builder, Playground, Integrate, Settings, Services, custom Tools, and Skills in light/dark themes and at 390 × 844. The visible surfaces had no unintended light-theme leaks, horizontal overflow, inaccessible dialog names, or unnamed controls.
+- Verified Settings uses live project state and that its Services, Tools, and Skills actions open the existing managers. Provider setup exposes Google AI Studio and custom endpoints; web search exposes Firecrawl, SearXNG, and the custom contract; MCP exposes browser sign-in and token fallback.
 
 ## Security regression coverage retained
 

@@ -1,5 +1,6 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import {
   BUILTIN_COMPONENT_MANIFESTS,
   describeHarness,
@@ -25,8 +26,10 @@ import {
   applyEdgeChanges,
   applyNodeChanges,
   useReactFlow,
+  useStoreApi,
   type Connection,
   type IsValidConnection,
+  type OnNodeDrag,
   type OnEdgesChange,
   type OnNodesChange,
   type XYPosition,
@@ -64,11 +67,6 @@ import { catalogMap, colorFor, glyphFor, validationRegistryFor } from "@/lib/com
 import { EMPTY_SPEC } from "@/lib/default-spec";
 import { HarnessNodeComponent } from "./harness-node";
 import { Inspector } from "./inspector";
-import { ConnectionManager } from "./connection-manager";
-import { CompatiblePicker } from "./compatible-picker";
-import { CustomToolManager } from "./custom-tool-manager";
-import { SkillManager } from "./skill-manager";
-import { Playground } from "./playground";
 import {
   connectionCanRun,
   connectionKindLabel,
@@ -93,6 +91,14 @@ const nodeTypes = { harness: HarnessNodeComponent };
 const defaultEdgeOptions = { type: "smoothstep", interactionWidth: 24 };
 const snapGrid: [number, number] = [16, 16];
 const LEGACY_COMPONENT_TYPES = new Set(["model", "prompt", "agent", "output"]);
+const Playground = dynamic(() => import("./playground").then((module) => module.Playground), {
+  loading: () => <div className="surface-loading" role="status"><span /><strong>Opening Playground</strong></div>,
+});
+const ConnectionManager = dynamic(() => import("./connection-manager").then((module) => module.ConnectionManager));
+const CompatiblePicker = dynamic(() => import("./compatible-picker").then((module) => module.CompatiblePicker));
+const CustomToolManager = dynamic(() => import("./custom-tool-manager").then((module) => module.CustomToolManager));
+const SkillManager = dynamic(() => import("./skill-manager").then((module) => module.SkillManager));
+const StudioSettings = dynamic(() => import("./studio-settings").then((module) => module.StudioSettings));
 
 interface SpecPayload {
   spec: HarnessSpec;
@@ -189,6 +195,25 @@ interface ExperimentResult {
   readonly diagnostics?: Diagnostic[];
 }
 
+interface NodeRunPresentation {
+  readonly runState: NodeRunState;
+  readonly lastRun?: NonNullable<HarnessNode["data"]["lastRun"]>;
+}
+
+interface DisplayNodeCacheEntry {
+  readonly source: HarnessNode;
+  readonly diagnostics: Diagnostic[];
+  readonly run?: NodeRunPresentation;
+  readonly locked: boolean;
+  readonly canInsertAtPort: NonNullable<HarnessNode["data"]["canInsertAtPort"]>;
+  readonly getPortInsertions: NonNullable<HarnessNode["data"]["getPortInsertions"]>;
+  readonly onInsertAtPort: NonNullable<HarnessNode["data"]["onInsertAtPort"]>;
+  readonly onAddAttachment: NonNullable<HarnessNode["data"]["onAddAttachment"]>;
+  readonly output: HarnessNode;
+}
+
+const EMPTY_NODE_DIAGNOSTICS: Diagnostic[] = [];
+
 const PALETTE_LABELS: Readonly<Record<PaletteKind, string>> = {
   components: "Build",
   tools: "Tools",
@@ -198,10 +223,10 @@ const PALETTE_LABELS: Readonly<Record<PaletteKind, string>> = {
 };
 
 const DOCK_LABELS: Readonly<Record<DockTab, string>> = {
-  problems: "Setup",
+  problems: "Issues",
   tests: "Tests",
   experiments: "Compare",
-  trace: "Activity",
+  trace: "Runs",
   yaml: "YAML",
 };
 
@@ -422,6 +447,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [paletteKind, setPaletteKind] = useState<PaletteKind>(initial.exists ? "components" : "templates");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteCategory, setPaletteCategory] = useState("all");
   const [studioCatalog, setStudioCatalog] = useState<StudioCatalogPayload>({
@@ -468,6 +494,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const canvasRef = useRef<HTMLDivElement>(null);
   const fittedGraph = useRef<string | undefined>(undefined);
   const reactFlow = useReactFlow<HarnessNode, HarnessEdge>();
+  const reactFlowStore = useStoreApi<HarnessNode, HarnessEdge>();
+  const applyTheme = useCallback((next: "light" | "dark") => {
+    setTheme(next);
+    globalThis.document.documentElement.dataset.theme = next;
+    localStorage.setItem("harnest.studio.theme", next);
+  }, []);
   useEffect(() => {
     const stored = localStorage.getItem("harnest.studio.theme");
     const next = stored === "light" || stored === "dark"
@@ -574,7 +606,21 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     nodes: activeGraph.nodes,
     edges: activeGraph.edges,
   } : document.draft, [activeGraph, document.draft]);
-  const integrationContract = useMemo(() => describeHarness(draftToSpec(document.draft)), [document.draft]);
+  const documentDraftRef = useRef(document.draft);
+  const viewDraftRef = useRef(viewDraft);
+  documentDraftRef.current = document.draft;
+  viewDraftRef.current = viewDraft;
+  const integrationContractCache = useRef({
+    semanticRevision: document.semanticRevision,
+    contract: describeHarness(draftToSpec(document.draft)),
+  });
+  if (integrationContractCache.current.semanticRevision !== document.semanticRevision) {
+    integrationContractCache.current = {
+      semanticRevision: document.semanticRevision,
+      contract: describeHarness(draftToSpec(document.draft)),
+    };
+  }
+  const integrationContract = integrationContractCache.current.contract;
   const replaceViewDraft = useCallback((draft: HarnessDraft, touch: "none" | "transient" | "layout" | "semantic") => {
     if (!activeSubgraph) {
       dispatch({ type: "replace-draft", draft, touch });
@@ -583,15 +629,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     dispatch({
       type: "replace-draft",
       draft: {
-        ...document.draft,
+        ...documentDraftRef.current,
         subgraphs: {
-          ...document.draft.subgraphs,
+          ...documentDraftRef.current.subgraphs,
           [activeSubgraph]: { entrypoint: draft.root.entrypoint, nodes: draft.nodes, edges: draft.edges },
         },
       },
       touch,
     });
-  }, [activeSubgraph, document.draft]);
+  }, [activeSubgraph]);
 
   const errorDiagnostics = document.diagnostics.filter((item) => item.severity === "error");
   const displayedDiagnostics = document.yamlState === "synced" ? document.diagnostics : document.yamlDiagnostics;
@@ -599,10 +645,17 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const running = experimentRunning;
   const graphLocked = running || document.yamlState !== "synced";
   const dirty = document.revision !== document.savedRevision || document.yamlState !== "synced";
-  const structurallyValid = useMemo(
-    () => document.yamlState === "synced" && parseSpec(stringifySpec(draftToSpec(document.draft))).ok,
-    [document.draft, document.yamlState],
-  );
+  const structuralValidationCache = useRef({
+    semanticRevision: document.semanticRevision,
+    valid: parseSpec(stringifySpec(draftToSpec(document.draft))).ok,
+  });
+  if (structuralValidationCache.current.semanticRevision !== document.semanticRevision) {
+    structuralValidationCache.current = {
+      semanticRevision: document.semanticRevision,
+      valid: parseSpec(stringifySpec(draftToSpec(document.draft))).ok,
+    };
+  }
+  const structurallyValid = document.yamlState === "synced" && structuralValidationCache.current.valid;
   const serverValidated = document.validatedSemanticRevision === document.semanticRevision
     && document.validationPhase === "server-valid";
   const canValidate = !running && !dirty && document.yamlState === "synced" && document.validationPhase !== "checking";
@@ -689,13 +742,14 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   const insertAtPort = useCallback((anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => {
     if (graphLocked) return;
-    const anchorNode = viewDraft.nodes.find((node) => node.id === anchor.nodeId);
+    const current = viewDraftRef.current;
+    const anchorNode = current.nodes.find((node) => node.id === anchor.nodeId);
     const manifest = manifests.get(insertion.type);
     if (!anchorNode || !manifest) {
       setStatusNote("The compatible component is no longer available. Refresh the catalog and try again.");
       return;
     }
-    const id = uniqueComponentId(insertion.type, new Set(viewDraft.nodes.map((node) => node.id)));
+    const id = uniqueComponentId(insertion.type, new Set(current.nodes.map((node) => node.id)));
     const component = { id, type: insertion.type, config: structuredClone(manifest.defaultConfig) } as HarnessComponent;
     const candidate: HarnessConnection = anchor.direction === "output" ? {
       from: { component: anchor.nodeId, port: anchor.port },
@@ -704,9 +758,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       from: { component: id, port: insertion.connectPort },
       to: { component: anchor.nodeId, port: anchor.port },
     };
-    const upgraded = viewDraft.root.version === "0.1" && !LEGACY_COMPONENT_TYPES.has(insertion.type);
+    const upgraded = current.root.version === "0.1" && !LEGACY_COMPONENT_TYPES.has(insertion.type);
     const root = {
-      ...viewDraft.root,
+      ...current.root,
       ...(upgraded ? { version: "0.2" as const } : {}),
       ...(manifest.category === "Output" ? { entrypoint: id } : {}),
     };
@@ -715,15 +769,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       type: "harness",
       position: {
         x: anchorNode.position.x + (anchor.direction === "output" ? 360 : -360),
-        y: anchorNode.position.y + Math.min(160, viewDraft.nodes.filter((item) => Math.abs(item.position.x - anchorNode.position.x) < 80).length * 24),
+        y: anchorNode.position.y + Math.min(160, current.nodes.filter((item) => Math.abs(item.position.x - anchorNode.position.x) < 80).length * 24),
       },
       data: { component, manifest },
       selected: true,
     };
     const draft = {
-      ...viewDraft,
+      ...current,
       root,
-      nodes: [...viewDraft.nodes.map((current) => ({ ...current, selected: false })), node],
+      nodes: [...current.nodes.map((candidateNode) => ({ ...candidateNode, selected: false })), node],
     };
     const validation = validateCandidateConnection(draftToSpec(draft), candidate, { components: validationComponents });
     if (!validation.ok) {
@@ -740,58 +794,111 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       targetHandle: connection.to.port,
       data: { connection },
     };
-    replaceViewDraft({ ...draft, edges: [...viewDraft.edges, edge] }, "semantic");
+    replaceViewDraft({ ...draft, edges: [...draft.edges, edge] }, "semantic");
     setStatusNote(`${manifest.label} ${id} added and connected · Undo with Ctrl/⌘ Z`);
-  }, [graphLocked, manifests, replaceViewDraft, validationComponents, viewDraft]);
+  }, [graphLocked, manifests, replaceViewDraft, validationComponents]);
 
-  const portInsertions = useMemo(() => Object.fromEntries(viewDraft.nodes.flatMap((node) => [
-    ...Object.keys(node.data.manifest.ports.inputs).map((port) => {
-      const key = `${node.id}:input:${port}`;
-      return [key, compatiblePortInsertions(viewDraft, catalog, { nodeId: node.id, direction: "input", port })] as const;
-    }),
-    ...Object.keys(node.data.manifest.ports.outputs).map((port) => {
-      const key = `${node.id}:output:${port}`;
-      return [key, compatiblePortInsertions(viewDraft, catalog, { nodeId: node.id, direction: "output", port })] as const;
-    }),
-  ])), [catalog, viewDraft]);
+  const canInsertAtPort = useCallback((anchor: CanvasPortAnchor) => {
+    const draft = viewDraftRef.current;
+    if (anchor.direction === "output" && draft.root.entrypoint === anchor.nodeId) return false;
+    const node = draft.nodes.find((candidate) => candidate.id === anchor.nodeId);
+    if (!node) return false;
+    const definition = anchor.direction === "input"
+      ? node.data.manifest.ports.inputs[anchor.port]
+      : node.data.manifest.ports.outputs[anchor.port];
+    if (!definition) return false;
+    if (anchor.direction === "input") {
+      const count = draft.edges.filter((edge) => edge.target === anchor.nodeId && edge.targetHandle === anchor.port).length;
+      const max = definition.maxConnections ?? (definition.variadic ? Number.POSITIVE_INFINITY : 1);
+      if (count >= max) return false;
+    }
+    return true;
+  }, []);
+  const getPortInsertions = useCallback((anchor: CanvasPortAnchor) =>
+    compatiblePortInsertions(viewDraftRef.current, catalog, anchor), [catalog]);
+  const openAttachmentPicker = useCallback((nodeId: string, slot: "tools" | "skills") =>
+    setAttachmentPicker({ nodeId, slot }), []);
 
-  const displayNodes = useMemo(() => viewDraft.nodes.map((node) => {
-    const nodeEvents = trace.filter((event) => (event as RunEvent & { nodeId?: string }).nodeId?.split("/").at(-1) === node.id);
-    const ended = nodeEvents.findLast((event) => event.type === "node-end") as (RunEvent & { durationMs?: number }) | undefined;
-    const failed = nodeEvents.findLast((event) => event.type === "error") as (RunEvent & { message?: string }) | undefined;
-    const runState: NodeRunState = failed ? "error" : ended ? "success" : nodeEvents.some((event) => event.type === "node-start") ? "running" : "idle";
-    return {
-      ...node,
-      data: {
-      ...node.data,
-      diagnostics: document.diagnostics.filter((item) => item.componentId === node.id
-        && (activeSubgraph
-          ? item.path.startsWith(`$.subgraphs.${activeSubgraph}.`)
-          : !item.path.startsWith("$.subgraphs."))),
-      runState,
-      ...(nodeEvents.length ? { lastRun: {
-        ...(runId ? { runId } : {}),
-        state: runState,
-        ...(typeof ended?.durationMs === "number" ? { durationMs: ended.durationMs } : {}),
-        eventCount: nodeEvents.length,
-        ...(failed?.message ? { error: failed.message } : {}),
-      } } : {}),
-      locked: graphLocked,
-      portInsertions: Object.fromEntries([
-        ...Object.keys(node.data.manifest.ports.inputs).flatMap((port) => {
-          const options = portInsertions[`${node.id}:input:${port}`];
-          return options?.length ? [[`input:${port}`, options] as const] : [];
-        }),
-        ...Object.keys(node.data.manifest.ports.outputs).flatMap((port) => {
-          const options = portInsertions[`${node.id}:output:${port}`];
-          return options?.length ? [[`output:${port}`, options] as const] : [];
-        }),
-      ]),
-      onInsertAtPort: insertAtPort,
-      onAddAttachment: (nodeId: string, slot: "tools" | "skills") => setAttachmentPicker({ nodeId, slot }),
-      },
-    };
-  }), [activeSubgraph, document.diagnostics, graphLocked, insertAtPort, portInsertions, runId, trace, viewDraft.nodes]);
+  const diagnosticsByNode = useMemo(() => {
+    const grouped = new Map<string, Diagnostic[]>();
+    for (const diagnostic of document.diagnostics) {
+      if (!diagnostic.componentId || (activeSubgraph
+        ? !diagnostic.path.startsWith(`$.subgraphs.${activeSubgraph}.`)
+        : diagnostic.path.startsWith("$.subgraphs."))) continue;
+      const current = grouped.get(diagnostic.componentId) ?? [];
+      current.push(diagnostic);
+      grouped.set(diagnostic.componentId, current);
+    }
+    return grouped;
+  }, [activeSubgraph, document.diagnostics]);
+  const runByNode = useMemo(() => {
+    const events = new Map<string, RunEvent[]>();
+    for (const event of trace) {
+      const nodeId = eventNodeId(event)?.split("/").at(-1);
+      if (!nodeId) continue;
+      const current = events.get(nodeId) ?? [];
+      current.push(event);
+      events.set(nodeId, current);
+    }
+    return new Map([...events].map(([nodeId, nodeEvents]) => {
+      const ended = nodeEvents.findLast((event) => event.type === "node-end") as (RunEvent & { durationMs?: number }) | undefined;
+      const failed = nodeEvents.findLast((event) => event.type === "error") as (RunEvent & { message?: string }) | undefined;
+      const runState: NodeRunState = failed ? "error" : ended ? "success" : nodeEvents.some((event) => event.type === "node-start") ? "running" : "idle";
+      return [nodeId, {
+        runState,
+        lastRun: {
+          ...(runId ? { runId } : {}),
+          state: runState,
+          ...(typeof ended?.durationMs === "number" ? { durationMs: ended.durationMs } : {}),
+          eventCount: nodeEvents.length,
+          ...(failed?.message ? { error: failed.message } : {}),
+        },
+      } satisfies NodeRunPresentation] as const;
+    }));
+  }, [runId, trace]);
+  const displayNodeCache = useRef(new Map<string, DisplayNodeCacheEntry>());
+  const displayNodes = useMemo(() => {
+    const nextCache = new Map<string, DisplayNodeCacheEntry>();
+    const nodes = viewDraft.nodes.map((node) => {
+      const diagnostics = diagnosticsByNode.get(node.id) ?? EMPTY_NODE_DIAGNOSTICS;
+      const run = runByNode.get(node.id);
+      const cached = displayNodeCache.current.get(node.id);
+      if (cached?.source === node && cached.diagnostics === diagnostics && cached.run === run && cached.locked === graphLocked
+        && cached.canInsertAtPort === canInsertAtPort && cached.getPortInsertions === getPortInsertions
+        && cached.onInsertAtPort === insertAtPort && cached.onAddAttachment === openAttachmentPicker) {
+        nextCache.set(node.id, cached);
+        return cached.output;
+      }
+      const output: HarnessNode = {
+        ...node,
+        data: {
+          ...node.data,
+          diagnostics,
+          runState: run?.runState ?? "idle",
+          lastRun: run?.lastRun,
+          locked: graphLocked,
+          canInsertAtPort,
+          getPortInsertions,
+          onInsertAtPort: insertAtPort,
+          onAddAttachment: openAttachmentPicker,
+        },
+      };
+      nextCache.set(node.id, {
+        source: node,
+        diagnostics,
+        run,
+        locked: graphLocked,
+        canInsertAtPort,
+        getPortInsertions,
+        onInsertAtPort: insertAtPort,
+        onAddAttachment: openAttachmentPicker,
+        output,
+      });
+      return output;
+    });
+    displayNodeCache.current = nextCache;
+    return nodes;
+  }, [canInsertAtPort, diagnosticsByNode, getPortInsertions, graphLocked, insertAtPort, openAttachmentPicker, runByNode, viewDraft.nodes]);
 
   const displayEdges = useMemo(() => viewDraft.edges.map((edge) => ({
     ...edge,
@@ -800,6 +907,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     animated: false,
     data: { ...edge.data!, running: false },
   })), [viewDraft.edges]);
+
+  useEffect(() => {
+    const store = reactFlowStore.getState();
+    store.setNodes(displayNodes);
+    store.setEdges(displayEdges);
+  }, [displayEdges, displayNodes, reactFlowStore]);
 
   useEffect(() => {
     const graph = activeSubgraph ?? "root";
@@ -813,25 +926,40 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   const onNodesChange: OnNodesChange<HarnessNode> = useCallback((changes) => {
     if (graphLocked && changes.some((change) => change.type !== "select" && change.type !== "dimensions")) return;
-    const nodes = applyNodeChanges(changes, viewDraft.nodes);
-    const removed = changes.some((change) => change.type === "remove");
-    const finishedMove = changes.some((change) => change.type === "position" && change.dragging !== true);
-    const edges = removed ? viewDraft.edges.filter((edge) => nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target)) : viewDraft.edges;
-    let draft = { ...viewDraft, nodes, edges };
+    const persistentChanges = changes.filter((change) => change.type !== "position");
+    if (!persistentChanges.length) return;
+    const current = viewDraftRef.current;
+    const nodes = applyNodeChanges(persistentChanges, current.nodes);
+    const removed = persistentChanges.some((change) => change.type === "remove");
+    const edges = removed ? current.edges.filter((edge) => nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target)) : current.edges;
+    let draft = { ...current, nodes, edges };
     if (removed && !nodes.some((node) => node.id === draft.root.entrypoint)) {
       draft = { ...draft, root: { ...draft.root, entrypoint: chooseEntrypoint(draft) } };
     }
-    const dragging = changes.some((change) => change.type === "position" && change.dragging === true);
-    replaceViewDraft(draft, removed ? "semantic" : finishedMove ? "layout" : dragging ? "transient" : "none");
-  }, [graphLocked, replaceViewDraft, viewDraft]);
+    replaceViewDraft(draft, removed ? "semantic" : "none");
+  }, [graphLocked, replaceViewDraft]);
+
+  const onNodeDragStop: OnNodeDrag<HarnessNode> = useCallback(() => {
+    const current = viewDraftRef.current;
+    const positions = new Map(reactFlow.getNodes().map((node) => [node.id, node.position]));
+    let changed = false;
+    const nodes = current.nodes.map((node) => {
+      const position = positions.get(node.id);
+      if (!position || (position.x === node.position.x && position.y === node.position.y)) return node;
+      changed = true;
+      return { ...node, position };
+    });
+    if (changed) replaceViewDraft({ ...current, nodes }, "layout");
+  }, [reactFlow, replaceViewDraft]);
 
   const onEdgesChange: OnEdgesChange<HarnessEdge> = useCallback((changes) => {
     if (graphLocked && changes.some((change) => change.type !== "select")) return;
-    const edges = applyEdgeChanges(changes, viewDraft.edges);
+    const current = viewDraftRef.current;
+    const edges = applyEdgeChanges(changes, current.edges);
     const removed = changes.some((change) => change.type === "remove");
-    const draft = { ...viewDraft, edges };
+    const draft = { ...current, edges };
     replaceViewDraft(draft, removed ? "semantic" : "none");
-  }, [graphLocked, replaceViewDraft, viewDraft]);
+  }, [graphLocked, replaceViewDraft]);
 
   const candidateConnection = useCallback((connection: Connection | HarnessEdge): HarnessConnection | null => {
     if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) return null;
@@ -843,14 +971,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   const isValidConnection: IsValidConnection<HarnessEdge> = useCallback((connection) => {
     const candidate = candidateConnection(connection);
-    return candidate ? validateCandidateConnection(draftToSpec(viewDraft), candidate, { components: validationComponents }).ok : false;
-  }, [candidateConnection, validationComponents, viewDraft]);
+    return candidate ? validateCandidateConnection(draftToSpec(viewDraftRef.current), candidate, { components: validationComponents }).ok : false;
+  }, [candidateConnection, validationComponents]);
 
   const onConnect = useCallback((connection: Connection) => {
     if (graphLocked) return;
+    const current = viewDraftRef.current;
     const candidate = candidateConnection(connection);
     if (!candidate) return;
-    const validation = validateCandidateConnection(draftToSpec(viewDraft), candidate, { components: validationComponents });
+    const validation = validateCandidateConnection(draftToSpec(current), candidate, { components: validationComponents });
     if (!validation.ok) {
       setStatusNote(validation.diagnostics[0]?.message ?? "That connection is not compatible.");
       return;
@@ -866,13 +995,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       targetHandle: complete.to.port,
       data: { connection: complete },
     };
-    const target = viewDraft.nodes.find((node) => node.id === complete.to.component);
+    const target = current.nodes.find((node) => node.id === complete.to.component);
     const root = target?.data.manifest.category === "Output"
-      ? { ...viewDraft.root, entrypoint: target.id }
-      : viewDraft.root;
-    replaceViewDraft({ ...viewDraft, root, edges: [...viewDraft.edges, edge] }, "semantic");
+      ? { ...current.root, entrypoint: target.id }
+      : current.root;
+    replaceViewDraft({ ...current, root, edges: [...current.edges, edge] }, "semantic");
     setStatusNote(`Connected ${complete.from.component}.${complete.from.port} to ${complete.to.component}.${complete.to.port}`);
-  }, [candidateConnection, graphLocked, replaceViewDraft, validationComponents, viewDraft]);
+  }, [candidateConnection, graphLocked, replaceViewDraft, validationComponents]);
 
   const addComponent = useCallback((
     type: string,
@@ -1586,7 +1715,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const nextConnectionSetup = configuredConnection
     ?? (requiredConnectionKind ? { kind: requiredConnectionKind } : undefined);
   const connectionReady = !nextConnectionSetup;
-  const savedTests = draftToSpec(document.draft).tests ?? [];
+  const savedTests = (document.draft.root.tests as HarnessTestCase[] | undefined) ?? [];
   const replaceTests = (tests: HarnessTestCase[]) => {
     const root = { ...document.draft.root };
     if (tests.length) root.tests = tests;
@@ -1653,7 +1782,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         </div>
         <nav className="surface-tabs" aria-label="Harnest workspace">
           <button className={surface === "builder" ? "is-active" : ""} aria-current={surface === "builder" ? "page" : undefined} onClick={() => setSurface("builder")}>Builder</button>
-          <button className={surface === "playground" ? "is-active" : ""} aria-current={surface === "playground" ? "page" : undefined} onClick={() => setSurface("playground")}>Harnest Playground</button>
+          <button className={surface === "playground" ? "is-active" : ""} aria-current={surface === "playground" ? "page" : undefined} onClick={() => setSurface("playground")}>Playground</button>
           <button className={surface === "integrate" ? "is-active" : ""} aria-current={surface === "integrate" ? "page" : undefined} onClick={() => setSurface("integrate")}>Integrate</button>
         </nav>
         {surface === "playground" ? <div className="playground-rail-context"><span>Immutable runtime</span><strong>{serverValidated ? "Ready" : "Setup required"}</strong></div> : surface === "integrate" ? <div className="playground-rail-context"><span>Integration contract</span><strong>{integrationContract.integrationSurfaces.length} surfaces</strong></div> : welcome ? <div className="welcome-context"><span>First run</span><strong>Choose one outcome</strong></div> : <>
@@ -1683,18 +1812,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             ) : <button className="button button-rail" disabled>Preparing…</button>}
           </div>
         </>}
-        <button
-          className="theme-toggle"
-          type="button"
-          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
-          title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
-          onClick={() => setTheme((current) => {
-            const next = current === "dark" ? "light" : "dark";
-            globalThis.document.documentElement.dataset.theme = next;
-            localStorage.setItem("harnest.studio.theme", next);
-            return next;
-          })}
-        ><span aria-hidden="true">{theme === "dark" ? "☀" : "◐"}</span></button>
+        <button className="settings-trigger" type="button" aria-label="Open Studio settings" title="Studio settings" aria-haspopup="dialog" onClick={() => setSettingsOpen(true)}>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 8.4a3.6 3.6 0 1 0 0 7.2 3.6 3.6 0 0 0 0-7.2Zm8 3.6-.1-1.3 1.8-1.4-2-3.4-2.2.9a8 8 0 0 0-2.2-1.3L15 3.1h-4l-.3 2.4a8 8 0 0 0-2.2 1.3l-2.2-.9-2 3.4 1.8 1.4L6 12l.1 1.3-1.8 1.4 2 3.4 2.2-.9a8 8 0 0 0 2.2 1.3l.3 2.4h4l.3-2.4a8 8 0 0 0 2.2-1.3l2.2.9 2-3.4-1.8-1.4L20 12Z" /></svg>
+        </button>
       </header>
 
       {surface === "playground" ? <Playground onOpenBuilder={() => setSurface("builder")} /> : surface === "integrate" ? <IntegrationWorkspace contract={integrationContract} diagnostics={document.diagnostics} connections={connections} connectionsLoaded={connectionsLoaded} verified={!dirty && serverValidated} file={initial.file} onOpenBuilder={() => setSurface("builder")} onOpenConnections={() => openConnections()} /> : welcome ? (
@@ -1802,11 +1922,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         </div>
         {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">Blank harness</span><strong>Add the first building block</strong><span>Open the catalog, or start from a recipe for a working graph.</span><button className="onboarding-blank" onClick={() => { setPaletteKind("templates"); setPaletteOpen(true); }}>Browse recipes</button></div>}
         <ReactFlow<HarnessNode, HarnessEdge>
-          nodes={displayNodes}
-          edges={displayEdges}
+          defaultNodes={displayNodes}
+          defaultEdges={displayEdges}
           nodeTypes={nodeTypes}
           defaultEdgeOptions={defaultEdgeOptions}
           onNodesChange={onNodesChange}
+          onNodeDragStop={onNodeDragStop}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           isValidConnection={isValidConnection}
@@ -1827,6 +1948,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           maxZoom={1.8}
           panOnScroll
           selectionOnDrag
+          onlyRenderVisibleElements
           nodesFocusable
           edgesFocusable
           autoPanOnNodeFocus
@@ -1836,14 +1958,14 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             "handle.ariaLabel": "Typed connection port",
           }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={20} size={1} color={theme === "dark" ? "#353b47" : "#c7ced8"} />
+          <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="var(--canvas-grid)" />
           <Controls position="bottom-left" showInteractive={false} />
-          <MiniMap position="bottom-right" pannable zoomable nodeColor={(node) => colorFor((node.data as HarnessNode["data"]).manifest.category)} maskColor={theme === "dark" ? "rgb(15 17 22 / 78%)" : "rgb(244 246 249 / 76%)"} />
+          <MiniMap position="bottom-right" pannable zoomable nodeColor={(node) => colorFor((node.data as HarnessNode["data"]).manifest.category)} maskColor="var(--minimap-mask)" />
         </ReactFlow>
       </section>
 
       <aside className="inspector-panel" aria-label="Component and connection inspector">
-        <div className="panel-heading"><h2>Configure</h2><span className="panel-count">{selectedEdge ? "connection" : selectedNode?.data.component.type ?? "none"}</span></div>
+        <div className="panel-heading"><h2>Component settings</h2><span className="panel-count">{selectedEdge ? "connection" : selectedNode?.data.component.type ?? "none"}</span></div>
         <Inspector
           node={selectedNode}
           edge={selectedEdge}
@@ -1880,7 +2002,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         />
       </aside>
 
-      <section className={`bottom-dock ${dockOpen ? "" : "is-collapsed"}`} aria-label="Setup, tests, comparisons, activity, and YAML">
+      <section className={`bottom-dock ${dockOpen ? "" : "is-collapsed"}`} aria-label="Issues, tests, comparisons, runs, and YAML">
         <div className="dock-heading">
           <div className="dock-tabs" role="tablist" aria-label="Studio dock">
             {dockTabs.map((tab) => (
@@ -2053,7 +2175,22 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       </footer>
       </>}
 
-      <ConnectionManager
+      {settingsOpen && <StudioSettings
+        open
+        theme={theme}
+        file={initial.file}
+        contract={integrationContract}
+        diagnostics={document.diagnostics}
+        connections={connections}
+        toolCount={studioCatalog.tools.length}
+        skillCount={studioCatalog.skills.length}
+        onOpenChange={setSettingsOpen}
+        onThemeChange={applyTheme}
+        onManageConnections={() => openConnections()}
+        onManageTools={() => setCustomToolOpen(true)}
+        onManageSkills={() => setSkillManagerOpen(true)}
+      />}
+      {connectionManagerOpen && <ConnectionManager
         open={connectionManagerOpen}
         connections={connections}
         definitions={studioCatalog.connectionTypes.length ? studioCatalog.connectionTypes : CONNECTION_TYPE_CATALOG}
@@ -2065,9 +2202,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           void refreshStudioCatalog().catch(() => setStatusNote("Connection saved, but the Tool catalog could not be refreshed."));
         }}
         onComplete={completeConnection}
-      />
-      <CompatiblePicker
-        open={Boolean(attachmentPicker && !connectionManagerOpen)}
+      />}
+      {attachmentPicker && !connectionManagerOpen && <CompatiblePicker
+        open
         slot={attachmentPicker?.slot ?? "tools"}
         nodeId={attachmentPicker?.nodeId ?? "agent"}
         tools={studioCatalog.tools}
@@ -2081,18 +2218,18 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           setAttachmentPicker({ ...attachmentPicker, pendingItemId: itemId });
           openConnections(kind);
         }}
-      />
-      <CustomToolManager
-        open={customToolOpen}
+      />}
+      {customToolOpen && <CustomToolManager
+        open
         connections={connections}
         onClose={() => setCustomToolOpen(false)}
         onChanged={() => refreshStudioCatalog().catch(() => setStatusNote("Tool saved, but the catalog could not be refreshed."))}
-      />
-      <SkillManager
-        open={skillManagerOpen}
+      />}
+      {skillManagerOpen && <SkillManager
+        open
         onClose={() => setSkillManagerOpen(false)}
         onChanged={() => refreshStudioCatalog().catch(() => setStatusNote("Skill installed, but the catalog could not be refreshed."))}
-      />
+      />}
     </main>
   );
 }

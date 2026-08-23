@@ -31,7 +31,8 @@ export type HarnessNodeData = Record<string, unknown> & {
     readonly error?: string;
   };
   onAddAttachment?: (nodeId: string, slot: "tools" | "skills") => void;
-  portInsertions?: Readonly<Record<string, readonly CanvasPortInsertion[]>>;
+  canInsertAtPort?: (anchor: CanvasPortAnchor) => boolean;
+  getPortInsertions?: (anchor: CanvasPortAnchor) => readonly CanvasPortInsertion[];
   onInsertAtPort?: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
   locked?: boolean;
 };

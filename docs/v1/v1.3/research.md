@@ -2,7 +2,7 @@
 
 Research date: 2026-08-24. The in-app browser was used against the live Dify workflow editor and the official Base UI documentation before implementation.
 
-Primary references: Dify's [workflow quick start](https://docs.dify.ai/en/guides/application-orchestrate/creating-an-application), [model Provider guide](https://docs.dify.ai/en/develop-plugin/dev-guides-and-walkthroughs/creating-new-model-provider), and [plugin extension choices](https://docs.dify.ai/en/develop-plugin/getting-started/choose-plugin-type), plus the [Agent Skills specification](https://github.com/agentskills/agentskills/blob/main/docs/specification.mdx).
+Primary references: Dify's [workflow quick start](https://docs.dify.ai/en/guides/application-orchestrate/creating-an-application), [workflow implementation](https://github.com/langgenius/dify/blob/main/web/app/components/workflow/index.tsx), [node interaction hook](https://github.com/langgenius/dify/blob/main/web/app/components/workflow/hooks/use-nodes-interactions.ts), [model Provider UI](https://github.com/langgenius/dify/blob/main/web/app/components/header/account-setting/model-provider-page/index.tsx), [model Provider guide](https://docs.dify.ai/en/develop-plugin/dev-guides-and-walkthroughs/creating-new-model-provider), and [plugin extension choices](https://docs.dify.ai/en/develop-plugin/getting-started/choose-plugin-type), plus the [Agent Skills specification](https://github.com/agentskills/agentskills/blob/main/docs/specification.mdx).
 
 ## What was worth borrowing
 
@@ -14,6 +14,7 @@ Primary references: Dify's [workflow quick start](https://docs.dify.ai/en/guides
 - Save state, readiness, preview, run history/checklist, and publishing are visible at the workspace level.
 - Model Provider setup uses discoverable provider cards, connection status, API-key forms, model selection, and custom endpoints instead of requiring users to edit workflow internals.
 - API Access keeps contract documentation, streaming, file upload, and conversation integration close to the application being built.
+- Dify's source keeps transient canvas interaction in its workflow store, synchronizes draft/history at interaction boundaries, memoizes heavy panels, and defers optional UI. Those implementation patterns informed Harnest's drag-end commit, stable node presentation cache, grouped diagnostics/trace, and lazy manager loading.
 
 Harnest adopts contextual insertion, Settings / Last run, automatic save/validation status, a compact global progress rail, reusable service cards, guided Provider/custom-endpoint forms, and generated integration recipes. It does not copy Dify's generic automation catalog or visual styling. Harnest still treats typed ports, policies, tests, permissions, trace events, and a portable HarnessSpec as the product boundary.
 
