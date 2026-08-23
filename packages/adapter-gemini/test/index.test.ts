@@ -86,7 +86,15 @@ describe("Gemini adapter", () => {
       tools: [{
         name: "sum",
         description: "Add",
-        inputSchema: { type: "object", additionalProperties: false },
+        inputSchema: {
+          type: "object",
+          properties: {
+            additionalProperties: { type: "string" },
+            nested: { type: "object", additionalProperties: false },
+          },
+          examples: [{ additionalProperties: "literal data" }],
+          additionalProperties: false,
+        },
       }],
     }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
 
@@ -99,7 +107,14 @@ describe("Gemini adapter", () => {
     expect(body).toMatchObject({
       tools: [{ functionDeclarations: [{
         name: "sum",
-        parametersJsonSchema: { type: "object", additionalProperties: false },
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            additionalProperties: { type: "string" },
+            nested: { type: "object" },
+          },
+          examples: [{ additionalProperties: "literal data" }],
+        },
       }] }],
       contents: [
         { role: "model", parts: [{

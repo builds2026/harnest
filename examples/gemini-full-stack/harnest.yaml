@@ -3,40 +3,101 @@ components:
   - id: model
     type: model
     config:
-      adapter: gemini
+      connectionId: gemini-main
       model: gemini-3.5-flash-lite
-      apiKey: env:GEMINI_API_KEY
-      maxTokens: 1000
+      temperature: 0.2
+      maxTokens: 4000
   - id: prompt
     type: prompt
     config:
       template: |-
-        Answer the user's request clearly and concisely in Korean.
+        Answer the user's request in Korean unless they request another language.
+        Choose tools only when they improve the answer:
+        - Web Search for current or externally verifiable facts.
+        - Web Scrape for the contents of a relevant result URL.
+        - Code Runner for calculations, parsing, or data transformation.
+        Cite source URLs returned by the web tools. Never claim a tool was used when it was not.
 
         User request: {{input}}
+  - id: guidance
+    type: context
+    config:
+      source: text
+      text: Prefer primary sources, state uncertainty, and keep executable code inside the isolated sandbox.
+  - id: preferences
+    type: memory
+    config:
+      key: geminiAssistantPreferences
+      operation: read
+      initial:
+        language: ko
+        citations: true
+  - id: webSearch
+    type: tool
+    config:
+      tool: builtin.web-search
+      connectionId: web-main
+      source: builtin
+      risk: external
+  - id: webScrape
+    type: tool
+    config:
+      tool: builtin.web-scrape
+      connectionId: web-main
+      source: builtin
+      risk: external
+  - id: codeRunner
+    type: tool
+    config:
+      tool: builtin.code-runner
+      connectionId: sandbox-main
+      source: builtin
+      risk: destructive
   - id: agent
     type: agent
-    config: {}
+    config:
+      system: You are a grounded research and coding assistant. Use the smallest sufficient set of tools.
+      maxTurns: 8
+      maxToolCalls: 8
+      toolTimeoutMs: 30000
+      maxTokens: 12000
+      toolError: model
+      allowTools:
+        - builtin.web-search
+        - builtin.web-scrape
+        - builtin.code-runner
   - id: output
     type: output
     config:
       format: text
 connections:
-  - id: model_to_agent
-    from: { component: model, port: model }
+  - from: { component: model, port: model }
     to: { component: agent, port: model }
-  - id: prompt_to_agent
-    from: { component: prompt, port: prompt }
+  - from: { component: prompt, port: prompt }
     to: { component: agent, port: prompt }
-  - id: agent_to_output
-    from: { component: agent, port: response }
+  - from: { component: guidance, port: context }
+    to: { component: agent, port: context }
+  - from: { component: preferences, port: memory }
+    to: { component: agent, port: memory }
+  - from: { component: webSearch, port: tool }
+    to: { component: agent, port: tools }
+  - from: { component: webScrape, port: tool }
+    to: { component: agent, port: tools }
+  - from: { component: codeRunner, port: tool }
+    to: { component: agent, port: tools }
+  - from: { component: agent, port: response }
     to: { component: output, port: value }
 entrypoint: output
 runtime:
-  timeoutMs: 30000
+  timeoutMs: 120000
 studio:
   positions:
-    model: { x: 60, y: 40 }
-    prompt: { x: 60, y: 220 }
-    agent: { x: 390, y: 120 }
-    output: { x: 720, y: 120 }
+    model: { x: 40, y: 40 }
+    prompt: { x: 40, y: 220 }
+    guidance: { x: 40, y: 430 }
+    preferences: { x: 40, y: 590 }
+    webSearch: { x: 350, y: 40 }
+    webScrape: { x: 350, y: 200 }
+    codeRunner: { x: 350, y: 360 }
+    agent: { x: 690, y: 220 }
+    output: { x: 1040, y: 220 }

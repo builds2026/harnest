@@ -2,11 +2,11 @@
 
 ## ADR-01 — Connection metadata와 credential을 분리한다
 
-Harness에는 `connectionId`와 비민감 node/action 설정만 저장한다. Project/user Connection metadata는 JSON이고 credential, OAuth transaction, client information, token은 OS-user-bound vault에 둔다. Windows 구현은 DPAPI(CurrentUser)로 감싼 random data key와 AES-256-GCM을 사용한다. 안전한 OS backend가 없는 platform은 plaintext fallback 대신 실패한다.
+Harness에는 `connectionId`와 비민감 node/action 설정만 저장한다. Project/user Connection metadata는 JSON이고 credential, OAuth transaction, client information, token은 OS-user-bound vault에 둔다. Windows DPAPI(CurrentUser), macOS Keychain, Linux Secret Service로 AES-256-GCM key material을 보호한다. 안전한 OS backend가 없으면 plaintext fallback 대신 실패한다.
 
 ## ADR-02 — Tool 실행 계약은 하나다
 
-기존 `ToolRegistry` manifest에 output schema, source, risk와 Connection 요구사항을 추가한다. MCP, built-in, HTTP/OpenAPI, command와 module Tool은 같은 binding을 Agent에 제공한다. 기존 v1.1 `local-tool`/`mcp-tool`의 독립 실행은 호환 경로로 남기며 raw MCP도 실제 stdio와 Streamable HTTP SDK transport를 사용하고 exact host/process capability를 통과한다.
+기존 `ToolRegistry` manifest에 output schema, source, risk와 Connection 요구사항을 추가한다. MCP, built-in, HTTP/OpenAPI, command와 module Tool은 같은 binding을 Agent에 제공한다. raw MCP HTTP는 제한된 호환 경로로 유지하지만 raw stdio는 fail closed한다. 저장 MCP stdio와 process/code/module Tool은 approved container Connection을 통과한다.
 
 ## ADR-03 — Tool attachment와 Tool 실행을 분리한다
 
@@ -22,7 +22,7 @@ Provider Adapter는 tool definition, assistant tool call, tool result와 streame
 
 ## ADR-06 — Skill은 progressive disclosure다
 
-`skill` Component는 id와 사용자가 고른 resource reference만 전달한다. Catalog는 metadata만, Agent 활성화는 본문만, resource service는 요청된 file만 bounded하게 읽는다. Script는 provenance/hash 확인과 별도 trust callback이 없으면 접근할 수 없다.
+`skill` Component는 id와 사용자가 고른 resource reference만 전달한다. Catalog는 metadata만, Agent 활성화는 본문만, resource service는 요청된 file만 bounded하게 읽는다. Script는 Studio/CLI에서 code와 SHA-256을 검토한 뒤 저장한 exact-hash 승인이 있어야 접근할 수 있고 변경 시 무효화된다.
 
 ## ADR-07 — Studio는 기존 manifest-driven canvas를 확장한다
 
@@ -30,4 +30,4 @@ Provider Adapter는 tool definition, assistant tool call, tool result와 streame
 
 ## ADR-08 — 실행할 수 없는 항목은 installed/connected로 표시하지 않는다
 
-Protocol test가 없는 일반 HTTP/Local Runtime metadata는 untested다. Provider는 등록 Adapter probe, MCP는 protocol discovery, Web Search는 저장 HTTP mapping probe를 사용한다. Built-in Tool은 실제 executor가 Registry에 들어왔을 때만 installed다. 외부 Git/package materializer, vendor OAuth, OS resource isolation을 확인하지 못하면 unavailable 또는 unverified로 표시한다.
+Provider는 등록 Adapter probe, MCP는 protocol discovery, HTTP/Search/Scrape는 저장 request mapping probe, Local Runtime은 container engine/image probe를 사용한다. Built-in Tool은 실제 executor가 Registry에 들어왔을 때만 installed다. Git/package는 immutable source를 내려받아 integrity를 확인한 경우에만 설치하고, vendor OAuth나 external service test가 실패하면 연결 상태를 그대로 error/needs-auth로 표시한다.

@@ -103,3 +103,54 @@ export class ConnectionError extends Error {
 
 export const CONNECTION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export const CREDENTIAL_FIELD = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
+
+export const DEFAULT_PROVIDER_MODELS = Object.freeze({
+  gemini: "gemini-3.5-flash-lite",
+  openai: "",
+  anthropic: "",
+  ollama: "llama3.2",
+});
+
+export const DEFAULT_SANDBOX_IMAGES = Object.freeze({
+  node: "node:22-alpine",
+  python: "python:3.13-alpine",
+});
+
+export const FIRECRAWL_CONNECTION_CONFIG = Object.freeze({
+  connector: "firecrawl",
+  url: "https://api.firecrawl.dev/v2/search",
+  authScheme: "bearer",
+  method: "POST",
+  requestEncoding: "json",
+  queryParameter: "query",
+  limitParameter: "limit",
+  staticParameters: { sources: ["web"] },
+  responseItemsPath: "/data/web",
+  titleField: "title",
+  urlField: "url",
+  snippetField: "description",
+  contentField: "markdown",
+  testUrl: "https://api.firecrawl.dev/v2/team/credit-usage",
+  testMethod: "GET",
+  scrapeUrl: "https://api.firecrawl.dev/v2/scrape",
+  scrapeUrlParameter: "url",
+  scrapeStaticParameters: { formats: ["markdown"], onlyMainContent: true },
+  scrapeContentPath: "/data/markdown",
+  scrapeTitlePath: "/data/metadata/title",
+  scrapeSourceUrlPath: "/data/metadata/sourceURL",
+});
+
+export const SEARXNG_CONNECTION_CONFIG = Object.freeze({
+  connector: "searxng",
+  url: "",
+  authScheme: "none",
+  method: "GET",
+  requestEncoding: "query",
+  queryParameter: "q",
+  limitParameter: "limit",
+  staticParameters: { format: "json" },
+  responseItemsPath: "/results",
+  titleField: "title",
+  urlField: "url",
+  snippetField: "content",
+});

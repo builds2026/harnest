@@ -3,9 +3,7 @@ import type { Dirent } from "node:fs";
 import {
   lstat,
   mkdir,
-  open,
   opendir,
-  readFile,
   readdir,
   realpath,
   rename,
@@ -14,7 +12,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { atomicWriteVerifiedFile, openVerifiedFile, readVerifiedFile, writeVerifiedFile } from "./safe-files.js";
 import {
   SKILL_NAME_PATTERN,
   parseSkillDocument,
@@ -125,6 +124,14 @@ export interface SkillResource {
   readonly trusted: boolean;
 }
 
+export interface SkillScriptReview {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly content: string;
+  readonly approved: boolean;
+}
+
 export interface ScriptTrustRequest {
   readonly skill: SkillCatalogEntry;
   readonly resource: string;
@@ -193,6 +200,10 @@ export interface NodeSkillStoreOptions {
 }
 
 const PROVENANCE_FILE = ".harnest-provenance.json";
+const SCRIPT_APPROVAL_FILE = "skill-script-approvals.json";
+const SCRIPT_APPROVAL_VERSION = 1 as const;
+const MAX_SCRIPT_REVIEWS = 128;
+const MAX_SCRIPT_REVIEW_BYTES = 4 * 1_048_576;
 const RESOURCE_ROOTS = new Set(["assets", "references", "scripts"]);
 const SHA256 = /^sha256-[a-f0-9]{64}$/;
 const GIT_COMMIT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
@@ -249,19 +260,20 @@ export function skillInstallSourceKey(source: GitSkillInstallSource | PackageSki
 }
 
 async function readFrontmatterOnly(file: string, maximum: number): Promise<string> {
-  const handle = await open(file, "r");
+  const opened = await openVerifiedFile(file, await realpath(dirname(file)), "read");
   const chunks: Buffer[] = [];
   let total = 0;
   try {
     while (total < maximum) {
       const buffer = Buffer.alloc(Math.min(4_096, maximum - total));
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, total);
+      const { bytesRead } = await opened.handle.read(buffer, 0, buffer.length, total);
       if (bytesRead === 0) break;
       chunks.push(buffer.subarray(0, bytesRead));
       total += bytesRead;
       const candidate = Buffer.concat(chunks).toString("utf8");
       try {
         const sliced = splitSkillDocument(candidate);
+        await opened.verify();
         return `---\n${sliced.yaml}---\n`;
       } catch (error) {
         if (!(error instanceof Error) || !("code" in error)
@@ -269,7 +281,7 @@ async function readFrontmatterOnly(file: string, maximum: number): Promise<strin
       }
     }
   } finally {
-    await handle.close();
+    await opened.handle.close();
   }
   throw new SkillStoreError(
     "SKILL_READ_LIMIT",
@@ -278,16 +290,14 @@ async function readFrontmatterOnly(file: string, maximum: number): Promise<strin
 }
 
 async function readBounded(file: string, maximum: number): Promise<Buffer> {
-  const info = await stat(file);
-  if (!info.isFile()) throw new SkillStoreError("SKILL_RESOURCE_INVALID", "Skill resource is not a regular file");
-  if (info.size > maximum) {
-    throw new SkillStoreError("SKILL_READ_LIMIT", `Skill file exceeds the ${maximum}-byte limit`);
+  try {
+    return await readVerifiedFile(file, await realpath(dirname(file)), maximum);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("exceeds")) throw new SkillStoreError(
+      "SKILL_READ_LIMIT", `Skill file exceeds the ${maximum}-byte limit`,
+    );
+    throw error;
   }
-  const content = await readFile(file);
-  if (content.byteLength > maximum) {
-    throw new SkillStoreError("SKILL_READ_LIMIT", `Skill file exceeds the ${maximum}-byte limit`);
-  }
-  return content;
 }
 
 interface RootCandidate {
@@ -389,10 +399,10 @@ async function skillTreeHash(root: string, limits: SkillHashLimits): Promise<str
       if (entry.isDirectory()) {
         await visit(canonical, depth + 1);
       } else if (entry.isFile()) {
-        const handle = await open(canonical, "r");
+        const openedFile = await openVerifiedFile(canonical, root, "read");
         let size = 0;
         try {
-          const info = await handle.stat();
+          const info = await openedFile.handle.stat();
           if (!info.isFile()) throw new SkillStoreError("SKILL_CATALOG_INVALID", "Skill trees may contain only regular files");
           if (info.size > limits.maxPerFile) throw new SkillStoreError(
             "SKILL_READ_LIMIT", `Skill provenance file exceeds ${limits.maxPerFile} bytes`,
@@ -402,7 +412,7 @@ async function skillTreeHash(root: string, limits: SkillHashLimits): Promise<str
           );
           const relativePath = relative(root, canonical).split(sep).join("/");
           hash.update(relativePath).update("\0").update(String(info.size)).update("\0");
-          const stream = handle.createReadStream({ autoClose: false });
+          const stream = openedFile.handle.createReadStream({ autoClose: false });
           for await (const chunk of stream) {
             const content = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             size += content.byteLength;
@@ -414,9 +424,10 @@ async function skillTreeHash(root: string, limits: SkillHashLimits): Promise<str
           if (size !== info.size) throw new SkillStoreError(
             "SKILL_CATALOG_INVALID", "Skill provenance data changed while it was being hashed",
           );
+          await openedFile.verify();
           state.totalBytes += size;
         } finally {
-          await handle.close();
+          await openedFile.handle.close();
         }
       } else {
         throw new SkillStoreError("SKILL_CATALOG_INVALID", "Skill trees may contain only regular files and directories");
@@ -531,15 +542,14 @@ async function copySkillTree(
       throw new SkillStoreError("SKILL_INSTALL_INVALID", `Skill entry '${entry.name}' is not a regular file`);
     }
     state.files += 1;
-    const info = await stat(sourceCanonical);
-    const content = await readFile(sourceCanonical);
+    const content = await readVerifiedFile(sourceCanonical, sourceRoot, limits.maxBytes);
     state.bytes += content.byteLength;
     if (state.files > limits.maxFiles || state.bytes > limits.maxBytes || content.byteLength > limits.maxBytes) {
       throw new SkillStoreError("SKILL_READ_LIMIT", "Skill install exceeds its file or byte limit");
     }
     const path = relative(sourceRoot, sourceCanonical).split(sep).join("/");
     state.hash.update(path).update("\0").update(String(content.byteLength)).update("\0").update(content);
-    await writeFile(destinationPath, content, { mode: info.mode & 0o777 });
+    await writeVerifiedFile(destinationPath, await realpath(destination), content);
   }
 }
 
@@ -577,6 +587,51 @@ function normalizedResourcePath(path: string): string {
     );
   }
   return segments.join("/");
+}
+
+async function readSkillResourceFile(
+  entry: SkillCatalogEntry,
+  requestedPath: string,
+  maximum: number,
+): Promise<{ readonly path: string; readonly content: Buffer; readonly sha256: string }> {
+  const resourcePath = normalizedResourcePath(requestedPath);
+  const root = await realpath(entry.directory);
+  let target: string;
+  try {
+    target = await realpath(resolve(root, resourcePath));
+  } catch (error) {
+    if (isMissing(error)) throw new SkillStoreError(
+      "SKILL_RESOURCE_INVALID",
+      `Skill resource '${resourcePath}' does not exist`,
+      { skill: entry.name, resource: resourcePath },
+    );
+    throw error;
+  }
+  if (!isInside(root, target)) throw new SkillStoreError(
+    "SKILL_RESOURCE_OUTSIDE_ROOT",
+    `Skill resource '${resourcePath}' resolves outside the skill`,
+    { skill: entry.name, resource: resourcePath },
+  );
+  const linkInfo = await lstat(resolve(root, resourcePath));
+  if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) throw new SkillStoreError(
+    "SKILL_RESOURCE_INVALID",
+    `Skill resource '${resourcePath}' must be a regular, non-symbolic-link file`,
+    { skill: entry.name, resource: resourcePath },
+  );
+  const content = await readBounded(target, maximum);
+  return { path: resourcePath, content, sha256: sha256(content) };
+}
+
+interface PersistedScriptApproval {
+  readonly skill: string;
+  readonly path: string;
+  readonly sha256: string;
+  readonly approvedAt: string;
+}
+
+interface PersistedScriptApprovals {
+  readonly version: typeof SCRIPT_APPROVAL_VERSION;
+  readonly approvals: readonly PersistedScriptApproval[];
 }
 
 export class NodeSkillStore {
@@ -696,64 +751,100 @@ export class NodeSkillStore {
     options: LoadSkillResourceOptions = {},
   ): Promise<SkillResource> {
     const entry = await this.#verifiedEntry(await this.#find(name));
-    const resourcePath = normalizedResourcePath(requestedPath);
-    const root = await realpath(entry.directory);
-    let target: string;
-    try {
-      target = await realpath(resolve(root, resourcePath));
-    } catch (error) {
-      if (isMissing(error)) {
-        throw new SkillStoreError(
-          "SKILL_RESOURCE_INVALID",
-          `Skill resource '${resourcePath}' does not exist`,
-          { skill: name, resource: resourcePath },
-        );
-      }
-      throw error;
-    }
-    if (!isInside(root, target)) {
-      throw new SkillStoreError(
-        "SKILL_RESOURCE_OUTSIDE_ROOT",
-        `Skill resource '${resourcePath}' resolves outside the skill`,
-        { skill: name, resource: resourcePath },
-      );
-    }
-    const linkInfo = await lstat(resolve(root, resourcePath));
-    if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) {
-      throw new SkillStoreError(
-        "SKILL_RESOURCE_INVALID",
-        `Skill resource '${resourcePath}' must be a regular, non-symbolic-link file`,
-        { skill: name, resource: resourcePath },
-      );
-    }
-    const content = await readBounded(
-      target,
+    const resource = await readSkillResourceFile(
+      entry,
+      requestedPath,
       boundedInteger(this.#options.maxResourceBytes, 1_048_576, 8_388_608),
     );
-    const digest = sha256(content);
-    const script = resourcePath.startsWith("scripts/");
+    const script = resource.path.startsWith("scripts/");
     let trusted = !script && entry.provenanceVerified;
     if (script) {
       trusted = this.#options.authorizeScript === undefined
-        ? false
-        : await this.#options.authorizeScript({ skill: entry, resource: resourcePath, sha256: digest });
+        ? await this.#scriptApproved(entry.name, resource.path, resource.sha256)
+        : await this.#options.authorizeScript({ skill: entry, resource: resource.path, sha256: resource.sha256 });
       if (!trusted) {
         throw new SkillStoreError(
           "SKILL_SCRIPT_APPROVAL_REQUIRED",
-          `Skill script '${resourcePath}' requires approval for ${digest}`,
-          { skill: name, resource: resourcePath },
+          `Skill script '${resource.path}' requires approval for ${resource.sha256}`,
+          { skill: name, resource: resource.path },
         );
       }
     }
     return {
       skill: name,
-      path: resourcePath,
-      content: options.encoding === "bytes" ? content : content.toString("utf8"),
-      bytes: content.byteLength,
-      sha256: digest,
+      path: resource.path,
+      content: options.encoding === "bytes" ? resource.content : resource.content.toString("utf8"),
+      bytes: resource.content.byteLength,
+      sha256: resource.sha256,
       script,
       trusted,
     };
+  }
+
+  async reviewScripts(name: string): Promise<readonly SkillScriptReview[]> {
+    const entry = await this.#verifiedEntry(await this.#find(name));
+    const scripts = resolve(entry.directory, "scripts");
+    try {
+      const info = await lstat(scripts);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new SkillStoreError(
+        "SKILL_RESOURCE_INVALID", "Skill scripts must be a regular directory", { skill: name },
+      );
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw error;
+    }
+    const paths: string[] = [];
+    const visit = async (directory: string, depth: number): Promise<void> => {
+      if (depth > 16) throw new SkillStoreError("SKILL_READ_LIMIT", "Skill scripts exceed review depth");
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const child of entries) {
+        if (child.isSymbolicLink()) throw new SkillStoreError("SKILL_RESOURCE_INVALID", "Skill scripts cannot contain links");
+        const target = resolve(directory, child.name);
+        if (child.isDirectory()) await visit(target, depth + 1);
+        else if (child.isFile()) paths.push(relative(entry.directory, target).split(sep).join("/"));
+        else throw new SkillStoreError("SKILL_RESOURCE_INVALID", "Skill scripts may contain only files and directories");
+        if (paths.length > MAX_SCRIPT_REVIEWS) throw new SkillStoreError("SKILL_READ_LIMIT", "Skill has too many scripts to review");
+      }
+    };
+    await visit(scripts, 0);
+    const approvals = await this.#scriptApprovals();
+    const reviews: SkillScriptReview[] = [];
+    let total = 0;
+    for (const path of paths) {
+      const resource = await readSkillResourceFile(
+        entry,
+        path,
+        boundedInteger(this.#options.maxResourceBytes, 1_048_576, 8_388_608),
+      );
+      total += resource.content.byteLength;
+      if (total > MAX_SCRIPT_REVIEW_BYTES || resource.content.includes(0)) throw new SkillStoreError(
+        "SKILL_READ_LIMIT", "Skill scripts exceed the text review limit",
+      );
+      reviews.push({
+        path,
+        bytes: resource.content.byteLength,
+        sha256: resource.sha256,
+        content: resource.content.toString("utf8"),
+        approved: approvals.some((approval) => approval.skill === name && approval.path === path
+          && approval.sha256 === resource.sha256),
+      });
+    }
+    return reviews;
+  }
+
+  async approveScript(name: string, path: string, expectedSha256: string): Promise<SkillScriptReview> {
+    const review = (await this.reviewScripts(name)).find((candidate) => candidate.path === path);
+    if (!review || review.sha256 !== expectedSha256) throw new SkillStoreError(
+      "SKILL_SCRIPT_APPROVAL_REQUIRED",
+      `Skill script '${path}' changed before approval`,
+      { skill: name, resource: path },
+    );
+    const approvals = (await this.#scriptApprovals()).filter((approval) =>
+      approval.skill !== name || approval.path !== path);
+    approvals.push({ skill: name, path, sha256: review.sha256, approvedAt: new Date().toISOString() });
+    await this.#writeScriptApprovals(approvals);
+    return { ...review, approved: true };
   }
 
   async install(source: SkillInstallSource, options: InstallSkillOptions): Promise<SkillCatalogEntry> {
@@ -804,7 +895,10 @@ export class NodeSkillStore {
       join(sourceRoot, "SKILL.md"),
       boundedInteger(this.#options.maxSkillBytes, 524_288, 4_194_304),
     );
-    const parsed = parseSkillDocument(document.toString("utf8"), { directoryName });
+    const parsed = parseSkillDocument(
+      document.toString("utf8"),
+      source.kind === "local" ? { directoryName } : {},
+    );
     if (!SKILL_NAME_PATTERN.test(parsed.descriptor.name)) {
       throw new SkillStoreError("SKILL_INSTALL_INVALID", "Skill install name is invalid");
     }
@@ -875,6 +969,45 @@ export class NodeSkillStore {
     const entry = catalog.skills.find((candidate) => candidate.name === name);
     if (!entry) throw new SkillStoreError("SKILL_NOT_FOUND", `Skill '${name}' is not installed`, { skill: name });
     return entry;
+  }
+
+  async #scriptApproved(skill: string, path: string, digest: string): Promise<boolean> {
+    return (await this.#scriptApprovals()).some((approval) =>
+      approval.skill === skill && approval.path === path && approval.sha256 === digest);
+  }
+
+  async #scriptApprovals(): Promise<PersistedScriptApproval[]> {
+    const root = await this.#projectRoot;
+    const file = join(root, ".harnest", SCRIPT_APPROVAL_FILE);
+    try {
+      const parent = await realpath(dirname(file));
+      const value = JSON.parse((await readVerifiedFile(file, parent, 1_048_576)).toString("utf8")) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid approval file");
+      const record = value as Partial<PersistedScriptApprovals>;
+      if (record.version !== SCRIPT_APPROVAL_VERSION || !Array.isArray(record.approvals)) throw new Error("invalid approval file");
+      return record.approvals.filter((approval): approval is PersistedScriptApproval => Boolean(
+        approval && typeof approval === "object"
+        && typeof approval.skill === "string" && SKILL_NAME_PATTERN.test(approval.skill)
+        && typeof approval.path === "string" && approval.path.startsWith("scripts/")
+        && typeof approval.sha256 === "string" && SHA256.test(approval.sha256)
+        && typeof approval.approvedAt === "string",
+      ));
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw new SkillStoreError(
+        "SKILL_CATALOG_INVALID",
+        `Skill script approvals cannot be read: ${error instanceof Error ? error.message : "invalid data"}`,
+      );
+    }
+  }
+
+  async #writeScriptApprovals(approvals: readonly PersistedScriptApproval[]): Promise<void> {
+    const root = await this.#projectRoot;
+    const directory = await containedDirectory(root, join(root, ".harnest"));
+    await atomicWriteVerifiedFile(join(directory, SCRIPT_APPROVAL_FILE), directory, `${JSON.stringify({
+      version: SCRIPT_APPROVAL_VERSION,
+      approvals,
+    } satisfies PersistedScriptApprovals, null, 2)}\n`);
   }
 
   async #verifiedEntry(entry: SkillCatalogEntry): Promise<SkillCatalogEntry> {

@@ -1,20 +1,20 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { constants as fsConstants, type Stats } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
-  rename,
-  rm,
   stat,
-  writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { isAbsolute, dirname, relative, resolve, sep } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { parseDocument } from "yaml";
 import { inspectSafeRegex } from "./safe-regex.js";
+import { atomicWriteVerifiedFile, readVerifiedFile } from "./safe-files.js";
 import type {
   ToolDefinition,
   ToolExecutionContext,
@@ -143,7 +143,11 @@ export interface ProcessCapabilityRequest {
   readonly command: string;
   readonly args: readonly string[];
   readonly cwd: string;
-  readonly isolation: "timeout-output-cwd-bounds-only";
+  readonly isolation: "os-sandbox";
+  readonly connectionId?: string;
+}
+
+export interface ProcessExecutionRequest extends BoundedProcessOptions {
   readonly connectionId?: string;
 }
 
@@ -161,12 +165,23 @@ export interface ModuleExecutionRequest {
   readonly input: unknown;
   readonly signal: AbortSignal;
   readonly context: ToolExecutionContext;
+  readonly timeoutMs: number;
+  readonly maxInputBytes: number;
+  readonly maxOutputBytes: number;
   readonly connectionId?: string;
 }
 
 export interface WebSearchRequest {
   readonly query: string;
   readonly limit: number;
+  readonly cursor?: string;
+  readonly signal: AbortSignal;
+  readonly context: ToolExecutionContext;
+  readonly connectionId?: string;
+}
+
+export interface WebScrapeRequest {
+  readonly url: string;
   readonly signal: AbortSignal;
   readonly context: ToolExecutionContext;
   readonly connectionId?: string;
@@ -185,6 +200,10 @@ export interface ToolHostCapabilities {
   readonly authorizeProcess?: (
     request: ProcessCapabilityRequest,
   ) => boolean | Promise<boolean>;
+  /** Host process boundary. Production Node hosts execute this in the configured OS sandbox. */
+  readonly executeProcess?: (
+    request: ProcessExecutionRequest,
+  ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
   /** Required before built-in file reads or writes. */
   readonly authorizeFile?: (
     request: FileCapabilityRequest,
@@ -195,6 +214,7 @@ export interface ToolHostCapabilities {
   ) => unknown | Promise<unknown>;
   /** Required provider/connection host for the built-in Web Search manifest. */
   readonly webSearch?: (request: WebSearchRequest) => unknown | Promise<unknown>;
+  readonly webScrape?: (request: WebScrapeRequest) => unknown | Promise<unknown>;
 }
 
 export interface NodeToolStoreOptions {
@@ -734,8 +754,15 @@ const BUILTIN_INPUTS = {
     properties: {
       query: { type: "string", minLength: 1 },
       limit: { type: "integer", minimum: 1, maximum: 20, default: 5 },
+      cursor: { type: "string", minLength: 1, maxLength: 4_096 },
     },
     required: ["query"],
+    additionalProperties: false,
+  },
+  webScrape: {
+    type: "object",
+    properties: { url: { type: "string", minLength: 1, maxLength: 8_192 } },
+    required: ["url"],
     additionalProperties: false,
   },
   http: {
@@ -792,6 +819,16 @@ export const BUILTIN_TOOL_MANIFESTS = Object.freeze([
     connectionKinds: ["tool-service"],
   },
   {
+    id: "builtin.web-scrape",
+    label: "Web Scrape",
+    description: "Extract one public page through a host-approved Tool Service Connection.",
+    inputSchema: BUILTIN_INPUTS.webScrape,
+    category: "Web",
+    risk: "external",
+    source: "builtin",
+    connectionKinds: ["tool-service"],
+  },
+  {
     id: "builtin.http",
     label: "HTTP Request",
     description: "Send an HTTP request after explicit host approval; credentials come from the host connection.",
@@ -814,7 +851,7 @@ export const BUILTIN_TOOL_MANIFESTS = Object.freeze([
   {
     id: "builtin.shell",
     label: "Shell",
-    description: "Run a host-approved process without a shell. Timeout, output, and cwd bounds are not an OS sandbox.",
+    description: "Run a host-approved executable without a shell inside an approved no-network container.",
     inputSchema: BUILTIN_INPUTS.shell,
     category: "Local",
     risk: "destructive",
@@ -824,7 +861,7 @@ export const BUILTIN_TOOL_MANIFESTS = Object.freeze([
   {
     id: "builtin.code-runner",
     label: "Code Runner",
-    description: "Run code in a host-approved interpreter. Timeout, output, and cwd bounds are not an OS sandbox.",
+    description: "Run Node.js or Python code inside an approved no-network container.",
     inputSchema: BUILTIN_INPUTS.code,
     category: "Local",
     risk: "destructive",
@@ -873,6 +910,108 @@ function mergeSignals(parent: AbortSignal, timeoutMs: number): { signal: AbortSi
       parent.removeEventListener("abort", abort);
     },
   };
+}
+
+export interface BoundedProcessOptions {
+  readonly toolId: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly stdin: string;
+  readonly timeoutMs: number;
+  readonly maxInputBytes: number;
+  readonly maxOutputBytes: number;
+  readonly signal: AbortSignal;
+  readonly environment?: Readonly<Record<string, string>>;
+}
+
+export async function runBoundedProcess(options: BoundedProcessOptions): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}> {
+  if (Buffer.byteLength(options.stdin, "utf8") > options.maxInputBytes) throw new ToolStoreError(
+    "TOOL_INPUT_INVALID", `Process stdin exceeds ${options.maxInputBytes} bytes`, options.toolId,
+  );
+  const deadline = mergeSignals(options.signal, options.timeoutMs);
+  try {
+    if (deadline.signal.aborted) throw deadline.signal.reason;
+    return await new Promise((resolvePromise, rejectPromise) => {
+      let settled = false;
+      let total = 0;
+      let terminalError: unknown;
+      let terminating = false;
+      let forceKillTimer: NodeJS.Timeout | undefined;
+      let closeDeadlineTimer: NodeJS.Timeout | undefined;
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      const finish = (error?: unknown, result?: { stdout: string; stderr: string; exitCode: number }) => {
+        if (settled) return;
+        settled = true;
+        if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+        if (closeDeadlineTimer !== undefined) clearTimeout(closeDeadlineTimer);
+        deadline.signal.removeEventListener("abort", aborted);
+        if (error !== undefined) rejectPromise(error);
+        else if (result !== undefined) resolvePromise(result);
+      };
+      const child = spawn(options.command, [...options.args], {
+        cwd: options.cwd,
+        env: { ...(options.environment ?? {}) },
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      const terminate = (error: unknown) => {
+        if (terminalError === undefined) terminalError = error;
+        if (terminating || settled) return;
+        terminating = true;
+        try { child.kill("SIGTERM"); } catch { /* close deadline still settles the caller */ }
+        forceKillTimer = setTimeout(() => {
+          if (settled) return;
+          try { child.kill("SIGKILL"); } catch { /* close deadline still settles the caller */ }
+        }, PROCESS_TERMINATE_GRACE_MS);
+        closeDeadlineTimer = setTimeout(() => {
+          if (settled) return;
+          child.stdin.destroy();
+          child.stdout.destroy();
+          child.stderr.destroy();
+          child.unref();
+          finish(terminalError);
+        }, PROCESS_TERMINATE_GRACE_MS + PROCESS_CLOSE_DEADLINE_MS);
+      };
+      const aborted = () => terminate(deadline.signal.reason);
+      deadline.signal.addEventListener("abort", aborted, { once: true });
+      const collect = (target: Buffer[], chunk: Buffer) => {
+        if (terminalError !== undefined) return;
+        total += chunk.byteLength;
+        if (total > options.maxOutputBytes) terminate(new ToolStoreError(
+          "TOOL_OUTPUT_LIMIT", `Process output exceeds ${options.maxOutputBytes} bytes`, options.toolId,
+        ));
+        else target.push(Buffer.from(chunk));
+      };
+      child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+      child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+      child.on("error", (error) => finish(terminalError ?? new ToolStoreError(
+        "TOOL_EXECUTION_FAILED", `Process failed: ${error.message}`, options.toolId,
+      )));
+      child.on("close", (code) => {
+        if (terminalError !== undefined) return finish(terminalError);
+        if (code !== 0) return finish(new ToolStoreError(
+          "TOOL_EXECUTION_FAILED", `Process exited with code ${code ?? "unknown"}`, options.toolId,
+        ));
+        finish(undefined, {
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
+          exitCode: 0,
+        });
+      });
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(options.stdin);
+      if (deadline.signal.aborted) aborted();
+    });
+  } finally {
+    deadline.cleanup();
+  }
 }
 
 async function signalRace<T>(value: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -1140,13 +1279,7 @@ export class NodeToolStore {
     const directory = await this.#storeDirectory(true);
     const file = resolve(directory, `${validated.id}.json`);
     if (!isInside(directory, file)) throw new ToolStoreError("TOOL_MANIFEST_INVALID", "Tool manifest path is invalid", validated.id);
-    const temporary = resolve(directory, `.${validated.id}.${randomUUID()}.tmp`);
-    try {
-      await writeFile(temporary, serialized, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, file);
-    } finally {
-      await rm(temporary, { force: true });
-    }
+    await atomicWriteVerifiedFile(file, directory, serialized);
     return validated;
   }
 
@@ -1168,7 +1301,11 @@ export class NodeToolStore {
     const maximum = boundedInteger(this.#options.maxManifestBytes, 1_048_576, 4_194_304);
     if (info.size > maximum) throw new ToolStoreError("TOOL_MANIFEST_INVALID", `Tool '${id}' manifest exceeds ${maximum} bytes`, id);
     try {
-      return validateStoredToolManifest(JSON.parse(await readFile(file, "utf8")) as unknown);
+      const candidate = JSON.parse((await readVerifiedFile(file, directory, maximum)).toString("utf8")) as unknown;
+      if (isRecord(candidate) && candidate.deleted === true) throw new ToolStoreError(
+        "TOOL_MANIFEST_NOT_FOUND", `Tool '${id}' is not installed`, id,
+      );
+      return validateStoredToolManifest(candidate);
     } catch (error) {
       if (error instanceof ToolStoreError) throw error;
       throw new ToolStoreError(
@@ -1194,7 +1331,9 @@ export class NodeToolStore {
         if (tool.id !== id) throw new ToolStoreError("TOOL_MANIFEST_INVALID", "Manifest id must match its filename", id);
         tools.push(tool);
       } catch (error) {
-        warnings.push(`Ignoring tool manifest '${entry.name}': ${error instanceof Error ? error.message : "invalid manifest"}`);
+        if (!(error instanceof ToolStoreError && error.code === "TOOL_MANIFEST_NOT_FOUND")) {
+          warnings.push(`Ignoring tool manifest '${entry.name}': ${error instanceof Error ? error.message : "invalid manifest"}`);
+        }
       }
     }
     return { tools, warnings };
@@ -1211,7 +1350,7 @@ export class NodeToolStore {
       if (!info.isFile() || info.isSymbolicLink()) {
         throw new ToolStoreError("TOOL_MANIFEST_INVALID", `Tool '${id}' manifest is not a regular file`, id);
       }
-      await rm(file);
+      await atomicWriteVerifiedFile(file, directory, '{"deleted":true}\n');
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
@@ -1628,6 +1767,9 @@ export class NodeToolStore {
         input,
         signal: deadline.signal,
         context,
+        timeoutMs: this.#timeout(manifest.timeoutMs),
+        maxInputBytes: this.#maxInput(),
+        maxOutputBytes: this.#maxOutput(),
         ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
       })), deadline.signal);
     } catch (error) {
@@ -1664,6 +1806,23 @@ export class NodeToolStore {
         output = await signalRace(Promise.resolve(webSearch({
           query: input.query as string,
           limit: typeof input.limit === "number" ? input.limit : 5,
+          ...(typeof input.cursor === "string" ? { cursor: input.cursor } : {}),
+          signal: deadline.signal,
+          context,
+          ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
+        })), deadline.signal);
+      } finally {
+        deadline.cleanup();
+      }
+    } else if (id === "builtin.web-scrape") {
+      const webScrape = this.#options.capabilities?.webScrape;
+      if (webScrape === undefined) throw new ToolStoreError(
+        "TOOL_CAPABILITY_REQUIRED", "Web Scrape requires a Tool Service capability callback", id,
+      );
+      const deadline = mergeSignals(context.signal, this.#timeout());
+      try {
+        output = await signalRace(Promise.resolve(webScrape({
+          url: input.url as string,
           signal: deadline.signal,
           context,
           ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
@@ -1713,32 +1872,95 @@ export class NodeToolStore {
   async #executeFile(input: Record<string, unknown>, context: ToolExecutionContext): Promise<unknown> {
     const operation = input.operation as "read" | "write";
     const path = input.path as string;
-    const target = operation === "read"
-      ? await this.#containedExistingPath(path, false)
-      : await this.#containedWritePath(path);
     const authorizeFile = this.#options.capabilities?.authorizeFile;
     if (authorizeFile === undefined) {
       throw new ToolStoreError("TOOL_CAPABILITY_REQUIRED", "File tool requires a file capability callback", "builtin.file");
     }
-    if (!await authorizeFile({ toolId: "builtin.file", operation, path: target })) {
-      throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `File '${path}' was not approved`, "builtin.file");
-    }
-    if (context.signal.aborted) throw context.signal.reason;
-    if (operation === "read") {
-      const info = await stat(target);
-      if (!info.isFile() || info.size > this.#maxOutput()) {
-        throw new ToolStoreError("TOOL_OUTPUT_LIMIT", `File exceeds ${this.#maxOutput()} bytes`, "builtin.file");
-      }
-      return readFile(target, "utf8");
-    }
     if (typeof input.content !== "string") {
-      throw new ToolStoreError("TOOL_INPUT_INVALID", "File write requires string content", "builtin.file");
+      if (operation === "write") throw new ToolStoreError(
+        "TOOL_INPUT_INVALID", "File write requires string content", "builtin.file",
+      );
     }
-    if (Buffer.byteLength(input.content, "utf8") > this.#maxInput()) {
+    if (operation === "write" && Buffer.byteLength(input.content as string, "utf8") > this.#maxInput()) {
       throw new ToolStoreError("TOOL_INPUT_INVALID", `File content exceeds ${this.#maxInput()} bytes`, "builtin.file");
     }
-    await writeFile(target, input.content, "utf8");
-    return { path: relative(await this.#root, target).split(sep).join("/"), bytes: Buffer.byteLength(input.content, "utf8") };
+    const opened = await this.#openContainedFile(path, operation);
+    try {
+      if (!await authorizeFile({ toolId: "builtin.file", operation, path: opened.path })) {
+        throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `File '${path}' was not approved`, "builtin.file");
+      }
+      if (context.signal.aborted) throw context.signal.reason;
+      await this.#assertOpenFileIdentity(opened.handle, opened.path);
+      const info = await opened.handle.stat();
+      if (operation === "read") {
+        if (info.size > this.#maxOutput()) throw new ToolStoreError(
+          "TOOL_OUTPUT_LIMIT", `File exceeds ${this.#maxOutput()} bytes`, "builtin.file",
+        );
+        return opened.handle.readFile({ encoding: "utf8" });
+      }
+      await opened.handle.truncate(0);
+      await opened.handle.writeFile(input.content as string, { encoding: "utf8" });
+      await opened.handle.sync();
+      return {
+        path: relative(await this.#root, opened.path).split(sep).join("/"),
+        bytes: Buffer.byteLength(input.content as string, "utf8"),
+      };
+    } finally {
+      await opened.handle.close();
+    }
+  }
+
+  async #openContainedFile(configured: string, operation: "read" | "write"): Promise<{
+    readonly handle: FileHandle;
+    readonly path: string;
+  }> {
+    if (configured.length === 0 || configured.length > 1_024 || isAbsolute(configured) || configured.includes("\0")) {
+      throw new ToolStoreError("TOOL_CAPABILITY_DENIED", "Project path must be a bounded relative path");
+    }
+    const root = await this.#root;
+    const lexical = resolve(root, configured);
+    if (!isInside(root, lexical)) throw new ToolStoreError(
+      "TOOL_CAPABILITY_DENIED", `Project path '${configured}' is outside the project`,
+    );
+    const parent = await realpath(dirname(lexical));
+    if (!isInside(root, parent)) throw new ToolStoreError(
+      "TOOL_CAPABILITY_DENIED", `Project path '${configured}' has an unsafe parent`,
+    );
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    const flags = operation === "read"
+      ? fsConstants.O_RDONLY | noFollow
+      : fsConstants.O_RDWR | fsConstants.O_CREAT | noFollow;
+    let handle: FileHandle;
+    try {
+      handle = await open(lexical, flags, 0o600);
+    } catch (error) {
+      if (isMissing(error)) throw new ToolStoreError(
+        "TOOL_CAPABILITY_DENIED", `Project path '${configured}' does not exist`,
+      );
+      throw error;
+    }
+    try {
+      const canonical = await realpath(lexical);
+      if (!isInside(root, canonical) || (await lstat(lexical)).isSymbolicLink()) throw new ToolStoreError(
+        "TOOL_CAPABILITY_DENIED", `Project path '${configured}' resolves outside the project`,
+      );
+      await this.#assertOpenFileIdentity(handle, canonical);
+      return { handle, path: canonical };
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+
+  async #assertOpenFileIdentity(handle: FileHandle, path: string): Promise<void> {
+    const [opened, current] = await Promise.all([handle.stat(), stat(path)]);
+    if (!opened.isFile() || !current.isFile() || !this.#sameFile(opened, current)) throw new ToolStoreError(
+      "TOOL_CAPABILITY_DENIED", "Project file changed while it was being authorized", "builtin.file",
+    );
+  }
+
+  #sameFile(left: Stats, right: Stats): boolean {
+    return left.ino !== 0 && left.ino === right.ino && (process.platform === "win32" || left.dev === right.dev);
   }
 
   async #runProcess(
@@ -1763,104 +1985,26 @@ export class NodeToolStore {
       command,
       args,
       cwd,
-      isolation: "timeout-output-cwd-bounds-only",
+      isolation: "os-sandbox",
       ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
     });
     if (!approved) throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `Process '${command}' was not approved`, toolId);
-    const deadline = mergeSignals(parentSignal, timeoutMs);
-    try {
-      if (deadline.signal.aborted) throw deadline.signal.reason;
-      return await new Promise((resolvePromise, rejectPromise) => {
-        let settled = false;
-        let total = 0;
-        let terminalError: unknown;
-        let terminating = false;
-        let forceKillTimer: NodeJS.Timeout | undefined;
-        let closeDeadlineTimer: NodeJS.Timeout | undefined;
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        const finish = (error?: unknown, result?: { stdout: string; stderr: string; exitCode: number }) => {
-          if (settled) return;
-          settled = true;
-          if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-          if (closeDeadlineTimer !== undefined) clearTimeout(closeDeadlineTimer);
-          deadline.signal.removeEventListener("abort", aborted);
-          if (error !== undefined) rejectPromise(error);
-          else if (result !== undefined) resolvePromise(result);
-        };
-        const child = spawn(command, [...args], {
-          cwd,
-          env: { ...(this.#options.processEnvironment ?? {}) },
-          shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true,
-        });
-        const terminate = (error: unknown) => {
-          if (terminalError === undefined) terminalError = error;
-          if (terminating || settled) return;
-          terminating = true;
-          try {
-            child.kill("SIGTERM");
-          } catch {
-            // The bounded close deadline below still settles the caller.
-          }
-          forceKillTimer = setTimeout(() => {
-            if (settled) return;
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // The caller must not wait forever even when the host refuses the signal.
-            }
-          }, PROCESS_TERMINATE_GRACE_MS);
-          closeDeadlineTimer = setTimeout(() => {
-            if (settled) return;
-            child.stdin.destroy();
-            child.stdout.destroy();
-            child.stderr.destroy();
-            child.unref();
-            finish(terminalError);
-          }, PROCESS_TERMINATE_GRACE_MS + PROCESS_CLOSE_DEADLINE_MS);
-        };
-        const aborted = () => terminate(deadline.signal.reason);
-        deadline.signal.addEventListener("abort", aborted, { once: true });
-        const collect = (target: Buffer[], chunk: Buffer) => {
-          if (terminalError !== undefined) return;
-          total += chunk.byteLength;
-          if (total > this.#maxOutput()) {
-            terminate(new ToolStoreError("TOOL_OUTPUT_LIMIT", `Process output exceeds ${this.#maxOutput()} bytes`, toolId));
-          } else {
-            target.push(Buffer.from(chunk));
-          }
-        };
-        child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
-        child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
-        child.on("error", (error) => finish(terminalError ?? new ToolStoreError(
-          "TOOL_EXECUTION_FAILED",
-          `Process failed: ${error.message}`,
-          toolId,
-        )));
-        child.on("close", (code) => {
-          if (terminalError !== undefined) {
-            finish(terminalError);
-            return;
-          }
-          if (code !== 0) {
-            finish(new ToolStoreError("TOOL_EXECUTION_FAILED", `Process exited with code ${code ?? "unknown"}`, toolId));
-            return;
-          }
-          finish(undefined, {
-            stdout: Buffer.concat(stdout).toString("utf8"),
-            stderr: Buffer.concat(stderr).toString("utf8"),
-            exitCode: 0,
-          });
-        });
-        child.stdin.on("error", () => undefined);
-        child.stdin.end(stdin);
-        if (deadline.signal.aborted) aborted();
-      });
-    } finally {
-      deadline.cleanup();
-    }
+    const request: ProcessExecutionRequest = {
+      toolId,
+      command,
+      args,
+      cwd,
+      stdin,
+      timeoutMs,
+      maxInputBytes: this.#maxInput(),
+      maxOutputBytes: this.#maxOutput(),
+      signal: parentSignal,
+      ...(this.#options.processEnvironment ? { environment: this.#options.processEnvironment } : {}),
+      ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
+    };
+    return this.#options.capabilities?.executeProcess
+      ? this.#options.capabilities.executeProcess(request)
+      : runBoundedProcess(request);
   }
 
   async #containedExistingPath(configured: string, directoryOnly: boolean): Promise<string> {
@@ -1890,22 +2034,4 @@ export class NodeToolStore {
     return target;
   }
 
-  async #containedWritePath(configured: string): Promise<string> {
-    if (configured.length === 0 || configured.length > 1_024 || isAbsolute(configured) || configured.includes("\0")) {
-      throw new ToolStoreError("TOOL_CAPABILITY_DENIED", "Project path must be a bounded relative path");
-    }
-    const root = await this.#root;
-    const target = resolve(root, configured);
-    if (!isInside(root, target)) throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `Project path '${configured}' is outside the project`);
-    const parent = await realpath(dirname(target));
-    if (!isInside(root, parent)) throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `Project path '${configured}' has an unsafe parent`);
-    try {
-      if ((await lstat(target)).isSymbolicLink()) {
-        throw new ToolStoreError("TOOL_CAPABILITY_DENIED", `Project path '${configured}' is a symbolic link`);
-      }
-    } catch (error) {
-      if (!isMissing(error)) throw error;
-    }
-    return target;
-  }
 }

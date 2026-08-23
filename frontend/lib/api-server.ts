@@ -87,7 +87,7 @@ export const apiErrorResponse = (error: unknown) => {
     return Response.json({ ok: false, error: { code: error.code, message: error.message } }, { status });
   }
   if (error && typeof error === "object" && "name" in error
-    && (error.name === "ToolStoreError" || error.name === "SkillStoreError")
+    && (error.name === "ToolStoreError" || error.name === "SkillStoreError" || error.name === "SkillParseError")
     && "code" in error && typeof error.code === "string" && "message" in error && typeof error.message === "string") {
     const status = /NOT_FOUND/.test(error.code) ? 404
       : /APPROVAL_REQUIRED|EXISTS/.test(error.code) ? 409

@@ -13,10 +13,11 @@ import {
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, StreamableHTTPClientTransport, type Tool } from "@modelcontextprotocol/client";
-import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { build } from "esbuild";
 import { AdapterError, AdapterRegistry, type ModelAdapter } from "./adapter.js";
 import type { ConnectionProfile } from "./connection.js";
 import type {
@@ -31,7 +32,10 @@ import { normalizeSpec } from "./graph.js";
 import {
   ConnectionManager,
   canonicalExecutable,
+  containerEngineEnvironment,
+  containerRunArguments,
   executeWebSearchConnection,
+  executeWebScrapeConnection,
   guardedFetch,
   mcpToolApprovalId,
   openMcpConnection,
@@ -39,6 +43,7 @@ import {
   type McpConnectionHandle,
 } from "./node-connections.js";
 import { NodeSkillStore } from "./node-skills.js";
+import { atomicWriteVerifiedFile, openVerifiedFile, readVerifiedFile } from "./safe-files.js";
 import {
   BUILTIN_TOOL_MANIFESTS,
   NodeToolStore,
@@ -46,7 +51,10 @@ import {
   type HttpCapabilityRequest,
   type ModuleExecutionRequest,
   type ProcessCapabilityRequest,
+  type ProcessExecutionRequest,
   type WebSearchRequest,
+  type WebScrapeRequest,
+  runBoundedProcess,
 } from "./node-tools.js";
 import {
   parseSpec,
@@ -67,6 +75,7 @@ import type {
 export {
   ConnectionManager,
   canonicalExecutable,
+  detectContainerEngine,
   guardedFetch,
   mcpToolApprovalId,
   openMcpConnection,
@@ -76,6 +85,7 @@ export {
   type McpConnectionHandle,
 } from "./node-connections.js";
 export * from "./node-skills.js";
+export * from "./node-skill-install.js";
 export * from "./node-tools.js";
 
 export async function loadSpecFile(filePath: string): Promise<ParseResult> {
@@ -362,12 +372,14 @@ async function readBoundedHandle(
   };
 }
 
-async function readBounded(file: string, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
-  const handle = await open(file, "r");
+async function readBounded(file: string, root: string, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+  const opened = await openVerifiedFile(file, root, "read");
   try {
-    return await readBoundedHandle(handle, maxBytes);
+    const content = await readBoundedHandle(opened.handle, maxBytes);
+    await opened.verify();
+    return content;
   } finally {
-    await handle.close();
+    await opened.handle.close();
   }
 }
 
@@ -487,9 +499,7 @@ export class FileMemoryStore {
     const file = join(directory, "memory.json");
     let memory: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     try {
-      const info = await stat(file);
-      if (info.size > 1_048_576) throw new Error("Project memory exceeds the 1 MiB safety limit");
-      const parsed = JSON.parse(await readFile(file, "utf8")) as unknown;
+      const parsed = JSON.parse((await readVerifiedFile(file, directory, 1_048_576)).toString("utf8")) as unknown;
       const record = asRecord(parsed);
       if (!record) throw new Error("Project memory must contain a JSON object");
       memory = Object.assign(Object.create(null) as Record<string, unknown>, record);
@@ -525,13 +535,7 @@ export class FileMemoryStore {
     if (changed) {
       const serialized = JSON.stringify(memory, null, 2);
       if (byteLength(serialized) > 1_048_576) throw new Error("Project memory exceeds the 1 MiB safety limit");
-      const temporary = join(directory, `memory.${process.pid}.${randomUUID()}.tmp`);
-      try {
-        await writeFile(temporary, serialized, { encoding: "utf8", mode: 0o600 });
-        await rename(temporary, file);
-      } finally {
-        await rm(temporary, { force: true });
-      }
+      await atomicWriteVerifiedFile(file, directory, serialized);
     }
     return { value: result, metadata: { key, operation } };
   }
@@ -600,9 +604,11 @@ export class NodeRuntimeServices implements RuntimeServices {
         },
         performHttp: (request) => this.#performHttp(request),
         authorizeProcess: (request) => this.#authorizeProcess(request),
+        executeProcess: (request) => this.#executeProcess(request),
         authorizeFile: () => options.allowFileSystem === true,
         executeModule: (request) => this.#executeModule(request),
         webSearch: (request) => this.#webSearch(request),
+        webScrape: (request) => this.#webScrape(request),
       },
     });
   }
@@ -710,6 +716,10 @@ export class NodeRuntimeServices implements RuntimeServices {
 
   resolveSecret(reference: string): string | undefined {
     return this.resolveConnectionSecret(reference);
+  }
+
+  fetchProvider(url: string | URL, init: RequestInit | undefined): Promise<Response> {
+    return guardedFetch(true, { maxStreamBytes: 16 * 1_048_576 })(url, init);
   }
 
   releaseRun(runId: string): void {
@@ -859,40 +869,133 @@ export class NodeRuntimeServices implements RuntimeServices {
       if (value === undefined) throw new Error(`Connection '${profile.id}' credential '${field}' is unavailable`);
       headers.set(name, value);
     }
-    return fetch(new Request(capability.request, { headers, redirect: "error" }));
+    const body = capability.request.body ? Buffer.from(await capability.request.arrayBuffer()) : undefined;
+    return guardedFetch(true)(capability.url, {
+      method: capability.request.method,
+      headers,
+      ...(body ? { body } : {}),
+      signal: capability.request.signal,
+      redirect: "error",
+    });
   }
 
   async #authorizeProcess(request: ProcessCapabilityRequest): Promise<boolean> {
-    if (!request.connectionId || !isAbsolute(request.command)) return false;
-    const commandInfo = await lstat(request.command).catch(() => undefined);
-    if (!commandInfo?.isFile() || commandInfo.isSymbolicLink()) return false;
-    const command = await realpath(request.command).catch(() => undefined);
-    if (!command || (process.platform === "win32"
-      ? command.toLocaleLowerCase() !== resolve(request.command).toLocaleLowerCase()
-      : command !== resolve(request.command))) return false;
-    const allowed = this.#options.allowProcessCommands?.some((candidate) => process.platform === "win32"
-      ? candidate.toLocaleLowerCase() === command.toLocaleLowerCase() : candidate === command);
-    if (!allowed) return false;
+    if (!request.connectionId) return false;
     const profile = await this.connectionManager.require(request.connectionId);
-    if (profile.kind !== "local-runtime" || typeof profile.config.command !== "string") return false;
-    const configured = await realpath(profile.config.command).catch(() => undefined);
-    return configured !== undefined && (process.platform === "win32"
-      ? configured.toLocaleLowerCase() === command.toLocaleLowerCase() : configured === command);
+    if (profile.kind !== "local-runtime" || profile.config.sandbox !== "container") return false;
+    await this.connectionManager.assertProcessApproved(profile);
+    if (request.toolId === "builtin.code-runner") {
+      return profile.config.runtime === "node" || profile.config.runtime === "python";
+    }
+    return typeof profile.config.command === "string" && profile.config.command === request.command;
+  }
+
+  async #executeProcess(request: ProcessExecutionRequest): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    if (!request.connectionId) throw new Error("Process execution requires a Sandbox Connection");
+    const profile = await this.connectionManager.require(request.connectionId, "local-runtime");
+    if (profile.config.sandbox !== "container") throw new Error(
+      `Local Runtime '${profile.name}' is not an isolated container sandbox`,
+    );
+    const runtime = profile.config.runtime as "node" | "python" | "shell" | "custom";
+    const command = request.toolId === "builtin.code-runner"
+      ? runtime === "node" ? ["node", "-"] : runtime === "python" ? ["python", "-"] : []
+      : typeof profile.config.command === "string"
+        ? [profile.config.command, ...(Array.isArray(profile.config.args) ? profile.config.args as string[] : []), ...request.args]
+        : [];
+    if (!command.length) throw new Error(`Sandbox '${profile.name}' cannot execute Tool '${request.toolId}'`);
+    return this.#runContainer(profile, request, command);
+  }
+
+  async #runContainer(
+    profile: ConnectionProfile,
+    request: ProcessExecutionRequest,
+    command: readonly string[],
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const imageId = await this.connectionManager.assertProcessApproved(profile);
+    if (!imageId) throw new Error(`Local Runtime '${profile.name}' has no approved container image`);
+    const engine = await canonicalExecutable(profile.config.engine, profile.id);
+    const name = `harnest-${randomUUID()}`;
+    const engineEnvironment = containerEngineEnvironment();
+    try {
+      return await runBoundedProcess({
+        ...request,
+        command: engine.path,
+        args: containerRunArguments(profile, name, command, [], imageId),
+        cwd: dirname(engine.path),
+        environment: engineEnvironment,
+      });
+    } finally {
+      await runBoundedProcess({
+        toolId: `${request.toolId}:cleanup`, command: engine.path, args: ["rm", "--force", name],
+        cwd: dirname(engine.path), stdin: "", timeoutMs: 5_000, maxInputBytes: 1,
+        maxOutputBytes: 64 * 1_024, signal: new AbortController().signal, environment: engineEnvironment,
+      }).catch(() => undefined);
+    }
   }
 
   async #executeModule(request: ModuleExecutionRequest): Promise<unknown> {
     if (this.#options.allowModuleExecution !== true) {
       throw new Error(`TypeScript Tool '${request.toolId}' requires reviewed module execution permission`);
     }
-    const specifier = isAbsolute(request.resolvedModule)
-      ? pathToFileURL(request.resolvedModule).href
-      : await moduleUrl(request.resolvedModule, this.#projectDirectory, "TOOL_MODULE_UNTRUSTED");
-    const loaded = await importModule(specifier);
-    const candidate = request.exportName === "default" ? loaded.default : loaded[request.exportName];
-    if (typeof candidate !== "function") {
-      throw new Error(`TypeScript Tool '${request.toolId}' export '${request.exportName}' is not a function`);
+    if (!request.connectionId) throw new Error(`TypeScript Tool '${request.toolId}' requires a Sandbox Connection`);
+    const profile = await this.connectionManager.require(request.connectionId, "local-runtime");
+    if (profile.config.sandbox !== "container" || profile.config.runtime !== "node") throw new Error(
+      `TypeScript Tool '${request.toolId}' requires an approved Node container sandbox`,
+    );
+    const bundled = await build({
+      absWorkingDir: this.#projectDirectory,
+      entryPoints: [request.resolvedModule],
+      bundle: true,
+      format: "cjs",
+      platform: "node",
+      target: "node20",
+      write: false,
+      logLevel: "silent",
+      legalComments: "none",
+    });
+    const source = bundled.outputFiles[0]?.text;
+    if (!source) throw new Error(`TypeScript Tool '${request.toolId}' could not be bundled`);
+    const marker = `__HARNEST_RESULT_${randomUUID()}__`;
+    const input = Buffer.from(JSON.stringify(request.input), "utf8").toString("base64");
+    const safeContext = Buffer.from(JSON.stringify({
+      runId: request.context.runId,
+      nodeId: request.context.nodeId,
+      iteration: request.context.iteration,
+    }), "utf8").toString("base64");
+    const script = `${source}\n;(async () => {\n`
+      + `const candidate = ${request.exportName === "default" ? "module.exports.default ?? module.exports" : `module.exports[${JSON.stringify(request.exportName)}]`};\n`
+      + `if (typeof candidate !== "function") throw new Error(${JSON.stringify(`Export '${request.exportName}' is not a function`)});\n`
+      + `const input = JSON.parse(Buffer.from(${JSON.stringify(input)}, "base64").toString("utf8"));\n`
+      + `const values = JSON.parse(Buffer.from(${JSON.stringify(safeContext)}, "base64").toString("utf8"));\n`
+      + `const context = Object.freeze({ ...values, signal: new AbortController().signal, resolveSecret: () => undefined });\n`
+      + `const value = await candidate(input, context);\n`
+      + `process.stdout.write("\\n${marker}" + Buffer.from(JSON.stringify({ ok: true, value: value === undefined ? null : value })).toString("base64") + "\\n");\n`
+      + `})().catch((error) => { process.stdout.write("\\n${marker}" + Buffer.from(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) })).toString("base64") + "\\n"); process.exitCode = 1; });\n`;
+    const result = await this.#runContainer(profile, {
+      toolId: request.toolId,
+      command: "node",
+      args: ["-"],
+      cwd: this.#projectDirectory,
+      stdin: script,
+      timeoutMs: request.timeoutMs,
+      maxInputBytes: request.maxInputBytes,
+      maxOutputBytes: request.maxOutputBytes,
+      signal: request.signal,
+      connectionId: request.connectionId,
+    }, ["node", "-"]);
+    const offset = result.stdout.lastIndexOf(marker);
+    const encoded = offset < 0 ? "" : result.stdout.slice(offset + marker.length).split(/\r?\n/u, 1)[0]?.trim() ?? "";
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as unknown;
+    } catch {
+      throw new Error(`TypeScript Tool '${request.toolId}' returned an invalid sandbox response`);
     }
-    return candidate(request.input, request.context) as unknown;
+    const record = asRecord(envelope);
+    if (record?.ok !== true) throw new Error(
+      typeof record?.error === "string" ? record.error : `TypeScript Tool '${request.toolId}' failed in its sandbox`,
+    );
+    return record.value;
   }
 
   async #webSearch(request: WebSearchRequest): Promise<unknown> {
@@ -900,6 +1003,13 @@ export class NodeRuntimeServices implements RuntimeServices {
     const profile = await this.#assertToolConnection(["tool-service"], request.connectionId);
     if (!profile) throw new Error("Web Search Connection is unavailable");
     return executeWebSearchConnection(this.connectionManager, profile, request);
+  }
+
+  async #webScrape(request: WebScrapeRequest): Promise<unknown> {
+    if (!request.connectionId) throw new Error("Web Scrape requires a Tool Service Connection");
+    const profile = await this.#assertToolConnection(["tool-service"], request.connectionId);
+    if (!profile) throw new Error("Web Scrape Connection is unavailable");
+    return executeWebScrapeConnection(this.connectionManager, profile, request);
   }
 
   async requestToolApproval(
@@ -968,7 +1078,7 @@ export class NodeRuntimeServices implements RuntimeServices {
     if (config.source === "file") {
       const info = await stat(path);
       if (!info.isFile()) throw new Error("Context file path is not a file");
-      const selected = await readBounded(path, maxBytes);
+      const selected = await readBounded(path, root, maxBytes);
       return {
         value: selected.text,
         metadata: {
@@ -992,7 +1102,7 @@ export class NodeRuntimeServices implements RuntimeServices {
     for (const file of files) {
       if (scanRemaining <= 0) break;
       const readLimit = Math.min(65_536, scanRemaining);
-      const loaded = await readBounded(file.path, readLimit);
+      const loaded = await readBounded(file.path, root, readLimit);
       scanRemaining -= byteLength(loaded.text);
       documents.push({
         ...file,
@@ -1216,29 +1326,7 @@ export class NodeRuntimeServices implements RuntimeServices {
     const transportType = config.transport;
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
     if (transportType === "stdio") {
-      const requested = config.command;
-      if (typeof requested !== "string" || !requested) throw new Error("Raw MCP stdio command is invalid");
-      const nodeAlias = /^(?:node|node\.exe)$/i.test(requested);
-      const executable = await canonicalExecutable(nodeAlias ? await realpath(process.execPath) : requested);
-      const allowed = this.#options.allowProcessCommands?.some((candidate) => {
-        const left = process.platform === "win32" ? candidate.toLocaleLowerCase() : candidate;
-        const configured = process.platform === "win32" ? requested.toLocaleLowerCase() : requested;
-        const canonical = process.platform === "win32" ? executable.path.toLocaleLowerCase() : executable.path;
-        return left === configured || left === canonical;
-      });
-      if (!allowed) throw new Error(`MCP stdio command '${requested}' is not explicitly allowed`);
-      const args = config.args === undefined ? [] : config.args;
-      if (!Array.isArray(args) || args.length > 128
-        || args.some((argument) => typeof argument !== "string" || argument.length > 8_192)) {
-        throw new Error("Raw MCP stdio arguments are invalid");
-      }
-      transport = new StdioClientTransport({
-        command: executable.path,
-        args: args as string[],
-        cwd: this.#projectDirectory,
-        env: getDefaultEnvironment(),
-        stderr: "ignore",
-      });
+      throw new Error("Raw MCP stdio is disabled; create an isolated MCP stdio Connection or use MCP HTTP");
     } else if (transportType === "http") {
       if (typeof config.url !== "string") throw new Error("Raw MCP HTTP URL is invalid");
       const url = new URL(config.url);
@@ -1488,7 +1576,7 @@ export class FileRunStore {
     const directory = await storageDirectory(await this.#root, "runs");
     const file = await runFile(directory, runId);
     if (file.size > MAX_RUN_FILE_BYTES) throw new Error("Run trace exceeds the 8 MiB safety limit");
-    const selected = await readBounded(file.path, MAX_RUN_FILE_BYTES);
+    const selected = await readBounded(file.path, directory, MAX_RUN_FILE_BYTES);
     if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
     return parseRunEvents(runId, selected.text);
   }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { missingConnectionSetup, type ConnectionSummary } from "./connections";
 import { TEMPLATE_CATALOG, templateSpec } from "./studio-catalog";
 
 const allComponents = (id: Parameters<typeof templateSpec>[0]) => {
@@ -41,5 +42,18 @@ describe("Studio commissioning templates", () => {
   it("keeps RAG unready until real knowledge is supplied", () => {
     const knowledge = allComponents("rag").find((component) => component.id === "knowledge");
     expect(knowledge).toMatchObject({ type: "context", config: { source: "text", text: "" } });
+  });
+
+  it("stages the first missing declared Connection with its exact id", () => {
+    const connectedSearch = {
+      id: "search-main", kind: "tool-service", status: "connected",
+    } as ConnectionSummary;
+    expect(missingConnectionSetup([
+      { type: "tool", config: { tool: "builtin.web-search", connectionId: "search-main" } },
+      { type: "model", config: { connectionId: "gemini-main" } },
+    ], [connectedSearch], [])).toEqual({ id: "gemini-main", kind: "provider" });
+    expect(missingConnectionSetup([
+      { type: "tool", config: { tool: "builtin.code-runner", connectionId: "sandbox-main" } },
+    ], [], [])).toEqual({ id: "sandbox-main", kind: "local-runtime" });
   });
 });

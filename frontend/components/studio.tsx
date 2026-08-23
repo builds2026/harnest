@@ -4,6 +4,7 @@ import {
   BUILTIN_COMPONENT_MANIFESTS,
   parseSpec,
   stringifySpec,
+  skillConnectionRequirement,
   validateCandidateConnection,
   type ComponentManifest,
   type Diagnostic,
@@ -62,7 +63,7 @@ import { ConnectionManager } from "./connection-manager";
 import { CompatiblePicker } from "./compatible-picker";
 import { CustomToolManager } from "./custom-tool-manager";
 import { SkillManager } from "./skill-manager";
-import { connectionCanRun, type ConnectionKind, type ConnectionSummary } from "@/lib/connections";
+import { connectionCanRun, missingConnectionSetup, type ConnectionKind, type ConnectionSummary } from "@/lib/connections";
 import {
   CONNECTION_TYPE_CATALOG,
   TEMPLATE_CATALOG,
@@ -98,6 +99,7 @@ type RunPhase = "idle" | "starting" | "streaming" | "cancelling" | "cancelled" |
 type DockTab = "yaml" | "problems" | "run" | "tests" | "trace";
 
 type AttachmentPicker = { nodeId: string; slot: "tools" | "skills"; pendingItemId?: string };
+type PendingSkillAttach = { nodeId: string; skillId: string };
 
 interface PaletteViewItem {
   readonly key: string;
@@ -289,10 +291,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     connectionTypes: CONNECTION_TYPE_CATALOG,
   });
   const [connections, setConnections] = useState<ConnectionSummary[]>([]);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [connectionManagerOpen, setConnectionManagerOpen] = useState(false);
   const [requestedConnectionKind, setRequestedConnectionKind] = useState<ConnectionKind>();
+  const [requestedConnectionId, setRequestedConnectionId] = useState<string>();
   const [connectionTargetNodeId, setConnectionTargetNodeId] = useState<string>();
   const [attachmentPicker, setAttachmentPicker] = useState<AttachmentPicker>();
+  const [pendingSkillAttach, setPendingSkillAttach] = useState<PendingSkillAttach>();
   const [customToolOpen, setCustomToolOpen] = useState(false);
   const [skillManagerOpen, setSkillManagerOpen] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<TemplateCatalogItem["id"]>();
@@ -326,6 +331,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     edgeIds: new Set(),
   });
   const abortRef = useRef<AbortController | null>(null);
+  const autoSetup = useRef(initial.exists);
+  const autoSetupProgress = useRef(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const reactFlow = useReactFlow<HarnessNode, HarnessEdge>();
   useEffect(() => {
@@ -350,9 +357,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         if (!response.ok) throw new Error(await responseMessage(response));
         return response.json() as Promise<{ connections: ConnectionSummary[] }>;
       })
-      .then((connectionPayload) => setConnections(connectionPayload.connections))
+      .then((connectionPayload) => {
+        setConnections(connectionPayload.connections);
+        setConnectionsLoaded(true);
+      })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) setStatusNote(error instanceof Error ? error.message : "Connections could not be loaded");
+        if (!controller.signal.aborted) {
+          setConnectionsLoaded(true);
+          setStatusNote(error instanceof Error ? error.message : "Connections could not be loaded");
+        }
       });
     try {
       const storedFavorites = JSON.parse(localStorage.getItem(FAVORITES_KEY) ?? "[]") as unknown;
@@ -659,11 +672,33 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     replaceViewDraft({ ...viewDraft, nodes }, "semantic");
   }, [graphLocked, replaceViewDraft, viewDraft]);
 
-  const openConnections = useCallback((kind?: ConnectionKind, targetNodeId?: string) => {
+  const openConnections = useCallback((kind?: ConnectionKind, targetNodeId?: string, requestedId?: string) => {
     setRequestedConnectionKind(kind);
+    setRequestedConnectionId(requestedId);
     setConnectionTargetNodeId(targetNodeId);
     setConnectionManagerOpen(true);
   }, []);
+
+  useEffect(() => {
+    if (!autoSetup.current || !connectionsLoaded || connectionManagerOpen
+      || attachmentPicker || customToolOpen || skillManagerOpen) return;
+    const components = [
+      ...document.draft.nodes,
+      ...Object.values(document.draft.subgraphs).flatMap((graph) => graph.nodes),
+    ].map((node) => node.data.component);
+    const pending = missingConnectionSetup(components, connections, studioCatalog.tools);
+    if (!pending) {
+      if (autoSetupProgress.current) {
+        autoSetup.current = false;
+        setStatusNote("All declared Connections are ready.");
+      }
+      return;
+    }
+    autoSetupProgress.current = true;
+    openConnections(pending.kind, undefined, pending.id);
+    setStatusNote(`Setup needed · connect '${pending.id}'. Harnest will continue with the next requirement automatically.`);
+  }, [attachmentPicker, connectionManagerOpen, connections, connectionsLoaded, customToolOpen,
+    document.draft.nodes, document.draft.subgraphs, openConnections, skillManagerOpen, studioCatalog.tools]);
 
   const addTool = useCallback((
     tool: ToolCatalogItem,
@@ -733,10 +768,6 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const attachSkill = useCallback((skill: SkillCatalogItem, nodeId: string) => {
     const agent = viewDraft.nodes.find((node) => node.id === nodeId);
     if (!agent) return;
-    if (skill.scriptsPresent && !window.confirm(
-      `${skill.label} includes scripts from ${JSON.stringify(skill.provenance ?? { source: skill.source })}. `
-      + "Attaching loads SKILL.md instructions only; scripts remain inaccessible without separate resource approval. Continue?",
-    )) return;
     const attached = viewDraft.edges.some((edge) => edge.target === nodeId && edge.targetHandle === "skills"
       && viewDraft.nodes.some((node) => node.id === edge.source && node.data.component.type === "skill"
         && node.data.component.config.skill === skill.id));
@@ -745,15 +776,78 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       setAttachmentPicker(undefined);
       return;
     }
+    const incoming = viewDraft.edges.filter((edge) => edge.target === nodeId)
+      .flatMap((edge) => viewDraft.nodes.filter((node) => node.id === edge.source));
+    const attachedToolIds = new Set(incoming.filter((node) => node.data.component.type === "tool")
+      .map((node) => (node.data.component.config as Record<string, unknown>).tool)
+      .filter((id): id is string => typeof id === "string"));
+    const missingToolId = skill.requirements?.tools.find((id) => !attachedToolIds.has(id));
+    if (missingToolId) {
+      const tool = studioCatalog.tools.find((candidate) => candidate.id === missingToolId && candidate.installed);
+      setPendingSkillAttach({ nodeId, skillId: skill.id });
+      if (tool) {
+        addTool(tool, nodeId);
+        setStatusNote(`${skill.label} needs ${tool.label}; adding and connecting it first.`);
+      } else {
+        setAttachmentPicker({ nodeId, slot: "tools" });
+        setStatusNote(`${skill.label} needs Tool '${missingToolId}'. Install or select it, then Harnest will resume the Skill.`);
+      }
+      return;
+    }
+    const connectedIds = new Set(incoming.map((node) => (node.data.component.config as Record<string, unknown>).connectionId)
+      .filter((id): id is string => typeof id === "string" && Boolean(id)));
+    const missingConnection = skill.requirements?.connections.map((requirement) => ({
+      requirement,
+      ...skillConnectionRequirement(requirement),
+    })).find(({ id }) => !connectedIds.has(id));
+    if (missingConnection) {
+      const saved = connections.find((connection) => connection.id === missingConnection.id);
+      const kind = missingConnection.kind ?? saved?.kind;
+      const target = incoming.find((node) => {
+        if (kind === "provider") return node.data.component.type === "model";
+        if (node.data.component.type !== "tool") return false;
+        const toolId = (node.data.component.config as Record<string, unknown>).tool;
+        const tool = studioCatalog.tools.find((candidate) => candidate.id === toolId);
+        return Boolean(kind && tool?.connectionKinds?.includes(kind));
+      });
+      setAttachmentPicker({ nodeId, slot: "skills", pendingItemId: skill.id });
+      openConnections(kind, target?.id, missingConnection.id);
+      setStatusNote(`${skill.label} needs Connection '${missingConnection.id}'. Connect it once; Skill setup will resume automatically.`);
+      return;
+    }
+    if (skill.scriptsPresent && !window.confirm(
+      `${skill.label} includes scripts from ${JSON.stringify(skill.provenance ?? { source: skill.source })}. `
+      + "Only separately reviewed SHA-256 hashes can be loaded. Attach the instructions now?",
+    )) return;
     const position = {
       x: agent.position.x - 300,
       y: agent.position.y + 230 + viewDraft.nodes.filter((node) => node.position.x < agent.position.x).length * 24,
     };
     addComponent("skill", position, { skill: skill.id }, { nodeId, slot: "skills" });
     markRecent(`skills:${skill.id}`);
+    setPendingSkillAttach(undefined);
     setAttachmentPicker(undefined);
-    setStatusNote(`${skill.label} enabled on ${nodeId}. Validate its tools, connections, and trust before running.`);
-  }, [addComponent, markRecent, viewDraft.edges, viewDraft.nodes]);
+    const permissions = skill.requirements?.permissions ?? [];
+    setStatusNote(permissions.length
+      ? `${skill.label} enabled · Validate host permissions: ${permissions.join(", ")}.`
+      : `${skill.label} enabled on ${nodeId}.`);
+  }, [addComponent, addTool, connections, markRecent, openConnections, studioCatalog.tools, viewDraft.edges, viewDraft.nodes]);
+
+  useEffect(() => {
+    if (!pendingSkillAttach || connectionManagerOpen) return;
+    const skill = studioCatalog.skills.find((candidate) => candidate.id === pendingSkillAttach.skillId);
+    if (!skill) {
+      setPendingSkillAttach(undefined);
+      return;
+    }
+    const attachedTools = new Set(viewDraft.edges.filter((edge) => edge.target === pendingSkillAttach.nodeId)
+      .flatMap((edge) => viewDraft.nodes.filter((node) => node.id === edge.source && node.data.component.type === "tool"))
+      .map((node) => (node.data.component.config as Record<string, unknown>).tool)
+      .filter((id): id is string => typeof id === "string"));
+    if (skill.requirements?.tools.some((id) => !attachedTools.has(id))) return;
+    setPendingSkillAttach(undefined);
+    attachSkill(skill, pendingSkillAttach.nodeId);
+  }, [attachSkill, connectionManagerOpen, pendingSkillAttach, studioCatalog.skills, viewDraft.edges, viewDraft.nodes]);
 
   const applyTemplate = useCallback((template: TemplateCatalogItem) => {
     if (dirty && document.draft.nodes.length && !window.confirm("Replace the current unsaved graph with this template?")) return;
@@ -814,7 +908,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         config: { ...(target.data.component.config as Record<string, unknown>), connectionId: connection.id },
       } as HarnessComponent);
     }
-    if (!connectionTargetNodeId && !attachmentPicker) {
+    if (!connectionTargetNodeId && (!attachmentPicker || attachmentPicker.slot === "skills")) {
       const accepts = (component: HarnessComponent) => {
         const config = component.config as Record<string, unknown>;
         if (typeof config.connectionId === "string" && config.connectionId) return false;
@@ -856,7 +950,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         if (tool) addTool(tool, attachmentPicker.nodeId, connection);
       } else {
         const skill = studioCatalog.skills.find((item) => item.id === attachmentPicker.pendingItemId);
-        if (skill) attachSkill(skill, attachmentPicker.nodeId);
+        if (skill) setPendingSkillAttach({ nodeId: attachmentPicker.nodeId, skillId: skill.id });
       }
     }
     const needsMcpDiscovery = !attachmentPicker
@@ -866,12 +960,14 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         && node.data.component.config.source === "mcp" && !node.data.component.config.tool);
     if (needsMcpDiscovery) {
       setRequestedConnectionKind(undefined);
+      setRequestedConnectionId(undefined);
       setConnectionTargetNodeId(undefined);
       setStatusNote("MCP connected · Test and Discover tools here, then equip the Agent from its + Tool picker.");
       return;
     }
     setConnectionManagerOpen(false);
     setRequestedConnectionKind(undefined);
+    setRequestedConnectionId(undefined);
     setConnectionTargetNodeId(undefined);
     if (!attachmentPicker && selectedTemplateId) {
       const requirements = studioCatalog.templates.find((template) => template.id === selectedTemplateId)?.connectionKinds ?? [];
@@ -1401,7 +1497,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             onClick={() => { setPaletteKind(kind); setPaletteCategory("all"); setPaletteQuery(""); }}
           >{kind}</button>)}
         </div>
-        {(paletteKind === "tools" || paletteKind === "skills") && <div className="palette-create"><button className="button" onClick={() => paletteKind === "tools" ? setCustomToolOpen(true) : setSkillManagerOpen(true)}>{paletteKind === "tools" ? "New custom tool" : "Add skill"}</button></div>}
+        {(paletteKind === "tools" || paletteKind === "skills") && <div className="palette-create"><button className="button" onClick={() => paletteKind === "tools" ? setCustomToolOpen(true) : setSkillManagerOpen(true)}>{paletteKind === "tools" ? "New custom tool" : "Manage skills"}</button></div>}
         <div className="palette-filters">
           <label className="sr-only" htmlFor="palette-search">Search palette</label>
           <input id="palette-search" type="search" placeholder={`Search ${paletteKind}`} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)} />
@@ -1665,7 +1761,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         connections={connections}
         definitions={studioCatalog.connectionTypes.length ? studioCatalog.connectionTypes : CONNECTION_TYPE_CATALOG}
         requestedKind={requestedConnectionKind}
-        onClose={() => { setConnectionManagerOpen(false); setRequestedConnectionKind(undefined); setConnectionTargetNodeId(undefined); }}
+        requestedId={requestedConnectionId}
+        onClose={() => { autoSetup.current = false; setConnectionManagerOpen(false); setRequestedConnectionKind(undefined); setRequestedConnectionId(undefined); setConnectionTargetNodeId(undefined); }}
         onChanged={(next) => {
           setConnections(next);
           void refreshStudioCatalog().catch(() => setStatusNote("Connection saved, but the Tool catalog could not be refreshed."));

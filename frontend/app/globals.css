@@ -1126,8 +1126,13 @@ button:disabled {
 }
 
 .advanced-panel > .field-grid,
-.advanced-panel > .field {
+.advanced-panel > .field,
+.advanced-panel > .connection-card-actions {
   margin: 0 10px 10px;
+}
+
+.connection-card > .advanced-panel {
+  margin-top: 8px;
 }
 
 .sheet-backdrop,

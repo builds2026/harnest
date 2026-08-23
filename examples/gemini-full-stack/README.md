@@ -1,30 +1,40 @@
-# Gemini assistant and full-stack acceptance test
+# Gemini research + code harness
 
-`harnest.yaml` is a practical one-call Korean assistant. It uses Gemini 3.5 Flash-Lite and
-returns the answer directly as text. `harnest.acceptance.yaml` is the slower exhaustive graph
-that exercises Context, Memory, Skill, Tool calls, evaluation, Loop, Router, Join, and Trace.
+`harnest.yaml` is the practical harness: Gemini, static Context, project Memory, Web Search,
+Web Scrape, an isolated Code Runner, bounded multi-turn Tool use, text output, and persisted Trace.
+Secrets never appear in YAML.
 
-It uses no stored key. Create a key in [Google AI Studio](https://aistudio.google.com/) and keep
-it only in the `GEMINI_API_KEY` environment variable. The YAML deliberately contains only the
-`env:GEMINI_API_KEY` reference.
+## Easiest setup: Studio
 
 ```powershell
-$env:GEMINI_API_KEY = "your-key-here"
-npm run harnest -- validate examples/gemini-full-stack/harnest.yaml -- --allow-modules
-npm run harnest -- run examples/gemini-full-stack/harnest.yaml -- --input "서울의 봄 날씨 특징을 간단히 설명해줘"
+npm run harnest -- studio examples/gemini-full-stack/harnest.yaml
 ```
 
-For the practical assistant Studio, no file or Tool capability is needed:
+Studio reads the declared IDs and opens the three missing Connections in order:
+
+1. `gemini-main` — choose Google AI Studio and paste its API key.
+2. `web-main` — choose Firecrawl and paste its API key.
+3. `sandbox-main` — choose Node.js; Docker or Podman is detected, the image is pulled, tested, and approved.
+
+Save, Validate, enter a request, and Run. Tool calls show one bounded approval dialog before
+external transfer or sandbox execution. Run output and every node/tool event appear in Trace.
+
+## CLI setup
 
 ```powershell
-npm run harnest -- studio examples/gemini-full-stack/harnest.yaml -- --port 3000
+$env:GEMINI_API_KEY = "your-google-ai-studio-key"
+$env:FIRECRAWL_API_KEY = "your-firecrawl-key"
+
+npm run harnest -- connect gemini examples/gemini-full-stack/harnest.yaml -- --id gemini-main --secret-env GEMINI_API_KEY
+npm run harnest -- connect firecrawl examples/gemini-full-stack/harnest.yaml -- --id web-main --secret-env FIRECRAWL_API_KEY
+npm run harnest -- connect sandbox examples/gemini-full-stack/harnest.yaml -- --id sandbox-main --runtime node
+npm run harnest -- validate examples/gemini-full-stack/harnest.yaml
+npm run harnest -- run examples/gemini-full-stack/harnest.yaml -- --input "공식 출처를 검색하고 17*23을 코드로 검산해줘" --approve-tool builtin.web-search --approve-tool builtin.web-scrape --approve-tool builtin.code-runner
 ```
 
-Run the exhaustive acceptance graph only when testing every component:
+For a self-hosted SearXNG instance, create `web-main` with `connect searxng --url <.../search>`.
+SearXNG provides Search only, so remove the Web Scrape node or use a custom scrape mapping.
 
-```powershell
-npm run harnest -- test examples/gemini-full-stack/harnest.acceptance.yaml -- --allow-modules --allow-files --context-root knowledge --approve-tool demo.fixture-check --approve-tool demo.release-check
-```
-
-The acceptance graph deliberately makes two Gemini requests for the function-call round trip,
-so it is a feature test rather than a chat configuration.
+`harnest.acceptance.yaml` remains the slower engine acceptance graph for Context files, Memory,
+Skill resources, custom Tools, evaluation, Loop, Router, Join, and schema output. It is a test
+fixture, not the everyday assistant configuration.

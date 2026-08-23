@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createHash } from "node:crypto";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,9 +16,11 @@ import {
 } from "../src/index.js";
 import {
   ConnectionManager,
+  guardedFetch,
   mcpToolApprovalId,
   NodeRuntimeServices,
 } from "../src/node.js";
+import { credentialBackendCommand, pinnedLookup } from "../src/node-connections.js";
 
 const temporaryRoots: string[] = [];
 
@@ -43,52 +46,111 @@ afterEach(async () => {
 });
 
 describe.sequential("ConnectionManager credential boundary", () => {
+  it("uses OS credential stores without placing the vault key in command arguments", () => {
+    const id = "0123456789abcdef0123456789abcdef";
+    const mac = credentialBackendCommand("darwin", "store", id);
+    const linux = credentialBackendCommand("linux", "store", id);
+    expect(mac).toMatchObject({ protection: "macos-keychain", args: expect.arrayContaining(["-w"]) });
+    expect(mac.args.at(-1)).toBe("-w");
+    expect(linux).toMatchObject({ protection: "linux-secret-service", args: expect.arrayContaining(["store"]) });
+    expect([...mac.args, ...linux.args].some((argument) => /^[A-Za-z0-9+/]{43}=$/u.test(argument))).toBe(false);
+    expect(() => credentialBackendCommand("freebsd", "store", id)).toThrow(/DPAPI.*Keychain.*Secret Service/);
+  });
+
+  it("rejects hostnames that resolve to private addresses before connecting", async () => {
+    await expect(guardedFetch(true)("https://localhost/private")).rejects.toThrow(/private or reserved address/);
+    await expect(guardedFetch(true)(new Request("https://localhost/private")))
+      .rejects.toThrow(/private or reserved address/);
+  });
+
+  it("returns a pinned address in both Node lookup callback shapes", async () => {
+    const lookup = pinnedLookup({ address: "8.8.8.8", family: 4 });
+    await expect(new Promise((resolve, reject) => lookup("example.test", { all: true }, (error, addresses) => {
+      if (error) reject(error); else resolve(addresses);
+    }))).resolves.toEqual([{ address: "8.8.8.8", family: 4 }]);
+    await expect(new Promise((resolve, reject) => lookup("example.test", {}, (error, address, family) => {
+      if (error) reject(error); else resolve({ address, family });
+    }))).resolves.toEqual({ address: "8.8.8.8", family: 4 });
+  });
+
   it("tests and executes a SearXNG Search Connection through the shared Web Search contract", async () => {
     const { project, userData } = await temporaryProject();
-    const manager = new ConnectionManager(project, { userDataDirectory: userData });
-    const connection = await manager.create({
-      id: "searxng_fixture",
-      scope: "project",
-      kind: "tool-service",
-      name: "SearXNG fixture",
-      config: {
-        connector: "searxng",
-        url: "https://search.example.com/search",
-        method: "GET",
-        requestEncoding: "query",
-        queryParameter: "q",
-        limitParameter: "limit",
-        staticParameters: { format: "json" },
-        responseItemsPath: "/results",
-        snippetField: "content",
-      },
-    });
     const requests: string[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-      requests.push(input instanceof Request ? input.url : String(input));
-      return Response.json({ results: [{ title: "Harnest", url: "https://example.com/harnest", content: "Harness result" }] });
-    }));
-
-    await expect(manager.test(connection.id)).resolves.toMatchObject({ status: { state: "connected" } });
-    const services = new NodeRuntimeServices(project, { connectionManager: manager });
-    const result = await services.executeTool({
-      id: "builtin.web-search",
-      source: "builtin",
-      connectionId: connection.id,
-    }, { query: "agent harness", limit: 3 }, context);
-    expect(result.value).toEqual({
-      provider: "searxng",
-      results: [{
-        title: "Harnest",
-        url: "https://example.com/harnest",
-        snippet: "Harness result",
-        content: "Harness result",
-      }],
+    const server = createServer((request, outgoing) => {
+      requests.push(request.url ?? "");
+      outgoing.writeHead(200, { "content-type": "application/json" });
+      if (request.url === "/scrape") {
+        outgoing.end(JSON.stringify({ page: { title: "Public page", source: "http://8.8.8.8/page", markdown: "# Extracted" } }));
+        return;
+      }
+      outgoing.end(JSON.stringify({
+        results: [{ title: "Harnest", url: "https://example.com/harnest", content: "Harness result" }],
+        next: "page-2",
+      }));
     });
-    expect(requests).toHaveLength(2);
-    expect(new URL(requests[1]!).searchParams.get("q")).toBe("agent harness");
-    expect(new URL(requests[1]!).searchParams.get("format")).toBe("json");
-    await services.close();
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Search fixture did not bind a TCP port");
+      const manager = new ConnectionManager(project, { userDataDirectory: userData });
+      const connection = await manager.create({
+        id: "searxng_fixture",
+        scope: "project",
+        kind: "tool-service",
+        name: "SearXNG fixture",
+        config: {
+          connector: "searxng",
+          url: `http://127.0.0.1:${address.port}/search`,
+          method: "GET",
+          requestEncoding: "query",
+          queryParameter: "q",
+          limitParameter: "limit",
+          cursorParameter: "page",
+          nextCursorPath: "/next",
+          staticParameters: { format: "json" },
+          responseItemsPath: "/results",
+          snippetField: "content",
+          scrapeUrl: `http://127.0.0.1:${address.port}/scrape`,
+          scrapeUrlParameter: "url",
+          scrapeStaticParameters: { format: "markdown" },
+          scrapeContentPath: "/page/markdown",
+          scrapeTitlePath: "/page/title",
+          scrapeSourceUrlPath: "/page/source",
+        },
+      });
+      await expect(manager.test(connection.id)).resolves.toMatchObject({ status: { state: "connected" } });
+      const services = new NodeRuntimeServices(project, { connectionManager: manager });
+      const result = await services.executeTool({
+        id: "builtin.web-search",
+        source: "builtin",
+        connectionId: connection.id,
+      }, { query: "agent harness", limit: 3, cursor: "page-1" }, context);
+      expect(result.value).toEqual({
+        provider: "searxng",
+        nextCursor: "page-2",
+        results: [{
+          title: "Harnest",
+          url: "https://example.com/harnest",
+          snippet: "Harness result",
+          content: "Harness result",
+        }],
+      });
+      expect(requests).toHaveLength(2);
+      expect(new URL(requests[1]!, "http://fixture").searchParams.get("q")).toBe("agent harness");
+      expect(new URL(requests[1]!, "http://fixture").searchParams.get("format")).toBe("json");
+      expect(new URL(requests[1]!, "http://fixture").searchParams.get("page")).toBe("page-1");
+      await expect(services.executeTool({
+        id: "builtin.web-scrape",
+        source: "builtin",
+        connectionId: connection.id,
+      }, { url: "http://8.8.8.8/page" }, context)).resolves.toMatchObject({ value: {
+        provider: "searxng", url: "http://8.8.8.8/page", title: "Public page", content: "# Extracted",
+      } });
+      expect(requests).toHaveLength(3);
+      await services.close();
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
   });
 
   it("marks a Firecrawl Search Connection without an API key as needing authentication", async () => {
@@ -109,6 +171,95 @@ describe.sequential("ConnectionManager credential boundary", () => {
 
     await expect(manager.test(connection.id)).rejects.toMatchObject({ code: "CONNECTION_TEST_FAILED" });
     await expect(manager.require(connection.id)).resolves.toMatchObject({ status: { state: "needs_auth" } });
+  });
+
+  it("probes generic HTTP API reachability and authentication status", async () => {
+    const { project, userData } = await temporaryProject();
+    const server = createServer((request, response) => response.writeHead(request.url === "/ready" ? 204 : 401).end());
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("HTTP fixture did not bind a TCP port");
+      const manager = new ConnectionManager(project, { userDataDirectory: userData });
+      await manager.create({
+        id: "http_ready_fixture", scope: "project", kind: "http-api", name: "Ready API",
+        config: { url: `http://127.0.0.1:${address.port}/ready` },
+      });
+      await manager.create({
+        id: "http_auth_fixture", scope: "project", kind: "http-api", name: "Auth API",
+        config: { url: `http://127.0.0.1:${address.port}/auth` },
+      });
+      await expect(manager.test("http_ready_fixture")).resolves.toMatchObject({ status: { state: "connected" } });
+      await expect(manager.test("http_auth_fixture")).rejects.toMatchObject({ code: "CONNECTION_TEST_FAILED" });
+      await expect(manager.require("http_auth_fixture")).resolves.toMatchObject({ status: { state: "needs_auth" } });
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  it("runs code through an approved resource-bounded container engine", async () => {
+    if (process.platform !== "win32") return;
+    const { project, userData } = await temporaryProject();
+    const engineDirectory = join(project, "fake-container-engine");
+    await mkdir(engineDirectory);
+    const engine = join(engineDirectory, "docker.exe");
+    await copyFile(process.execPath, engine);
+    await writeFile(join(engineDirectory, "image"), `console.log("sha256:${"a".repeat(64)}")\n`, "utf8");
+    await writeFile(join(engineDirectory, "run"), `const { spawn } = require("node:child_process")
+if (!process.argv.includes("sha256:${"a".repeat(64)}")) process.exit(2)
+const child = spawn(process.execPath, ["-"], { stdio: ["pipe", "inherit", "inherit"] })
+process.stdin.pipe(child.stdin)
+child.on("exit", (code) => process.exit(code ?? 1))
+`, "utf8");
+    await writeFile(join(engineDirectory, "rm"), "process.exit(0)\n", "utf8");
+    const manager = new ConnectionManager(project, { userDataDirectory: userData });
+    const connection = await manager.create({
+      id: "sandbox_fixture",
+      scope: "project",
+      kind: "local-runtime",
+      name: "Sandbox fixture",
+      config: {
+        sandbox: "container",
+        engine,
+        image: "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        runtime: "node",
+        network: "none",
+        memoryMb: 128,
+        cpus: 0.5,
+        pids: 16,
+      },
+    });
+    await expect(manager.test(connection.id)).resolves.toMatchObject({ status: { state: "connected" } });
+    await manager.approveProcess(connection.id);
+    const services = new NodeRuntimeServices(project, { connectionManager: manager });
+    await expect(services.executeTool({
+      id: "builtin.code-runner",
+      source: "builtin",
+      connectionId: connection.id,
+    }, { runtime: "node", code: "console.log(2 + 3)" }, context)).resolves.toMatchObject({
+      value: { stdout: "5\n", exitCode: 0 },
+    });
+    await writeFile(join(project, "custom-tool.ts"), "export default ({ value }: { value: number }) => ({ doubled: value * 2 })\n", "utf8");
+    await services.toolStore.save({
+      manifestVersion: "1",
+      id: "custom.isolated-module",
+      label: "Isolated module",
+      description: "Containerized TypeScript fixture.",
+      inputSchema: { type: "object", properties: { value: { type: "number" } }, required: ["value"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { doubled: { type: "number" } }, required: ["doubled"], additionalProperties: false },
+      connectionKinds: ["local-runtime"],
+      kind: "typescript-module",
+      source: "module",
+      module: "./custom-tool.ts",
+    });
+    const moduleServices = new NodeRuntimeServices(project, { connectionManager: manager, allowModuleExecution: true });
+    await expect(moduleServices.executeTool({
+      id: "custom.isolated-module",
+      source: "module",
+      connectionId: connection.id,
+    }, { value: 4 }, context)).resolves.toMatchObject({ value: { doubled: 8 } });
+    await moduleServices.close();
+    await services.close();
   });
 
   it("rejects unsafe JSON Schemas before persisting discovered MCP Tools", async () => {
@@ -547,6 +698,147 @@ describe.sequential("ConnectionManager credential boundary", () => {
     }
   }, 30_000);
 
+  it("completes discovery, PKCE consent, callback, refresh, scope re-consent, and revoke", async () => {
+    if (process.platform !== "win32") return;
+    const { project, userData } = await temporaryProject();
+    let issuer = "";
+    let redirectUrl = "";
+    let authorizationCount = 0;
+    let refreshCount = 0;
+    const codes = new Map<string, { challenge: string; scope: string }>();
+    const revoked: string[] = [];
+    const body = async (request: IncomingMessage) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      return Buffer.concat(chunks).toString("utf8");
+    };
+    const server = createServer(async (request, response) => {
+      try {
+        const url = new URL(request.url ?? "/", issuer || "http://127.0.0.1");
+        if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({
+            resource: `${issuer}/mcp`, authorization_servers: [issuer], scopes_supported: ["tools:read", "tools:write"],
+          }));
+          return;
+        }
+        if (url.pathname === "/.well-known/oauth-authorization-server") {
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({
+            issuer,
+            authorization_endpoint: `${issuer}/authorize`,
+            token_endpoint: `${issuer}/token`,
+            registration_endpoint: `${issuer}/register`,
+            revocation_endpoint: `${issuer}/revoke`,
+            response_types_supported: ["code"],
+            grant_types_supported: ["authorization_code", "refresh_token"],
+            token_endpoint_auth_methods_supported: ["none"],
+            code_challenge_methods_supported: ["S256"],
+            scopes_supported: ["tools:read", "tools:write", "offline_access"],
+          }));
+          return;
+        }
+        if (url.pathname === "/register") {
+          const registered = JSON.parse(await body(request)) as { redirect_uris?: string[] };
+          redirectUrl = registered.redirect_uris?.[0] ?? "";
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({ ...registered, client_id: "fixture-client", token_endpoint_auth_method: "none" }));
+          return;
+        }
+        if (url.pathname === "/authorize") {
+          authorizationCount += 1;
+          const code = `code-${authorizationCount}`;
+          codes.set(code, {
+            challenge: url.searchParams.get("code_challenge") ?? "",
+            scope: url.searchParams.get("scope") ?? "",
+          });
+          const callback = new URL(url.searchParams.get("redirect_uri") ?? redirectUrl);
+          callback.searchParams.set("code", code);
+          callback.searchParams.set("state", url.searchParams.get("state") ?? "");
+          response.writeHead(302, { location: callback.toString() }).end();
+          return;
+        }
+        if (url.pathname === "/token") {
+          const form = new URLSearchParams(await body(request));
+          if (form.get("grant_type") === "refresh_token") {
+            refreshCount += 1;
+            response.setHeader("content-type", "application/json");
+            response.end(JSON.stringify({
+              access_token: `refreshed-${refreshCount}`, refresh_token: form.get("refresh_token"), token_type: "Bearer",
+            }));
+            return;
+          }
+          const grant = codes.get(form.get("code") ?? "");
+          const verifier = form.get("code_verifier") ?? "";
+          if (!grant || createHash("sha256").update(verifier).digest("base64url") !== grant.challenge) {
+            response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "invalid_grant" }));
+            return;
+          }
+          response.setHeader("content-type", "application/json");
+          response.end(JSON.stringify({
+            access_token: `access-${authorizationCount}`,
+            refresh_token: `refresh-${authorizationCount}`,
+            token_type: "Bearer",
+            scope: grant.scope,
+          }));
+          return;
+        }
+        if (url.pathname === "/revoke") {
+          revoked.push(new URLSearchParams(await body(request)).get("token") ?? "");
+          response.writeHead(200).end();
+          return;
+        }
+        if (url.pathname === "/mcp") {
+          response.writeHead(403, {
+            "www-authenticate": `Bearer error="insufficient_scope", scope="tools:write"`,
+          }).end();
+          return;
+        }
+        response.writeHead(404).end();
+      } catch (error) {
+        response.writeHead(500).end(error instanceof Error ? error.message : "fixture failure");
+      }
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("OAuth E2E fixture did not bind");
+    const host = `127.0.0.1:${address.port}`;
+    issuer = `http://${host}`;
+    const manager = new ConnectionManager(project, { userDataDirectory: userData });
+    const authorize = async (scope: string) => {
+      const started = await manager.beginOAuth("oauth_e2e_fixture", {
+        redirectUrl: "http://127.0.0.1:43119/callback",
+        scope,
+        allowNetworkHosts: [host],
+      });
+      expect(started.status).toBe("redirect");
+      const consent = await fetch(started.authorizationUrl!, { redirect: "manual" });
+      const callback = new URL(consent.headers.get("location")!);
+      return manager.finishOAuth("oauth_e2e_fixture", callback.searchParams, { allowNetworkHosts: [host] });
+    };
+    try {
+      await manager.create({
+        id: "oauth_e2e_fixture", scope: "project", kind: "mcp", name: "OAuth E2E Fixture",
+        config: { transport: "http", url: `${issuer}/mcp`, oauth: true },
+      });
+      await expect(authorize("tools:read")).resolves.toMatchObject({ status: { state: "unknown" } });
+      await expect(manager.beginOAuth("oauth_e2e_fixture", {
+        redirectUrl: "http://127.0.0.1:43119/callback", allowNetworkHosts: [host],
+      })).resolves.toMatchObject({ status: "authorized" });
+      expect(refreshCount).toBe(1);
+      await expect(manager.test("oauth_e2e_fixture", { allowNetworkHosts: [host] }))
+        .rejects.toMatchObject({ code: "CONNECTION_TEST_FAILED" });
+      expect((await manager.require("oauth_e2e_fixture")).status.state).toBe("insufficient_scope");
+      await expect(authorize("tools:write")).resolves.toMatchObject({ status: { state: "unknown" } });
+      expect(authorizationCount).toBe(2);
+      await expect(manager.disconnect("oauth_e2e_fixture", { revoke: true, allowNetworkHosts: [host] }))
+        .resolves.toMatchObject({ status: { state: "disconnected" } });
+      expect(revoked).toEqual(["refresh-2", "access-2"]);
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  }, 30_000);
+
   it("bounds stalled OAuth discovery requests", async () => {
     if (process.platform !== "win32") return;
     const { project, userData } = await temporaryProject();
@@ -672,7 +964,6 @@ describe.sequential("saved MCP Connections", () => {
   it("requires a full stdio launch fingerprint and executes discovered Tools by Connection ID", async () => {
     const { project, userData } = await temporaryProject();
     const manager = new ConnectionManager(project, { userDataDirectory: userData });
-    const executable = await realpath(process.execPath);
     if (process.platform !== "win32") {
       await manager.create({
         id: "stdio_fixture",
@@ -686,6 +977,17 @@ describe.sequential("saved MCP Connections", () => {
     }
 
     const server = fileURLToPath(new URL("../../../examples/mcp-tool-agent/server.mjs", import.meta.url));
+    const engineDirectory = join(project, "fake-mcp-container-engine");
+    await mkdir(engineDirectory);
+    const engine = join(engineDirectory, "docker.exe");
+    await copyFile(process.execPath, engine);
+    await writeFile(join(engineDirectory, "image"), `console.log("sha256:${"b".repeat(64)}")\n`, "utf8");
+    await writeFile(join(engineDirectory, "run"), `const { spawn } = require("node:child_process")
+const serverIndex = process.argv.findIndex((value) => value.endsWith("server.mjs"))
+const child = spawn(process.execPath, process.argv.slice(serverIndex), { stdio: "inherit", env: process.env })
+child.on("exit", (code) => process.exit(code ?? 1))
+`, "utf8");
+    await writeFile(join(engineDirectory, "rm"), "process.exit(0)\n", "utf8");
     await manager.create({
       id: "stdio_fixture",
       scope: "project",
@@ -693,23 +995,29 @@ describe.sequential("saved MCP Connections", () => {
       name: "stdio Fixture",
       config: {
         transport: "stdio",
-        command: executable,
+        sandbox: "container",
+        engine,
+        image: `fixture@sha256:${"b".repeat(64)}`,
+        command: "node",
         args: [server],
+        network: "none",
+        memoryMb: 128,
+        cpus: 0.5,
+        pids: 16,
         environmentCredentials: { HARNEST_FIXTURE: "fixtureEnv" },
       },
     }, { fixtureEnv: "first" });
     const profile = await manager.require("stdio_fixture", "mcp");
     await expect(manager.assertProcessApproved(profile)).rejects.toMatchObject({ code: "PROCESS_APPROVAL_REQUIRED" });
     await manager.approveProcess(profile.id);
-    await expect(manager.assertProcessApproved(profile)).resolves.toBeUndefined();
+    await expect(manager.assertProcessApproved(profile)).resolves.toBe(`sha256:${"b".repeat(64)}`);
 
-    const tested = await manager.test(profile.id, { allowProcessCommands: [executable], timeoutMs: 10_000 });
+    const tested = await manager.test(profile.id, { timeoutMs: 10_000 });
     expect(tested.status.state).toBe("connected");
     expect(tested.tools?.map(({ name }) => name)).toEqual(expect.arrayContaining(["lookup-city", "fail-city"]));
 
     const services = new NodeRuntimeServices(project, {
       connectionManager: manager,
-      allowProcessCommands: [executable],
     });
     try {
       await expect(services.callMcpTool({
@@ -744,7 +1052,7 @@ describe.sequential("saved MCP Connections", () => {
     await manager.approveProcess(profile.id);
 
     await manager.update(profile.id, {
-      config: { transport: "stdio", command: executable, args: [server, "--changed"] },
+      config: { ...profile.config, args: [server, "--changed"] },
     });
     await expect(manager.assertProcessApproved(await manager.require(profile.id))).rejects.toMatchObject({
       code: "PROCESS_APPROVAL_REQUIRED",

@@ -2,6 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  DEFAULT_PROVIDER_MODELS,
+  DEFAULT_SANDBOX_IMAGES,
+  FIRECRAWL_CONNECTION_CONFIG,
+  SEARXNG_CONNECTION_CONFIG,
+} from "@harnest/core";
+import {
+  connectionCanRun,
   connectionKindLabel,
   type ConnectionAction,
   type ConnectionActionResult,
@@ -14,20 +21,16 @@ import type { ConnectionTypeCatalogItem } from "@/lib/studio-catalog";
 type ManagerMode = "list" | "kind" | "form";
 
 const emptyConfig = (kind: ConnectionKind): Record<string, unknown> => kind === "provider"
-  ? { adapter: "gemini", model: "gemini-3.5-flash-lite" }
+  ? { adapter: "gemini", model: DEFAULT_PROVIDER_MODELS.gemini }
   : kind === "tool-service"
-    ? {
-      connector: "firecrawl", url: "https://api.firecrawl.dev/v2/search", authScheme: "bearer",
-      method: "POST", requestEncoding: "json", queryParameter: "query", limitParameter: "limit",
-      staticParameters: { sources: ["web"] }, responseItemsPath: "/data/web",
-      titleField: "title", urlField: "url", snippetField: "description", contentField: "markdown",
-      testUrl: "https://api.firecrawl.dev/v2/team/credit-usage", testMethod: "GET",
-    }
+    ? { ...FIRECRAWL_CONNECTION_CONFIG }
     : kind === "mcp-http"
       ? { url: "", oauth: true }
       : kind === "http-api"
         ? { url: "" }
-    : { command: "", args: [] };
+        : kind === "local-runtime"
+          ? { sandbox: "container", runtime: "node", image: DEFAULT_SANDBOX_IMAGES.node, network: "none" }
+          : { sandbox: "container", image: "", command: "", args: [], network: "none" };
 
 const statusLabel = (status: ConnectionSummary["status"]) => ({
   unknown: "Not tested",
@@ -47,6 +50,7 @@ const requestError = async (response: Response) => {
 
 function ConnectionForm({
   connection,
+  requestedId,
   kind,
   definition,
   busy,
@@ -54,6 +58,7 @@ function ConnectionForm({
   onSaved,
 }: {
   connection?: ConnectionSummary;
+  requestedId?: string;
   kind: ConnectionKind;
   definition: ConnectionTypeCatalogItem;
   busy: boolean;
@@ -77,7 +82,7 @@ function ConnectionForm({
   const submit = (event: FormEvent) => {
     event.preventDefault();
     void onSaved({
-      ...(connection ? { id: connection.id } : {}),
+      ...((connection?.id ?? requestedId) ? { id: connection?.id ?? requestedId } : {}),
       name,
       kind,
       scope,
@@ -90,6 +95,7 @@ function ConnectionForm({
     <form className="connection-form" onSubmit={submit}>
       <div className="sheet-section-heading"><span>{connection ? "Edit connection" : "Connection settings"}</span><small>{definition.label}</small></div>
       <div className="field-grid">
+        {requestedId && !connection && <div className="source-review"><span>Required Connection id</span><code>{requestedId}</code><p>This immutable id comes from the Skill requirement and will be wired automatically.</p></div>}
         <div className="field"><label htmlFor="connection-name">Name</label><input ref={firstField} id="connection-name" required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></div>
         <div className="field"><label htmlFor="connection-scope">Scope</label><select id="connection-scope" disabled={Boolean(connection)} value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="project">This project</option><option value="user">All local projects</option></select><span className="field-help">Project connections stay beside this harness. User connections can be reused locally.</span></div>
         {kind === "provider" && <>
@@ -97,7 +103,7 @@ function ConnectionForm({
             const adapter = event.target.value === "registered" ? "" : event.target.value;
             setConfig({
               adapter,
-              model: adapter === "gemini" ? "gemini-3.5-flash-lite" : adapter === "ollama" ? "llama3.2" : "",
+              model: DEFAULT_PROVIDER_MODELS[adapter as keyof typeof DEFAULT_PROVIDER_MODELS] ?? "",
               ...(adapter === "ollama" ? { baseUrl: "http://127.0.0.1:11434" } : {}),
             });
           }}><option value="gemini">Google AI Studio</option><option value="openai">OpenAI / OpenAI-compatible</option><option value="anthropic">Anthropic</option><option value="ollama">Ollama</option><option value="registered">Registered custom adapter</option></select></div>
@@ -114,19 +120,9 @@ function ConnectionForm({
           <div className="field"><label htmlFor="connection-connector">Search service</label><select id="connection-connector" value={String(config.connector ?? "firecrawl")} onChange={(event) => {
             const connector = event.target.value;
             setConfig(connector === "firecrawl"
-              ? {
-                connector, url: "https://api.firecrawl.dev/v2/search", authScheme: "bearer",
-                method: "POST", requestEncoding: "json", queryParameter: "query", limitParameter: "limit",
-                staticParameters: { sources: ["web"] }, responseItemsPath: "/data/web",
-                titleField: "title", urlField: "url", snippetField: "description", contentField: "markdown",
-                testUrl: "https://api.firecrawl.dev/v2/team/credit-usage", testMethod: "GET",
-              }
+              ? { ...FIRECRAWL_CONNECTION_CONFIG }
               : connector === "searxng"
-                ? {
-                  connector, url: "", authScheme: "none", method: "GET", requestEncoding: "query",
-                  queryParameter: "q", limitParameter: "limit", staticParameters: { format: "json" },
-                  responseItemsPath: "/results", titleField: "title", urlField: "url", snippetField: "content",
-                }
+                ? { ...SEARXNG_CONNECTION_CONFIG }
                 : {
                   connector, url: "", authScheme: "none", method: "POST", requestEncoding: "json",
                   queryParameter: "query", limitParameter: "limit", responseItemsPath: "/results",
@@ -145,8 +141,13 @@ function ConnectionForm({
           <div className="field"><label htmlFor="connection-url">Server URL</label><input id="connection-url" type="url" required placeholder="https://…" value={String(config.url ?? "")} onChange={(event) => update("url", event.target.value)} /></div>
         )}
         {kind === "mcp-http" && <div className="field"><label htmlFor="connection-mcp-auth">Authentication</label><select id="connection-mcp-auth" value={config.oauth === true ? "oauth" : "token"} onChange={(event) => update("oauth", event.target.value === "oauth")}><option value="oauth">OAuth in browser · auto-discover</option><option value="token">Bearer token</option></select></div>}
-        {(kind === "mcp-stdio" || kind === "local-runtime") && <>
-          <div className="field"><label htmlFor="connection-command">Approved executable</label><input id="connection-command" required placeholder="C:\Program Files\nodejs\node.exe" value={String(config.command ?? "")} onChange={(event) => update("command", event.target.value)} /><span className="field-help">Use a canonical absolute path; bare PATH commands are rejected.</span></div>
+        {kind === "local-runtime" && <>
+          <div className="field"><label htmlFor="connection-runtime">Code runtime</label><select id="connection-runtime" value={String(config.runtime ?? "node")} onChange={(event) => setConfig((current) => ({ ...current, runtime: event.target.value, image: DEFAULT_SANDBOX_IMAGES[event.target.value as keyof typeof DEFAULT_SANDBOX_IMAGES] }))}><option value="node">Node.js</option><option value="python">Python</option></select></div>
+          <div className="field"><label htmlFor="connection-image">Sandbox image</label><input id="connection-image" required value={String(config.image ?? "")} onChange={(event) => update("image", event.target.value)} /><span className="field-help">Docker or Podman is detected automatically. Connect downloads this image once and runs code with no network or project mount.</span></div>
+        </>}
+        {kind === "mcp-stdio" && <>
+          <div className="field"><label htmlFor="connection-image">MCP container image</label><input id="connection-image" required placeholder="ghcr.io/owner/mcp-server:version" value={String(config.image ?? "")} onChange={(event) => update("image", event.target.value)} /><span className="field-help">Use an image that already contains the MCP server. Docker or Podman is detected automatically.</span></div>
+          <div className="field"><label htmlFor="connection-command">Command in image</label><input id="connection-command" required placeholder="node" value={String(config.command ?? "")} onChange={(event) => update("command", event.target.value)} /></div>
           <div className="field"><label htmlFor="connection-args">Arguments</label><input id="connection-args" placeholder="server.js --stdio" value={Array.isArray(config.args) ? config.args.join(" ") : ""} onChange={(event) => update("args", event.target.value.split(/\s+/).filter(Boolean))} /></div>
         </>}
         {definition.secretFields.filter((field) => !(field.id === "token"
@@ -173,6 +174,8 @@ function ConnectionForm({
             <div className="field"><label htmlFor="connection-title-field">Title field</label><input id="connection-title-field" required value={String(config.titleField ?? "title")} onChange={(event) => update("titleField", event.target.value)} /></div>
             <div className="field"><label htmlFor="connection-url-field">URL field</label><input id="connection-url-field" required value={String(config.urlField ?? "url")} onChange={(event) => update("urlField", event.target.value)} /></div>
             <div className="field"><label htmlFor="connection-snippet-field">Snippet field</label><input id="connection-snippet-field" value={String(config.snippetField ?? "snippet")} onChange={(event) => update("snippetField", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-scrape-url">Page extraction endpoint <span className="field-optional">optional</span></label><input id="connection-scrape-url" type="url" value={String(config.scrapeUrl ?? "")} onChange={(event) => setConfig((current) => { const next = { ...current }; if (event.target.value) next.scrapeUrl = event.target.value; else delete next.scrapeUrl; return next; })} /><span className="field-help">If set, this Connection also exposes Web Scrape. POST JSON must accept a <code>url</code> field.</span></div>
+            {Boolean(config.scrapeUrl) && <div className="field"><label htmlFor="connection-scrape-content">Extracted text JSON Pointer</label><input id="connection-scrape-content" value={String(config.scrapeContentPath ?? "/data/markdown")} onChange={(event) => update("scrapeContentPath", event.target.value)} /></div>}
           </>}
         </details>
       </div>
@@ -186,6 +189,7 @@ export function ConnectionManager({
   connections,
   definitions,
   requestedKind,
+  requestedId,
   onClose,
   onChanged,
   onComplete,
@@ -194,6 +198,7 @@ export function ConnectionManager({
   connections: readonly ConnectionSummary[];
   definitions: readonly ConnectionTypeCatalogItem[];
   requestedKind?: ConnectionKind;
+  requestedId?: string;
   onClose: () => void;
   onChanged: (connections: ConnectionSummary[]) => void;
   onComplete?: (connection: ConnectionSummary) => void;
@@ -209,12 +214,13 @@ export function ConnectionManager({
 
   useEffect(() => {
     if (!open) return;
-    setKind(requestedKind ?? "provider");
-    setMode(requestedKind ? "form" : "list");
-    setEditing(undefined);
+    const requested = requestedId ? connections.find((connection) => connection.id === requestedId) : undefined;
+    setKind(requested?.kind ?? requestedKind ?? "provider");
+    setMode(requestedKind && !requested ? "form" : "list");
+    setEditing(requested);
     setMessage("");
     queueMicrotask(() => search.current?.focus());
-  }, [open, requestedKind]);
+  }, [connections, open, requestedId, requestedKind]);
 
   useEffect(() => {
     if (!open) return;
@@ -257,9 +263,9 @@ export function ConnectionManager({
 
   const visible = useMemo(() => {
     const value = query.trim().toLocaleLowerCase();
-    return connections.filter((connection) => !value
-      || `${connection.name} ${connection.kind} ${connection.scope} ${connection.status}`.toLocaleLowerCase().includes(value));
-  }, [connections, query]);
+    return connections.filter((connection) => (!requestedId || connection.id === requestedId) && (!value
+      || `${connection.name} ${connection.kind} ${connection.scope} ${connection.status}`.toLocaleLowerCase().includes(value)));
+  }, [connections, query, requestedId]);
 
   if (!open) return null;
   const definition = definitions.find((item) => item.id === kind) ?? definitions[0];
@@ -276,42 +282,49 @@ export function ConnectionManager({
       : null;
     setBusy(true);
     setMessage("");
+    let saved: ConnectionSummary | undefined;
     try {
       const response = await fetch("/api/connections", {
-        method: input.id ? "PATCH" : "POST",
+        method: editing ? "PATCH" : "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(input),
       });
       if (!response.ok) throw new Error(await requestError(response));
       const payload = await response.json() as { connection: ConnectionSummary };
-      let connected = payload.connection;
-      if (connected.kind === "tool-service" || connected.kind === "provider"
-        || connected.kind === "mcp-http") {
-        const actionValue: ConnectionAction = connected.kind === "mcp-http" && connected.config.oauth === true
-          ? "reauth" : connected.kind === "mcp-http" ? "discover" : "test";
-        const tested = await fetch("/api/connections/actions", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ id: connected.id, action: actionValue }),
-        });
-        if (!tested.ok) throw new Error(await requestError(tested));
-        const result = await tested.json() as ConnectionActionResult;
-        connected = result.connection;
-        setMessage(result.message);
-        if (result.authorizationUrl) {
-          if (oauthPopup) oauthPopup.location.href = result.authorizationUrl;
-          else window.open(result.authorizationUrl, "harnest-oauth", "popup,width=560,height=760");
-        } else oauthPopup?.close();
-      }
+      saved = payload.connection;
+      replace(saved);
+      let connected = saved;
+      const actionValue: ConnectionAction = connected.kind === "mcp-http" && connected.config.oauth === true
+        ? "reauth"
+        : connected.kind === "mcp-http" ? "discover"
+          : connected.kind === "mcp-stdio" || connected.kind === "local-runtime" ? "approve-process" : "test";
+      const tested = await fetch("/api/connections/actions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: connected.id, action: actionValue }),
+      });
+      if (!tested.ok) throw new Error(await requestError(tested));
+      const result = await tested.json() as ConnectionActionResult;
+      connected = result.connection;
+      setMessage(result.message);
       replace(connected);
+      if (!connectionCanRun(connected) && !result.authorizationUrl) {
+        oauthPopup?.close();
+        setEditing(connected);
+        setKind(connected.kind);
+        setMode("form");
+        return;
+      }
+      if (result.authorizationUrl) {
+        if (oauthPopup) oauthPopup.location.href = result.authorizationUrl;
+        else window.open(result.authorizationUrl, "harnest-oauth", "popup,width=560,height=760");
+      } else oauthPopup?.close();
       setMode("list");
       setEditing(undefined);
-      if (connected.kind !== "tool-service" && connected.kind !== "provider" && connected.kind !== "mcp-http") {
-        setMessage(`${connected.name} saved and ready to use.`);
-      }
       if (!(connected.kind === "mcp-http" && connected.config.oauth === true)) onComplete?.(connected);
     } catch (error) {
       oauthPopup?.close();
+      if (saved) setEditing(saved);
       setMessage(error instanceof Error ? error.message : "Connection could not be saved.");
     } finally {
       setBusy(false);
@@ -343,6 +356,9 @@ export function ConnectionManager({
         if (oauthPopup) oauthPopup.location.href = result.authorizationUrl;
         else window.open(result.authorizationUrl, "harnest-oauth", "popup,width=560,height=760");
       } else oauthPopup?.close();
+      if (["test", "discover", "approve-process"].includes(value) && connectionCanRun(result.connection)) {
+        onComplete?.(result.connection);
+      }
     } catch (error) {
       oauthPopup?.close();
       setMessage(error instanceof Error ? error.message : "Connection action failed.");
@@ -370,6 +386,18 @@ export function ConnectionManager({
     }
   };
 
+  const primary = (connection: ConnectionSummary): { label: string; action?: ConnectionAction } => {
+    if (onComplete && connectionCanRun(connection)) return { label: "Use connection" };
+    if (["needs_auth", "expired", "insufficient_scope", "disconnected"].includes(connection.status)) {
+      return { label: "Reconnect", action: "reauth" };
+    }
+    if ((connection.kind === "mcp-stdio" || connection.kind === "local-runtime") && connection.status === "error") {
+      return { label: "Repair sandbox", action: "approve-process" };
+    }
+    if (connection.kind === "mcp-http" || connection.kind === "mcp-stdio") return { label: "Refresh tools", action: "discover" };
+    return { label: "Test connection", action: "test" };
+  };
+
   return (
     <div className="sheet-backdrop">
       <section className="connection-sheet" role="dialog" aria-modal="true" aria-labelledby="connection-sheet-title">
@@ -379,26 +407,32 @@ export function ConnectionManager({
           {definitions.map((item) => <button key={item.id} className="connection-kind" onClick={() => { setKind(item.id); setMode("form"); }}><strong>{item.label}</strong><span>{item.description}</span></button>)}
           <button className="button" onClick={() => setMode("list")}>Back</button>
         </div>}
-        {mode === "form" && <ConnectionForm connection={editing} kind={kind} definition={definition} busy={busy} onCancel={() => { setEditing(undefined); setMode("list"); }} onSaved={save} />}
+        {mode === "form" && <ConnectionForm connection={editing} requestedId={requestedId} kind={kind} definition={definition} busy={busy} onCancel={() => { setEditing(undefined); setMode("list"); }} onSaved={save} />}
         {mode === "list" && <>
           <div className="connection-toolbar"><label className="sr-only" htmlFor="connection-search">Search connections</label><input ref={search} id="connection-search" type="search" placeholder="Search connections" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="button button-primary" onClick={() => setMode("kind")}>New connection</button></div>
           <div className="connection-list">
-            {visible.length ? visible.map((connection) => <article key={connection.id} className="connection-card">
+            {visible.length ? visible.map((connection) => {
+              const main = primary(connection);
+              return <article key={connection.id} className="connection-card">
               <div className="connection-card-heading"><span className={`connection-status is-${connection.status}`} aria-label={statusLabel(connection.status)} /><div><strong>{connection.name}</strong><small>{connectionKindLabel(connection.kind)} · {connection.scope}</small></div><span className="connection-status-copy">{statusLabel(connection.status)}</span></div>
               {connection.error && <p className="connection-error">{connection.error.message}</p>}
               <div className="connection-card-actions">
-                <button className="button" disabled={busy} onClick={() => void action(connection, "test")}>Test</button>
-                {(connection.kind === "mcp-http" || connection.kind === "mcp-stdio") && <button className="button" disabled={busy} onClick={() => void action(connection, "discover")}>Discover tools</button>}
-                {connection.kind === "mcp-stdio" && <button className="button" disabled={busy} onClick={() => void action(connection, "approve-process")}>Approve launch</button>}
+                <button className="button button-primary" disabled={busy} onClick={() => main.action ? void action(connection, main.action) : onComplete?.(connection)}>{main.label}</button>
                 <button className="button" disabled={busy} onClick={() => { setEditing(connection); setKind(connection.kind); setMode("form"); }}>Edit</button>
-                <button className="button" disabled={busy} onClick={() => void action(connection, "reauth")}>Reauthenticate</button>
+              </div>
+              <details className="advanced-panel"><summary>More</summary><div className="connection-card-actions">
+                {main.action !== "test" && <button className="button" disabled={busy} onClick={() => void action(connection, "test")}>Test</button>}
+                {(connection.kind === "mcp-http" || connection.kind === "mcp-stdio") && main.action !== "discover" && <button className="button" disabled={busy} onClick={() => void action(connection, "discover")}>Refresh tools</button>}
+                {(connection.kind === "mcp-stdio" || connection.kind === "local-runtime") && <button className="button" disabled={busy} onClick={() => void action(connection, "approve-process")}>Review sandbox</button>}
+                {main.action !== "reauth" && <button className="button" disabled={busy} onClick={() => void action(connection, "reauth")}>Reconnect</button>}
                 <button className="button" disabled={busy || connection.status === "disconnected"} onClick={() => void action(connection, "disconnect")}>Disconnect</button>
                 {connection.kind === "mcp-http" && connection.config.oauth === true && <button className="button" disabled={busy} onClick={() => void action(connection, "revoke")}>Revoke OAuth</button>}
                 {deleteId === connection.id
                   ? <><button className="button button-danger" disabled={busy} onClick={() => void remove(connection)}>Confirm delete</button><button className="button" onClick={() => setDeleteId("")}>Cancel</button></>
                   : <button className="button" disabled={busy} onClick={() => setDeleteId(connection.id)}>Delete</button>}
-              </div>
-            </article>) : <div className="connection-empty"><strong>{connections.length ? "No connections match" : "No connections yet"}</strong><span>Pick a service, sign in or add its key, and Harnest will test and wire it for you.</span></div>}
+              </div></details>
+            </article>;
+            }) : <div className="connection-empty"><strong>{connections.length ? "No connections match" : "No connections yet"}</strong><span>Pick a service, sign in or add its key, and Harnest will test and wire it for you.</span></div>}
           </div>
         </>}
       </section>

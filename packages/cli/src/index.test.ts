@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { cp, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -405,7 +407,7 @@ runtime:
     });
   });
 
-  it("executes reviewed raw stdio MCP and keeps raw HTTP host-gated", async () => {
+  it("rejects raw stdio MCP and keeps raw HTTP host-gated", async () => {
     const services = new NodeRuntimeServices(mcpDirectory, {
       allowProcessCommands: ["node"],
     });
@@ -420,7 +422,7 @@ runtime:
         },
         { city: "Seoul" },
         context("stdio-raw"),
-      )).resolves.toMatchObject({ value: { city: "Seoul", country: "South Korea" } });
+      )).rejects.toThrow("Raw MCP stdio is disabled");
     } finally {
       await services.close();
     }
@@ -438,6 +440,33 @@ runtime:
 });
 
 describe("harnest CLI", () => {
+  it("creates, tests, lists, and deletes a saved Connection", async () => {
+    const directory = await project("cli-connections");
+    const file = join(directory, "harnest.yaml");
+    const server = createServer((_request, response) => response.writeHead(204).end());
+    await new Promise<void>((resolvePromise, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolvePromise);
+    });
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const connected = await exec(process.execPath, [
+        cli, "connect", "http", file, "--id", "fixture-http", "--url", `http://127.0.0.1:${port}`,
+      ], { cwd: root });
+      expect(connected.stdout).toContain("fixture-http\tconnected");
+      const listed = await exec(process.execPath, [cli, "connections", file, "--json"], { cwd: root });
+      expect(JSON.parse(listed.stdout)).toContainEqual(expect.objectContaining({
+        id: "fixture-http",
+        kind: "http-api",
+        status: expect.objectContaining({ state: "connected" }),
+      }));
+      const removed = await exec(process.execPath, [cli, "connection", "delete", "fixture-http", file], { cwd: root });
+      expect(removed.stdout).toContain("Deleted fixture-http");
+    } finally {
+      await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    }
+  }, 20_000);
+
   it("does not validate a graph whose saved Connection is missing", async () => {
     const directory = await project("cli-missing-connection");
     const spec = join(directory, "harnest.yaml");
@@ -491,7 +520,7 @@ entrypoint: output
     ]));
   });
 
-  it("runs the RAG, v1.1 MCP, safe custom Tool, and evaluation Loop examples end to end", async () => {
+  it("runs the RAG, safe custom Tool, and evaluation Loop examples and rejects unisolated legacy MCP", async () => {
     const examples = await project("examples");
     const rag = join(examples, "rag");
     const mcp = join(examples, "mcp-tool-agent");
@@ -514,7 +543,7 @@ entrypoint: output
     ], { cwd: root });
     expect(ragRun.stdout).toContain("realpath");
 
-    const mcpRun = await exec(process.execPath, [
+    await expect(exec(process.execPath, [
       cli,
       "run",
       join(mcp, "harnest.yaml"),
@@ -525,12 +554,7 @@ entrypoint: output
       "--allow-modules",
       "--approve-tool",
       "lookup-city",
-    ], { cwd: root });
-    expect(mcpRun.stdout).toContain("South Korea");
-    const mcpTest = await exec(process.execPath, [
-      cli, "test", join(mcp, "harnest.yaml"), "--allow-process", "node", "--allow-modules", "--approve-tool", "lookup-city",
-    ], { cwd: root });
-    expect(mcpTest.stdout).toContain("PASS finds-seoul");
+    ], { cwd: root })).rejects.toThrow("Raw MCP stdio is disabled");
 
     const toolRun = await exec(process.execPath, [
       cli,
@@ -588,7 +612,7 @@ entrypoint: output
     });
   });
 
-  it("registers stored Tool definitions for validation and reuses the module-enabled Node service", async () => {
+  it("requires an isolated Sandbox Connection for a stored TypeScript Tool", async () => {
     const directory = await cliToolProject("cli-stored-tool", "read", "custom.stored-city");
     await writeFile(join(directory, "stored-tool.mjs"), `
       export default function storedCity(input) {
@@ -633,8 +657,7 @@ entrypoint: output
       "--approve-tool",
       "custom.stored-city",
     ], { cwd: root });
-    expect(executed.stdout).toContain("South Korea");
-    expect(executed.stdout).toContain("stored Tool");
+    expect(executed.stdout).toContain("requires a Sandbox Connection");
   });
 
   it("returns a failure for an invalid graph", async () => {

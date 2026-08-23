@@ -46,6 +46,28 @@ const sumTools = () => new ToolRegistry().register({
 });
 
 describe("v1.2 Agent Tool loop", () => {
+  it("routes provider requests through the host outbound boundary", async () => {
+    let fetchCalls = 0;
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: true, cancellation: true },
+      async *run(_request, context) {
+        await context.fetch!("https://provider.example/v1", { method: "POST" });
+        yield { type: "text-delta", text: "bounded" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const services: RuntimeServices = {
+      async fetchProvider() {
+        fetchCalls += 1;
+        return new Response(null, { status: 204 });
+      },
+    };
+    await expect(new HarnessRuntime(spec(), new AdapterRegistry().register(adapter), { services }).invoke("run"))
+      .resolves.toMatchObject({ output: "bounded" });
+    expect(fetchCalls).toBe(1);
+  });
+
   it("validates and snapshots Tool manifests at registration", () => {
     const original = {
       id: "mutable",

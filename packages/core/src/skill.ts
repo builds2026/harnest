@@ -10,6 +10,20 @@ export interface SkillRequirements {
   readonly permissions: readonly string[];
 }
 
+export type SkillConnectionKind = "provider" | "mcp-http" | "mcp-stdio" | "http-api" | "tool-service" | "local-runtime";
+
+const SKILL_CONNECTION_KINDS: readonly SkillConnectionKind[] = [
+  "provider", "mcp-http", "mcp-stdio", "http-api", "tool-service", "local-runtime",
+];
+
+/** Accepts `kind:id`; legacy ids such as `local-runtime-main` retain their full id and infer the wizard kind. */
+export function skillConnectionRequirement(value: string): { readonly id: string; readonly kind?: SkillConnectionKind } {
+  const explicit = SKILL_CONNECTION_KINDS.find((kind) => value.startsWith(`${kind}:`) && value.length > kind.length + 1);
+  if (explicit) return { id: value.slice(explicit.length + 1), kind: explicit };
+  const inferred = SKILL_CONNECTION_KINDS.find((kind) => value.startsWith(`${kind}-`));
+  return { id: value, ...(inferred ? { kind: inferred } : {}) };
+}
+
 /** Public Agent Skills frontmatter plus Harnest's namespaced metadata extension. */
 export interface SkillDescriptor {
   readonly name: string;

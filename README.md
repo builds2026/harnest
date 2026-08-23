@@ -15,11 +15,11 @@ npm run harnest -- run harnest.yaml -- --input "hello" --allow-modules
 npm run harnest -- studio harnest.yaml -- --allow-modules
 ```
 
-The root spec uses a deterministic local Echo Adapter, so it runs without a secret or network connection. Provider credentials use `env:NAME` references; resolved values are never written to trace files.
+Open `http://127.0.0.1:3000`. The root spec uses a deterministic local Echo Adapter, so it runs without a secret or network connection. For a real Gemini + Web Search + Code Runner graph, open [the full-stack example](./examples/gemini-full-stack/README.md); Studio detects its missing Connections and presents them one at a time.
 
 ## Executable v0.2 examples
 
-The repository includes three end-to-end examples:
+The repository includes end-to-end examples:
 
 ```bash
 # Project-bounded lexical RAG over Markdown files
@@ -27,25 +27,37 @@ npm run harnest -- run examples/rag/harnest.yaml -- \
   --input "How are Context paths protected?" \
   --allow-files --context-root knowledge --allow-modules
 
-# Real MCP stdio discovery and tool call, followed by an Agent response
-npm run harnest -- run examples/mcp-tool-agent/harnest.yaml -- \
-  --input "Which country contains the configured city?" \
-  --allow-process node --allow-modules --approve-tool lookup-city
-
 # Generate → evaluate → improve until /evaluation/passed is true
 npm run harnest -- run examples/evaluation-loop/harnest.yaml -- \
   --input "Draft answer" --allow-modules
+
+# Gemini + Firecrawl Search/Scrape + isolated Code Runner (Studio guides setup)
+npm run harnest -- studio examples/gemini-full-stack/harnest.yaml
 ```
 
 Their declared tests use the same graphs:
 
 ```bash
 npm run harnest -- test examples/rag/harnest.yaml -- --allow-files --context-root knowledge --allow-modules
-npm run harnest -- test examples/mcp-tool-agent/harnest.yaml -- --allow-process node --allow-modules --approve-tool lookup-city
 npm run harnest -- test examples/evaluation-loop/harnest.yaml -- --allow-modules
 ```
 
-The MCP example deliberately exercises the v1.1-compatible raw `mcp-tool` path. New Studio graphs normally use a saved MCP Connection and a Tool discovered from that Connection; both paths use the official stdio or Streamable HTTP client transports.
+Raw MCP stdio is fail-closed because it cannot provide OS isolation. Use a saved MCP Connection: Streamable HTTP supports OAuth discovery, and stdio runs in an approved no-network container. Studio discovers server Tools and equips the selected Agent.
+
+## Connections from the CLI
+
+The same lifecycle used by Studio is available without hand-editing metadata:
+
+```bash
+npm run harnest -- connections [file] -- --json
+npm run harnest -- connect gemini [file] -- --id gemini-main --secret-env GEMINI_API_KEY
+npm run harnest -- connect firecrawl [file] -- --id web-main --secret-env FIRECRAWL_API_KEY
+npm run harnest -- connect searxng [file] -- --id web-main --url https://search.example/search
+npm run harnest -- connect sandbox [file] -- --id sandbox-main --runtime node
+npm run harnest -- connection test|login|disconnect|revoke|delete <id> [file]
+```
+
+The second `--` before Harnest options is required when invoking the CLI through `npm run`. `connect` saves, authenticates or approves, and tests in one command. Secrets come from a hidden prompt or one named environment variable and are stored in the OS-protected local vault, never in YAML or command arguments.
 
 ## Capabilities and safety
 
@@ -53,10 +65,10 @@ Runtime capabilities are denied by default. Grant only what a reviewed spec need
 
 - `--allow-modules` enables adapter, component, and tool modules after review. Even `validate` and `inspect` refuse to execute a listed module without this flag.
 - `--allow-files` enables file or directory Context inside the project. `--context-root <path>` can further restrict it and is repeatable. Hidden metadata, `.harnest`, private-key files, and common credential files remain blocked.
-- `--allow-process <command>` allows one exact MCP stdio or local Tool command and is repeatable. On the raw MCP compatibility path, `node` resolves to the current canonical Node executable; other commands must already be absolute canonical non-link regular files. MCP child processes receive the SDK's minimal safe environment, not the full parent environment.
+- `--allow-process <command>` remains for reviewed legacy local Tools. Raw MCP stdio is disabled; saved MCP stdio, Shell, Code Runner, and TypeScript Tools require an approved Docker/Podman container with networking disabled, a read-only root, dropped capabilities, non-root execution, and resource bounds.
 - `--allow-network <host[:port]>` allows one exact MCP Streamable HTTP or HTTP Tool host and is repeatable. Remote endpoints require HTTPS; plain HTTP is limited to literal `127.0.0.1` or `[::1]`. Redirects and URL credentials are rejected, and raw MCP header values must be `env:NAME` references.
 
-File paths and executable modules are checked with their canonical real paths, including symlinks and Windows junctions. Adapter and runtime modules must be npm package specifiers or project-relative paths. SDK callers must pass `{ allowModuleExecution: true }`; the CLI does this only after a user has explicitly invoked it on a project. Review third-party Harness projects before validating or running them.
+File paths and executable modules are checked through verified handles and canonical real paths, including symlinks and Windows junctions. Outbound provider/MCP/HTTP requests resolve and pin permitted public IPs before connecting. Adapter and runtime modules must be npm package specifiers or project-relative paths. SDK callers must pass `{ allowModuleExecution: true }`; the CLI does this only after a user has explicitly invoked it on a project. Review third-party Harness projects before validating or running them.
 
 ## Runs and traces
 
@@ -108,7 +120,7 @@ packages/adapter-openai     OpenAI-compatible streaming adapter
 packages/adapter-anthropic  Anthropic Messages streaming adapter
 packages/adapter-gemini     Gemini streaming adapter
 packages/adapter-local      Ollama local streaming adapter
-packages/cli                validate, inspect, run, test, runs, trace, studio
+packages/cli                validate, inspect, run, test, runs, trace, studio, Connections, Skills
 frontend                    Next.js Web Studio
 examples                    RAG, MCP Tool Agent, Loop, provider, and extension specs
 docs/v1/v1.1                v1.1 research, decisions, and verification notes

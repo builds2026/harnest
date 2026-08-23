@@ -4,68 +4,65 @@
 
 | 영역 | 자동화된 근거 |
 | --- | --- |
-| v1.1 회귀 | graph validation, branch/join, subgraph/Loop, retry, budget, cancellation, MCP/Tool/Trace 테스트 |
-| Provider Tool 계약 | OpenAI, Anthropic, Gemini, Ollama의 Tool definition, streamed call, Tool result mapping 테스트 |
-| Agent Tool loop | connected-only allowlist, provider name collision, approval 전 side effect 차단, cancellation, multi-turn 결과, trace redaction 테스트 |
-| Connection/Credential | public metadata secret 부재, config secret 거부, same-origin credential injection, issuer-bound OAuth data, one-time callback state 테스트 |
-| Search Connection | GET/query와 POST/JSON mapping, response normalization, missing credential 상태, 저장 endpoint authorization 테스트 |
-| MCP stdio | 실제 local stdio fixture process를 exact command allowlist로 discover/call하는 테스트 |
-| MCP Streamable HTTP | 실제 local `2026-07-28` fixture를 host allowlist 뒤에서 discover/call하는 테스트 |
-| OAuth 상태 | local token endpoint callback exchange/replay, 401/insufficient scope 상태, refresh-token/access-token revoke 및 pending 보존 테스트 |
-| Custom Tool | schema generation, bounded store, HTTP execution, OpenAPI 3.0/3.1 import, external `$ref` 거부, process timeout/output, module capability, built-in 5종 테스트 |
-| Agent Skills | parser, precedence, metadata-only catalog, activation/resource bounds, script hash approval, provenance tamper, local/pinned source 정책 테스트 |
-| Studio logic | graph/YAML state, trace graph lens, capability scoping, 5개 template와 exact built-in ID 테스트 |
-| CLI | validate/run/runs/trace, saved Connection 진단, exact Tool approval와 RAG/MCP/evaluation example integration 테스트 |
-| Ingress bounds | provider stream total/line/event, 오류 본문, Tool call 수/인자, per-turn output, invalid usage와 post-finish record 차단 테스트 |
-| Studio Host | literal-loopback Host/Origin 허용과 DNS Host rebinding 요청 거부 테스트 |
+| Graph/runtime 회귀 | validation, branch/router/join, subgraph/Loop, retry, budget, cancellation, evaluator, Trace |
+| Provider Tool 계약 | OpenAI, Anthropic, Gemini, Ollama Tool definition, streamed call, Tool result mapping; Gemini unsupported `additionalProperties` 제거 후 원본 schema의 local AJV 검증 유지 |
+| Agent Tool loop | connected-only allowlist, name collision, exact approval 전 side effect 차단, cancellation, multi-turn result, secret redaction |
+| Connection/vault | project/user CRUD, config secret 거부, OS backend command boundary, profile-bound encrypted entry, HTTP/local probe, disconnect/revoke/reauth |
+| Outbound network | hostname private/reserved 거부, IPv4/IPv6 block lists, Node lookup single/all callback, pinned Host/SNI transport, redirect/size/credential-origin 제한 |
+| Web Search/Scrape | GET/query와 POST/JSON, cursor/pagination, response normalization, Firecrawl/SearXNG preset, scrape mapping, missing credential 상태 |
+| MCP | containerized stdio discovery/call/error와 raw stdio 거부, 실제 local Streamable HTTP `2026-07-28` discovery/call |
+| OAuth | discovery → DCR → PKCE callback → refresh → insufficient-scope 재동의 → revoke를 잇는 local protocol E2E와 replay/pending 상태 |
+| Custom/Built-in Tool | schema generation, bounded store, HTTP, OpenAPI 3.0/3.1, external `$ref` 거부, container process, TypeScript bundle, Built-in 6종 |
+| Agent Skills | parser/precedence/progressive disclosure, provenance tamper, local install, mocked Git/npm materialization+integrity+hostile archive, exact script hash approval/change invalidation |
+| Studio logic | graph/YAML state, trace lens, capability scoping, 5 Templates, missing declared Connection staging, exact Built-in ID |
+| CLI | validate/run/test/runs/trace, Connection create→test→list→delete, Skill lifecycle, exact Tool approval, examples integration |
+| Studio HTTP | literal-loopback Host/Origin 허용, DNS Host rebinding request 거부, body bounds와 secret-safe DTO |
 
-Local MCP fixture는 `examples/mcp-tool-agent/server.mjs`와 `http-server.mjs`를 실제 child/server protocol로 실행한다. OAuth fixture는 local HTTP token/revoke/auth-error endpoint를 사용하지만, 아래 전체 OAuth browser sequence를 모두 수행하는 하나의 E2E는 아니다.
+## 최종 명령 결과
 
-## 실행 명령
+2026-08-23 root snapshot:
 
-```powershell
-npm run lint
-npm run typecheck
-npm test
-npm run build
-```
-
-아래는 모든 수정이 반영된 2026-08-22 root snapshot의 최종 결과다.
-
-| 명령 | 최종 결과 |
+| 명령 | 결과 |
 | --- | --- |
 | `npm run lint` | 통과 — ESLint 오류·경고 없음 |
-| `npm run typecheck` | 통과 — package project references와 Studio `tsc --noEmit` |
-| `npm test` | 통과 — **22 files, 158 tests** |
-| `npm run build` | 통과 — package build와 Studio production build, static page **15/15**; Turbopack warning 1건 |
-| production Host smoke | 통과 — `Host: 127.0.0.1:3456`은 200, `Host: evil.example`은 403 |
-| in-app browser E2E | 통과 — 아래 로컬 흐름과 실제 Gemini provider; 외부 OAuth와 실제 Firecrawl/SearXNG service는 제외 |
+| `npm run typecheck` | 통과 — package project references + Studio `tsc --noEmit` |
+| `npm test` | 통과 — **22 files, 170 passed, 1 platform-conditional skipped (171 total)** |
+| `npm run build` | 통과 — package + Studio production build, static pages **15/15**, warning 없음 |
+| production Host smoke | 통과 — literal `Host: 127.0.0.1:3456` 200, `Host: evil.example` 403 |
 
-### Studio 브라우저 E2E
+## 실제 Studio E2E
 
-Next production server와 in-app browser로 다음을 실제 클릭해 확인했다.
+in-app browser와 임시 project에서 다음을 실제 클릭했다.
 
-- 빈 임시 프로젝트에서 First commissioning과 RAG, Web Research, Coding Agent, MCP Agent, Evaluation Loop 5개 Template 노출
-- Evaluation Loop 선택 시 YAML 편집 없이 graph 생성과 inline Provider Connection Wizard 복귀 흐름
-- Components/Tools/Skills/Connections/Templates Palette, built-in Tool 5종과 Custom Tool 4개 방식, local/Git/package Skill 추가 Form
-- 임시 graph 저장과 Validate; 누락 Provider가 성공으로 위장되지 않고 `MODEL_CONNECTION_REQUIRED`로 표시됨
-- 저장된 local echo Harness를 Validate한 뒤 Studio에서 실제 Run 성공, node 상태 반영, persisted Trace의 run/node/edge/usage/text events 확인
-- 같은 화면에서 saved harness test를 실행해 **1 passed · 0 failed** 확인
-- production server 로그에 처리되지 않은 오류 없음; 검증 중 생성한 임시 프로젝트와 Run trace는 종료 후 제거
-- Google AI Studio Gemini 3.5 Flash-Lite Provider Connection test 성공
-- SearXNG 호환 local Search Connection을 저장·자동 test한 뒤 Web Research Template이 Provider와 Search를 자동 연결
-- Gemini function call의 exact `{query, limit}`를 **Approve once**하고, Search result를 model에 반환해 두 번째 turn의 최종 응답까지 성공
+- first commissioning, 5 Templates, `Template → Connect → Equip → Validate → Run → Trace` rail
+- Web Research 선택 후 SearXNG endpoint 입력 한 번의 **Connect**로 저장+probe, `Connected` card와 다음 Gemini requirement 자동 진행
+- Local Skill 설치, script code/bytes/SHA-256 표시, **Approve exact hashes** 후 승인 상태
+- project-contained Echo adapter graph의 Inspector 수정 → Save → Validate → 두 Run(110/127ms) → persisted node/edge/usage/text Trace
+- saved Harness test **1 passed · 0 failed**
+- Agent `+ Tool` compatible picker에서 Web Search 한 번 선택 → Tool node/edge/Connection 자동 배선 → 저장/재검증
+- server log에 처리되지 않은 오류 없음
 
-Build에는 dynamic user-data path 때문에 Turbopack이 core trace 범위를 완전히 추론하지 못한다는 비차단 warning 1개가 남았다.
+마지막 자동-Connection wizard 재접속은 in-app browser의 local URL policy가 차단해 우회하지 않았다. exact id/kind staging은 별도 순수 회귀 테스트로 검증했다.
 
-## 자동화되지 않았거나 충분하지 않은 검증
+## 실제 Gemini + Web Search E2E
 
-- Protected Resource discovery → Authorization Server discovery → 실제 browser 로그인/consent → callback → refresh → scope 증가 → revoke 전 과정을 잇는 protocol E2E
-- 실제 OpenAI/Anthropic/Ollama credential을 사용한 provider-native multi-turn Tool call과 Gemini 오류/재인증 경로
-- Studio와 CLI가 같은 persisted custom Tool/Skill/Connection graph를 같은 승인 정책으로 실행한다는 cross-surface E2E
-- 실제 Git/package remote Skill materialization
-- Windows 이외 secure credential backend
-- canvas pointer drag/drop과 edge 재배선, compatible picker 선택, 실제 OAuth consent popup, call-time approval dialog를 한 흐름으로 잇는 추가 브라우저 회귀
-- DNS rebinding과 child process tree/resource exhaustion에 대한 보안 테스트
+저장된 Google AI Studio credential 값을 읽거나 출력하지 않고 다음을 수행했다.
 
-브라우저 E2E가 통과했어도 외부 credential, OAuth consent, OS sandbox와 outbound IP pinning까지 검증한 것으로 기록하지 않는다.
+1. Provider Connection 최소 probe: `gemini-3.5-flash-lite`가 `usage → finish` 반환.
+2. local SearXNG fixture Connection을 생성·실제 probe.
+3. `additionalProperties: false`가 있는 Web Search Tool schema를 Gemini에 전송.
+4. Gemini가 `{ query: "Harnest trace", limit: 1 }`을 호출.
+5. exact `builtin.web-search` 사전 승인 후 fixture 결과 반환.
+6. 두 번째 Gemini turn이 `Pinned search result`와 URL을 최종 출력.
+
+Run `3f90c6f6-d244-48a6-b523-329d2c7d8d43`은 **1662ms**, 331 input / 41 output token이었고 Trace에 tool-call, user approval, 23ms tool-result, second-turn text, run-end가 기록됐다. 테스트용 Connection과 YAML은 삭제했다.
+
+## 환경 때문에 남은 검증
+
+- 실제 OpenAI/Anthropic, Firecrawl, self-hosted SearXNG, 외부 MCP OAuth credential/service
+- 실행 중인 실제 Docker/Podman daemon의 image pull/container E2E(현재 Docker CLI만 있고 daemon은 중지 상태)
+- macOS Keychain/Linux Secret Service의 해당 OS CI
+- 실제 공개 GitHub/GitLab Skill repository와 npm Skill package
+- OAuth consent popup 및 canvas pointer edge 재배선 시각 회귀
+
+이 항목은 [remaining verification](./remaining-issues.md)에 배포 경계와 함께 기록한다.

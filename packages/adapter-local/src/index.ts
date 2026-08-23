@@ -151,7 +151,7 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
       };
       let response: Response;
       try {
-        response = await fetch(endpoint(request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL), {
+        response = await (context.fetch ?? fetch)(endpoint(request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL), {
           method: "POST",
           headers: {
             "content-type": "application/json",

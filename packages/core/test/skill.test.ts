@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSkillDocument, SkillParseError, splitSkillDocument } from "../src/skill.js";
+import { parseSkillDocument, SkillParseError, skillConnectionRequirement, splitSkillDocument } from "../src/skill.js";
 
 const valid = `---
 name: release-helper
@@ -56,5 +56,11 @@ describe("Agent Skill document parser", () => {
   it("requires the public name to match its containing directory", () => {
     expect(() => parseSkillDocument(valid, { directoryName: "different" }))
       .toThrowError(expect.objectContaining({ code: "SKILL_NAME_MISMATCH" } satisfies Partial<SkillParseError>));
+  });
+
+  it("normalizes explicit Connection kind requirements without changing legacy ids", () => {
+    expect(skillConnectionRequirement("provider:google-main")).toEqual({ kind: "provider", id: "google-main" });
+    expect(skillConnectionRequirement("local-runtime-main")).toEqual({ kind: "local-runtime", id: "local-runtime-main" });
+    expect(skillConnectionRequirement("repository")).toEqual({ id: "repository" });
   });
 });

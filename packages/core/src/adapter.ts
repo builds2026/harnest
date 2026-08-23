@@ -42,6 +42,8 @@ export interface ModelRequest {
 export interface AdapterContext {
   signal: AbortSignal;
   resolveSecret(reference: string): string | undefined;
+  /** Host-supplied outbound boundary. Node hosts use DNS validation and connection pinning. */
+  fetch?(url: string | URL, init?: RequestInit): Promise<Response>;
 }
 
 export interface TokenUsage {

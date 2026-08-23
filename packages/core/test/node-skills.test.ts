@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import {
   NodeSkillStore,
@@ -8,6 +10,7 @@ import {
   skillInstallSourceKey,
   type GitSkillInstallSource,
 } from "../src/node-skills.js";
+import { materializeRemoteSkill, resolveRemoteSkillSource } from "../src/node-skill-install.js";
 
 const skillDocument = (
   name: string,
@@ -42,6 +45,27 @@ async function workspace(): Promise<{ root: string; project: string; user: strin
   const user = join(root, "user");
   await Promise.all([mkdir(project), mkdir(user)]);
   return { root, project, user };
+}
+
+function tar(files: Readonly<Record<string, string>>): Buffer {
+  const records = Object.entries(files).flatMap(([path, value]) => {
+    const content = Buffer.from(value);
+    const header = Buffer.alloc(512);
+    header.write(path, 0, 100, "utf8");
+    header.write("0000644\0", 100, 8, "ascii");
+    header.write("0000000\0", 108, 8, "ascii");
+    header.write("0000000\0", 116, 8, "ascii");
+    header.write(`${content.length.toString(8).padStart(11, "0")}\0`, 124, 12, "ascii");
+    header.write("00000000000\0", 136, 12, "ascii");
+    header.fill(0x20, 148, 156);
+    header[156] = "0".charCodeAt(0);
+    header.write("ustar\0", 257, 6, "ascii");
+    header.write("00", 263, 2, "ascii");
+    const checksum = [...header].reduce((sum, byte) => sum + byte, 0);
+    header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, 8, "ascii");
+    return [header, content, Buffer.alloc(Math.ceil(content.length / 512) * 512 - content.length)];
+  });
+  return gzipSync(Buffer.concat([...records, Buffer.alloc(1_024)]));
 }
 
 describe("NodeSkillStore", () => {
@@ -108,6 +132,18 @@ describe("NodeSkillStore", () => {
         .rejects.toMatchObject({ code: "SKILL_RESOURCE_INVALID" });
       await expect(denied.loadResource("resource-skill", "scripts/run.mjs"))
         .rejects.toMatchObject({ code: "SKILL_SCRIPT_APPROVAL_REQUIRED" });
+      const [review] = await denied.reviewScripts("resource-skill");
+      expect(review).toMatchObject({ path: "scripts/run.mjs", content: "export default 1;", approved: false });
+      await denied.approveScript("resource-skill", review!.path, review!.sha256);
+      await expect(new NodeSkillStore({
+        projectDirectory: fixture.project,
+        userDirectory: fixture.user,
+      }).loadResource("resource-skill", "scripts/run.mjs"))
+        .resolves.toMatchObject({ script: true, trusted: true, sha256: review!.sha256 });
+      await writeFile(join(directory, "scripts", "run.mjs"), "export default 2;", "utf8");
+      await expect(denied.loadResource("resource-skill", "scripts/run.mjs"))
+        .rejects.toMatchObject({ code: "SKILL_SCRIPT_APPROVAL_REQUIRED" });
+      await writeFile(join(directory, "scripts", "run.mjs"), "export default 1;", "utf8");
 
       const authorizeScript = vi.fn(async ({ resource, sha256 }) =>
         resource === "scripts/run.mjs" && /^sha256-[a-f0-9]{64}$/.test(sha256));
@@ -288,6 +324,54 @@ describe("NodeSkillStore", () => {
         commit: source.commit,
       });
       expect(materializeRemote).toHaveBeenCalledWith(source);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves, verifies, and safely extracts an npm Skill archive", async () => {
+    const fixture = await workspace();
+    const archive = tar({
+      "package/SKILL.md": skillDocument("remote-package-skill", "Remote package"),
+      "package/references/note.md": "verified archive",
+    });
+    const integrity = `sha512-${createHash("sha512").update(archive).digest("base64")}`;
+    const fetch = vi.fn(async (input: string | URL) => input.toString().endsWith(".tgz")
+      ? new Response(archive)
+      : Response.json({
+          version: "1.2.3",
+          dist: { integrity, tarball: "https://registry.npmjs.org/remote-package-skill/-/remote-package-skill-1.2.3.tgz" },
+        }));
+    try {
+      const source = await resolveRemoteSkillSource({ kind: "package", package: "remote-package-skill" }, fetch);
+      expect(source).toEqual({ kind: "package", package: "remote-package-skill", version: "1.2.3", integrity });
+      const materialized = await materializeRemoteSkill(source, fetch);
+      try {
+        const store = new NodeSkillStore({
+          projectDirectory: fixture.project,
+          userDirectory: fixture.user,
+          materializeRemote: () => materialized.directory,
+        });
+        const installed = await store.install(source, {
+          scope: "project",
+          approval: { sourceKey: skillInstallSourceKey(source) },
+        });
+        expect(installed.provenance).toMatchObject({ kind: "package", version: "1.2.3", integrity });
+        await expect(store.loadResource("remote-package-skill", "references/note.md"))
+          .resolves.toMatchObject({ content: "verified archive", trusted: true });
+      } finally {
+        await materialized.cleanup();
+      }
+
+      const hostile = tar({ "package/../../escape.txt": "escape" });
+      const hostileIntegrity = `sha512-${createHash("sha512").update(hostile).digest("base64")}`;
+      await expect(materializeRemoteSkill(
+        { kind: "package", package: "remote-package-skill", version: "1.2.3", integrity: hostileIntegrity },
+        async (input) => input.toString().endsWith(".tgz") ? new Response(hostile) : Response.json({
+          version: "1.2.3",
+          dist: { integrity: hostileIntegrity, tarball: "https://registry.npmjs.org/remote-package-skill/-/remote-package-skill-1.2.3.tgz" },
+        }),
+      )).rejects.toThrow("path traversal");
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

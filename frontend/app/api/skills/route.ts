@@ -1,6 +1,9 @@
 import { dirname } from "node:path";
 import {
+  materializeRemoteSkill,
   NodeSkillStore,
+  remoteSkillSourceLabel,
+  resolveRemoteSkillSource,
   skillInstallSourceKey,
   type SkillCatalogEntry,
   type SkillInstallSource,
@@ -29,11 +32,18 @@ const safeSkill = (skill: SkillCatalogEntry) => ({
   provenance: skill.provenance,
 });
 
-const store = () => new NodeSkillStore({ projectDirectory: dirname(harnessFile()) });
+const projectDirectory = () => dirname(harnessFile());
 
-export async function GET() {
+const store = () => new NodeSkillStore({ projectDirectory: projectDirectory() });
+
+export async function GET(request?: Request) {
   try {
-    const catalog = await store().catalog();
+    const skillStore = store();
+    const review = request ? new URL(request.url).searchParams.get("review") : null;
+    if (review) return Response.json({ scripts: await skillStore.reviewScripts(review) }, {
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+    });
+    const catalog = await skillStore.catalog();
     return Response.json({ skills: catalog.skills.map(safeSkill), warnings: catalog.warnings }, {
       headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
     });
@@ -46,6 +56,21 @@ export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
     const body = record(await readJsonBody(request, 65_536), "Skill install");
+    if (body.action === "approve-scripts") {
+      if (typeof body.skill !== "string" || !Array.isArray(body.scripts) || body.scripts.length > 128) {
+        throw new ApiRequestError("SKILL_SCRIPT_APPROVAL_INVALID", "Skill script approval is invalid");
+      }
+      const skillStore = store();
+      const approved = [];
+      for (const candidate of body.scripts) {
+        const script = record(candidate, "Skill script approval");
+        if (typeof script.path !== "string" || typeof script.sha256 !== "string") {
+          throw new ApiRequestError("SKILL_SCRIPT_APPROVAL_INVALID", "Skill script path and hash are required");
+        }
+        approved.push(await skillStore.approveScript(body.skill, script.path, script.sha256));
+      }
+      return Response.json({ scripts: approved });
+    }
     if (body.scope !== "project" && body.scope !== "user") {
       throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill scope must be project or user");
     }
@@ -56,11 +81,19 @@ export async function POST(request: Request) {
     let source: SkillInstallSource;
     if (candidate.kind === "local" && typeof candidate.directory === "string" && candidate.directory.length <= 1_024) {
       source = { kind: "local", directory: candidate.directory };
-    } else if (candidate.kind === "git" && typeof candidate.repository === "string" && typeof candidate.commit === "string") {
-      source = { kind: "git", repository: candidate.repository, commit: candidate.commit };
-    } else if (candidate.kind === "package" && typeof candidate.package === "string"
-      && typeof candidate.version === "string" && typeof candidate.integrity === "string") {
-      source = { kind: "package", package: candidate.package, version: candidate.version, integrity: candidate.integrity };
+    } else if (candidate.kind === "git" && typeof candidate.repository === "string") {
+      source = await resolveRemoteSkillSource({
+        kind: "git",
+        repository: candidate.repository,
+        ...(typeof candidate.commit === "string" && candidate.commit ? { commit: candidate.commit } : {}),
+      });
+    } else if (candidate.kind === "package" && typeof candidate.package === "string") {
+      source = await resolveRemoteSkillSource({
+        kind: "package",
+        package: candidate.package,
+        ...(typeof candidate.version === "string" && candidate.version ? { version: candidate.version } : {}),
+        ...(typeof candidate.integrity === "string" && candidate.integrity ? { integrity: candidate.integrity } : {}),
+      });
     } else {
       throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill source is invalid");
     }
@@ -68,12 +101,23 @@ export async function POST(request: Request) {
     if (remote && body.approved !== true) {
       throw new ApiRequestError("SKILL_INSTALL_APPROVAL_REQUIRED", "Pinned remote source approval is required", 409);
     }
-    const skill = await store().install(source, {
-      scope: body.scope,
-      ...(typeof body.namespace === "string" ? { namespace: body.namespace as "agents" | "harnest" } : {}),
-      ...(source.kind !== "local" ? { approval: { sourceKey: skillInstallSourceKey(source) } } : {}),
-    });
-    return Response.json({ skill: safeSkill(skill) }, { status: 201 });
+    const materialized = source.kind === "local" ? undefined : await materializeRemoteSkill(source);
+    try {
+      const skillStore = materialized
+        ? new NodeSkillStore({ projectDirectory: projectDirectory(), materializeRemote: () => materialized.directory })
+        : store();
+      const skill = await skillStore.install(source, {
+        scope: body.scope,
+        ...(typeof body.namespace === "string" ? { namespace: body.namespace as "agents" | "harnest" } : {}),
+        ...(source.kind !== "local" ? { approval: { sourceKey: skillInstallSourceKey(source) } } : {}),
+      });
+      return Response.json({
+        skill: safeSkill(skill),
+        source: source.kind === "local" ? "Local folder" : remoteSkillSourceLabel(source),
+      }, { status: 201 });
+    } finally {
+      await materialized?.cleanup();
+    }
   } catch (error) {
     return apiErrorResponse(error);
   }

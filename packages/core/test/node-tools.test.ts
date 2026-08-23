@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -217,7 +217,7 @@ describe("custom tool execution capabilities", () => {
     }
   });
 
-  it("runs a host-approved local command without claiming OS sandboxing", async () => {
+  it("requires the host to attest OS isolation before a local command", async () => {
     const root = await project();
     try {
       const authorizeProcess = vi.fn(async () => true);
@@ -248,10 +248,10 @@ describe("custom tool execution capabilities", () => {
       await expect(store.execute(manifest, {}, context)).resolves.toEqual({ ok: true });
       expect(authorizeProcess).toHaveBeenCalledWith(expect.objectContaining({
         command: process.execPath,
-        isolation: "timeout-output-cwd-bounds-only",
+        isolation: "os-sandbox",
       }));
       expect(BUILTIN_TOOL_MANIFESTS.find(({ id }) => id === "builtin.shell")?.description)
-        .toContain("not an OS sandbox");
+        .toContain("no-network container");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -484,7 +484,34 @@ paths:
 });
 
 describe("built-in tool definitions", () => {
-  it("exposes all five built-ins through the same ToolDefinition contract", async () => {
+  it.skipIf(process.platform === "win32")("rejects a file swapped after authorization starts", async () => {
+    const root = await project();
+    const outside = await mkdtemp(join(tmpdir(), "harnest-tool-outside-"));
+    try {
+      const path = join(root, "note.txt");
+      const moved = join(root, "opened.txt");
+      const secret = join(outside, "secret.txt");
+      await writeFile(path, "safe", "utf8");
+      await writeFile(secret, "secret", "utf8");
+      const store = new NodeToolStore({
+        projectDirectory: root,
+        capabilities: {
+          authorizeFile: async () => {
+            await rename(path, moved);
+            await symlink(secret, path, "file");
+            return true;
+          },
+        },
+      });
+      await expect(store.executeBuiltin("builtin.file", { operation: "read", path: "note.txt" }, context))
+        .rejects.toMatchObject({ code: "TOOL_CAPABILITY_DENIED" });
+      await expect(readFile(secret, "utf8")).resolves.toBe("secret");
+    } finally {
+      await Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]);
+    }
+  });
+
+  it("exposes all built-ins through the same ToolDefinition contract", async () => {
     const root = await project();
     try {
       await mkdir(join(root, "data"));
@@ -500,6 +527,7 @@ describe("built-in tool definitions", () => {
       const definitions = store.builtinDefinitions();
       expect(definitions.map(({ id }) => id)).toEqual([
         "builtin.web-search",
+        "builtin.web-scrape",
         "builtin.http",
         "builtin.file",
         "builtin.shell",

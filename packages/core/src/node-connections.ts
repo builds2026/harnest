@@ -7,18 +7,20 @@ import {
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import {
   lstat,
   mkdir,
   open,
-  readFile,
   realpath,
-  rename,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
+import { request as requestHttp } from "node:http";
+import { request as requestHttps } from "node:https";
+import { BlockList, isIP, type LookupFunction } from "node:net";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
 import {
   auth,
   Client,
@@ -36,7 +38,7 @@ import {
   type StoredOAuthTokens,
   type Tool,
 } from "@modelcontextprotocol/client";
-import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import {
   CONNECTION_ID,
   CREDENTIAL_FIELD,
@@ -50,7 +52,9 @@ import {
   type ConnectionUpdateInput,
   type OAuthStartResult,
 } from "./connection.js";
+import { runBoundedProcess } from "./node-tools.js";
 import { snapshotSafeJsonSchema } from "./tool.js";
+import { atomicWriteVerifiedFile, readVerifiedFile } from "./safe-files.js";
 
 const FILE_VERSION = 1 as const;
 const MAX_METADATA_BYTES = 4 * 1024 * 1024;
@@ -113,11 +117,15 @@ interface EncryptedVault {
   readonly ciphertext: string;
 }
 
-interface WrappedKeyFile {
+type WrappedKeyFile = {
   readonly version: typeof FILE_VERSION;
   readonly protection: "dpapi-current-user";
   readonly wrappedKey: string;
-}
+} | {
+  readonly version: typeof FILE_VERSION;
+  readonly protection: "macos-keychain" | "linux-secret-service";
+  readonly keyId: string;
+};
 
 export interface ConnectionManagerOptions {
   readonly userDataDirectory?: string;
@@ -186,9 +194,8 @@ function defaultUserDataDirectory(): string {
 
 async function readJson(path: string, maxBytes: number): Promise<unknown | undefined> {
   try {
-    const info = await stat(path);
-    if (!info.isFile() || info.size > maxBytes) throw new Error(`File '${path}' is not a bounded regular file`);
-    return JSON.parse(await readFile(path, "utf8")) as unknown;
+    const directory = await realpath(dirname(path));
+    return JSON.parse((await readVerifiedFile(path, directory, maxBytes)).toString("utf8")) as unknown;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
     throw error;
@@ -197,13 +204,8 @@ async function readJson(path: string, maxBytes: number): Promise<unknown | undef
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
-  } finally {
-    await rm(temporary, { force: true });
-  }
+  const directory = await realpath(dirname(path));
+  await atomicWriteVerifiedFile(path, directory, `${JSON.stringify(value)}\n`);
 }
 
 async function pause(ms: number): Promise<void> {
@@ -315,16 +317,122 @@ async function dpapi(action: "protect" | "unprotect", data: Buffer): Promise<Buf
   });
 }
 
-class DpapiCredentialVault {
+interface CredentialBackendCommand {
+  readonly protection: "macos-keychain" | "linux-secret-service";
+  readonly candidates: readonly string[];
+  readonly args: readonly string[];
+}
+
+/** @internal Pure command builder kept exported for platform-independent security tests. */
+export function credentialBackendCommand(
+  platform: NodeJS.Platform,
+  action: "store" | "lookup",
+  keyId: string,
+): CredentialBackendCommand {
+  if (!/^[a-f0-9]{32}$/u.test(keyId)) throw new ConnectionError("CREDENTIAL_STORE_FAILED", "Credential key id is invalid");
+  if (platform === "darwin") return {
+    protection: "macos-keychain",
+    candidates: ["/usr/bin/security"],
+    args: action === "store"
+      ? ["add-generic-password", "-a", keyId, "-s", "dev.harnest.credential-vault", "-U", "-w"]
+      : ["find-generic-password", "-a", keyId, "-s", "dev.harnest.credential-vault", "-w"],
+  };
+  if (platform === "linux") return {
+    protection: "linux-secret-service",
+    candidates: ["/usr/bin/secret-tool", "/bin/secret-tool"],
+    args: action === "store"
+      ? ["store", "--label=Harnest credential vault key", "application", "harnest", "vault", keyId]
+      : ["lookup", "application", "harnest", "vault", keyId],
+  };
+  throw new ConnectionError(
+    "CREDENTIAL_BACKEND_UNAVAILABLE",
+    "Secure credentials require Windows DPAPI, macOS Keychain, or Linux Secret Service",
+  );
+}
+
+async function runCredentialBackend(
+  action: "store" | "lookup",
+  keyId: string,
+  secret?: Buffer,
+): Promise<Buffer> {
+  const descriptor = credentialBackendCommand(process.platform, action, keyId);
+  let executable: string | undefined;
+  for (const candidate of descriptor.candidates) {
+    try {
+      const canonical = await realpath(candidate);
+      if ((await stat(canonical)).isFile()) {
+        executable = canonical;
+        break;
+      }
+    } catch {
+      // Try the next fixed system path.
+    }
+  }
+  if (!executable) throw new ConnectionError(
+    "CREDENTIAL_BACKEND_UNAVAILABLE",
+    descriptor.protection === "linux-secret-service"
+      ? "Linux credentials require secret-tool and an unlocked Secret Service collection"
+      : "The macOS Keychain security tool is unavailable",
+  );
+  return new Promise<Buffer>((resolvePromise, reject) => {
+    let settled = false;
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputBytes = 0;
+    const finish = (error?: ConnectionError, value?: Buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolvePromise(value ?? Buffer.alloc(0));
+    };
+    const child = spawn(executable, [...descriptor.args], {
+      cwd: dirname(executable),
+      env: Object.fromEntries([
+        "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "HOME", "LANG", "LC_ALL", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+      ].flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]!]])),
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(new ConnectionError("CREDENTIAL_BACKEND_UNAVAILABLE", "The OS credential store did not respond"));
+    }, 30_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.byteLength;
+      if (outputBytes > 65_536) child.kill();
+      else stdout.push(Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.reduce((size, item) => size + item.byteLength, 0) < 8_192) stderr.push(Buffer.from(chunk));
+    });
+    child.once("error", (cause) => finish(new ConnectionError(
+      "CREDENTIAL_BACKEND_UNAVAILABLE", "The OS credential store could not be started", undefined, cause,
+    )));
+    child.once("exit", (code) => {
+      if (code !== 0 || outputBytes > 65_536) {
+        finish(new ConnectionError(
+          "CREDENTIAL_STORE_FAILED",
+          `The OS credential store rejected the request${stderr.length ? `: ${Buffer.concat(stderr).toString("utf8").trim().slice(0, 300)}` : ""}`,
+        ));
+      } else finish(undefined, Buffer.from(Buffer.concat(stdout).toString("utf8").trim(), "base64"));
+    });
+    child.stdin.end(action === "store" && secret ? `${secret.toString("base64")}\n` : undefined);
+  });
+}
+
+class CredentialVault {
   readonly #vaultPath: string;
   readonly #keyPath: string;
   readonly #lockPath: string;
+  readonly #keyId: string;
   #key: Buffer | undefined;
 
   constructor(directory: string) {
     this.#vaultPath = join(directory, "credentials.vault");
-    this.#keyPath = join(directory, "credentials.key.dpapi");
+    this.#keyPath = join(directory, process.platform === "win32" ? "credentials.key.dpapi" : "credentials.key.os");
     this.#lockPath = join(directory, "credentials.lock");
+    this.#keyId = createHash("sha256").update(resolve(directory)).digest("hex").slice(0, 32);
   }
 
   async read(binding: string): Promise<VaultEntry | undefined> {
@@ -350,22 +458,44 @@ class DpapiCredentialVault {
     if (this.#key) return this.#key;
     const candidate = await readJson(this.#keyPath, 16_384);
     if (candidate !== undefined) {
-      if (!isRecord(candidate) || candidate.version !== FILE_VERSION
-        || candidate.protection !== "dpapi-current-user" || typeof candidate.wrappedKey !== "string") {
+      if (!isRecord(candidate) || candidate.version !== FILE_VERSION) {
         throw new ConnectionError("CREDENTIAL_STORE_FAILED", "The wrapped credential key file is invalid");
       }
-      const key = await dpapi("unprotect", Buffer.from(candidate.wrappedKey, "base64"));
-      if (key.length !== 32) throw new ConnectionError("CREDENTIAL_STORE_FAILED", "Windows DPAPI returned an invalid credential key");
+      let key: Buffer;
+      if (candidate.protection === "dpapi-current-user" && typeof candidate.wrappedKey === "string") {
+        if (process.platform !== "win32") throw new ConnectionError(
+          "CREDENTIAL_BACKEND_UNAVAILABLE", "This credential vault is protected by Windows DPAPI",
+        );
+        key = await dpapi("unprotect", Buffer.from(candidate.wrappedKey, "base64"));
+      } else if ((candidate.protection === "macos-keychain" || candidate.protection === "linux-secret-service")
+        && candidate.keyId === this.#keyId) {
+        const backend = credentialBackendCommand(process.platform, "lookup", this.#keyId);
+        if (backend.protection !== candidate.protection) throw new ConnectionError(
+          "CREDENTIAL_BACKEND_UNAVAILABLE", `This credential vault is protected by ${candidate.protection}`,
+        );
+        key = await runCredentialBackend("lookup", this.#keyId);
+      } else throw new ConnectionError("CREDENTIAL_STORE_FAILED", "The wrapped credential key file is invalid");
+      if (key.length !== 32) throw new ConnectionError("CREDENTIAL_STORE_FAILED", "The OS credential store returned an invalid credential key");
       this.#key = key;
       return key;
     }
     const key = randomBytes(32);
-    const wrapped = await dpapi("protect", key);
-    await atomicJson(this.#keyPath, {
-      version: FILE_VERSION,
-      protection: "dpapi-current-user",
-      wrappedKey: wrapped.toString("base64"),
-    } satisfies WrappedKeyFile);
+    if (process.platform === "win32") {
+      const wrapped = await dpapi("protect", key);
+      await atomicJson(this.#keyPath, {
+        version: FILE_VERSION,
+        protection: "dpapi-current-user",
+        wrappedKey: wrapped.toString("base64"),
+      } satisfies WrappedKeyFile);
+    } else {
+      const backend = credentialBackendCommand(process.platform, "store", this.#keyId);
+      await runCredentialBackend("store", this.#keyId, key);
+      await atomicJson(this.#keyPath, {
+        version: FILE_VERSION,
+        protection: backend.protection,
+        keyId: this.#keyId,
+      } satisfies WrappedKeyFile);
+    }
     this.#key = key;
     return key;
   }
@@ -552,6 +682,24 @@ function validateTimeout(value: unknown, id?: string): void {
   }
 }
 
+function validateContainerConfig(config: Readonly<Record<string, unknown>>, id?: string): void {
+  if (typeof config.engine !== "string" || !isAbsolute(config.engine)) throw new ConnectionError(
+    "CONNECTION_INVALID", "Container sandboxes require an absolute Docker or Podman executable path", id,
+  );
+  if (typeof config.image !== "string" || !/^[A-Za-z0-9][A-Za-z0-9./:@_-]{0,511}$/u.test(config.image)) {
+    throw new ConnectionError("CONNECTION_INVALID", "Container sandbox image is invalid", id);
+  }
+  if (config.network !== undefined && config.network !== "none") throw new ConnectionError(
+    "CONNECTION_INVALID", "Container sandbox network must remain disabled", id,
+  );
+  for (const [key, minimum, maximum] of [["memoryMb", 64, 4096], ["cpus", 0.1, 8], ["pids", 8, 512]] as const) {
+    const value = config[key];
+    if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum)) {
+      throw new ConnectionError("CONNECTION_INVALID", `Container sandbox ${key} must be between ${minimum} and ${maximum}`, id);
+    }
+  }
+}
+
 function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateInput & { id: string; scope: ConnectionProfile["scope"]; kind: ConnectionProfile["kind"] })): void {
   if (!CONNECTION_ID.test(input.id ?? "generated") || !input.name?.trim() || input.name.trim().length > 120 || !isRecord(input.config)) {
     throw new ConnectionError("CONNECTION_INVALID", "Connection id, name, or config is invalid", input.id);
@@ -576,7 +724,9 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
         "url", "headers", "headerCredentials", "timeoutMs", "connector", "authScheme",
         "method", "requestEncoding", "queryParameter", "limitParameter", "staticParameters",
         "responseItemsPath", "titleField", "urlField", "snippetField", "contentField",
-        "testUrl", "testMethod",
+        "cursorParameter", "nextCursorPath", "testUrl", "testMethod",
+        "scrapeUrl", "scrapeMethod", "scrapeUrlParameter", "scrapeStaticParameters",
+        "scrapeContentPath", "scrapeTitlePath", "scrapeSourceUrlPath",
       ]
       : ["url", "headers", "headerCredentials", "timeoutMs"], input.id);
     validatePublicConfig(input.config);
@@ -600,10 +750,20 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
         throw new ConnectionError("CONNECTION_INVALID", "Search test method must be GET or POST", input.id);
       }
       if (input.config.testUrl !== undefined) secureEndpoint(input.config.testUrl, "Search test", input.id);
+      if (input.config.scrapeUrl !== undefined) secureEndpoint(input.config.scrapeUrl, "Scrape connector", input.id);
+      if (input.config.scrapeMethod !== undefined && input.config.scrapeMethod !== "POST") throw new ConnectionError(
+        "CONNECTION_INVALID", "Scrape request method must be POST", input.id,
+      );
       if (input.config.staticParameters !== undefined && !isRecord(input.config.staticParameters)) {
         throw new ConnectionError("CONNECTION_INVALID", "Search staticParameters must be an object", input.id);
       }
-      for (const field of ["queryParameter", "limitParameter", "titleField", "urlField", "snippetField", "contentField"] as const) {
+      if (input.config.scrapeStaticParameters !== undefined && !isRecord(input.config.scrapeStaticParameters)) {
+        throw new ConnectionError("CONNECTION_INVALID", "Scrape staticParameters must be an object", input.id);
+      }
+      for (const field of [
+        "queryParameter", "limitParameter", "cursorParameter", "titleField", "urlField", "snippetField", "contentField",
+        "scrapeUrlParameter",
+      ] as const) {
         const value = input.config[field];
         if (value !== undefined && (typeof value !== "string" || value.length > 256
           || (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value) && !/^\/(?:[^/~]|~[01])+(?:\/(?:[^/~]|~[01])+)*$/.test(value)))) {
@@ -615,15 +775,34 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
         || (input.config.responseItemsPath !== "" && !/^\/(?:[^/~]|~[01])+(?:\/(?:[^/~]|~[01])+)*$/.test(input.config.responseItemsPath)))) {
         throw new ConnectionError("CONNECTION_INVALID", "Search responseItemsPath must be a JSON Pointer", input.id);
       }
+      for (const field of ["nextCursorPath", "scrapeContentPath", "scrapeTitlePath", "scrapeSourceUrlPath"] as const) {
+        const value = input.config[field];
+        if (value !== undefined && (typeof value !== "string" || value.length > 512
+          || !/^\/(?:[^/~]|~[01])+(?:\/(?:[^/~]|~[01])+)*$/u.test(value))) throw new ConnectionError(
+          "CONNECTION_INVALID", `Tool Service ${field} must be a JSON Pointer`, input.id,
+        );
+      }
     }
     validateTimeout(input.config.timeoutMs, input.id);
     return;
   }
   if (input.kind === "local-runtime") {
-    assertConfigKeys(input.config, ["command", "args", "cwd", "timeoutMs"], input.id);
+    assertConfigKeys(input.config, [
+      "sandbox", "engine", "image", "runtime", "command", "args", "cwd", "timeoutMs",
+      "memoryMb", "cpus", "pids", "network",
+    ], input.id);
     validatePublicConfig(input.config);
-    if (typeof input.config.command !== "string" || !input.config.command.trim() || !isAbsolute(input.config.command)) {
-      throw new ConnectionError("CONNECTION_INVALID", "Local Runtime Connections require an absolute command path", input.id);
+    if (input.config.sandbox === "container") {
+      validateContainerConfig(input.config, input.id);
+      if (!["node", "python", "shell", "custom"].includes(String(input.config.runtime))) throw new ConnectionError(
+        "CONNECTION_INVALID", "Sandbox runtime must be node, python, shell, or custom", input.id,
+      );
+      if (input.config.command !== undefined && (typeof input.config.command !== "string"
+        || input.config.command.length === 0 || input.config.command.length > 8_192 || input.config.command.includes("\0"))) {
+        throw new ConnectionError("CONNECTION_INVALID", "Sandbox command is invalid", input.id);
+      }
+    } else if (typeof input.config.command !== "string" || !input.config.command.trim() || !isAbsolute(input.config.command)) {
+      throw new ConnectionError("CONNECTION_INVALID", "Trusted Local Runtime Connections require an absolute command path", input.id);
     }
     if (input.config.args !== undefined && (!Array.isArray(input.config.args)
       || input.config.args.length > 256
@@ -637,7 +816,10 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
   const transport = input.config.transport;
   if (transport === "stdio") assertConfigKeys(
     input.config,
-    ["transport", "protocol", "command", "args", "cwd", "environmentCredentials", "timeoutMs"],
+    [
+      "transport", "protocol", "sandbox", "engine", "image", "command", "args", "cwd",
+      "environmentCredentials", "timeoutMs", "memoryMb", "cpus", "pids", "network",
+    ],
     input.id,
   );
   else if (transport === "http") assertConfigKeys(
@@ -652,9 +834,21 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
   }
   validateTimeout(input.config.timeoutMs, input.id);
   if (transport === "stdio") {
+    if (input.config.sandbox === "container") {
+      validateContainerConfig(input.config, input.id);
+      if (input.config.cwd !== undefined) throw new ConnectionError(
+        "CONNECTION_INVALID", "Containerized MCP uses its isolated /workspace directory and cannot bind a host cwd", input.id,
+      );
+    }
     if (typeof input.config.command !== "string" || !input.config.command.trim() || input.config.command.length > 32_768
-      || !isAbsolute(input.config.command)) {
-      throw new ConnectionError("CONNECTION_INVALID", "MCP stdio connections require an absolute command path", input.id);
+      || input.config.command.includes("\0") || (input.config.sandbox !== "container" && !isAbsolute(input.config.command))) {
+      throw new ConnectionError(
+        "CONNECTION_INVALID",
+        input.config.sandbox === "container"
+          ? "Containerized MCP requires a bounded command available in its image"
+          : "Legacy MCP stdio metadata requires an absolute command path",
+        input.id,
+      );
     }
     if (input.config.args !== undefined && (!Array.isArray(input.config.args)
       || input.config.args.length > 256
@@ -789,10 +983,21 @@ export async function canonicalExecutable(command: unknown, connectionId?: strin
   };
 }
 
-export async function mcpProcessFingerprint(profile: ConnectionProfile): Promise<string> {
+export async function mcpProcessFingerprint(
+  profile: ConnectionProfile,
+  container?: Awaited<ReturnType<typeof containerImageIdentity>>,
+): Promise<string> {
   if (profile.kind !== "mcp" || profile.config.transport !== "stdio") throw new ConnectionError(
     "CONNECTION_TYPE_MISMATCH", `Connection '${profile.id}' is not MCP stdio`, profile.id,
   );
+  if (profile.config.sandbox === "container") {
+    container ??= await containerImageIdentity(profile);
+    return createHash("sha256").update(JSON.stringify({
+      engine: container.engine,
+      imageId: container.imageId,
+      config: canonicalJson(profile.config),
+    })).digest("hex");
+  }
   const executable = await canonicalExecutable(profile.config.command, profile.id);
   const canonical = JSON.stringify({
     command: executable,
@@ -804,6 +1009,110 @@ export async function mcpProcessFingerprint(profile: ConnectionProfile): Promise
   return createHash("sha256").update(canonical).digest("hex");
 }
 
+export function containerEngineEnvironment(): Record<string, string> {
+  return Object.fromEntries([
+    "HOME", "USERPROFILE", "SystemRoot", "TEMP", "TMP", "XDG_RUNTIME_DIR", "DOCKER_HOST", "CONTAINER_HOST",
+  ].flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
+}
+
+export async function detectContainerEngine(): Promise<string> {
+  const windowsRoots = [process.env.ProgramFiles, process.env.LOCALAPPDATA].filter(
+    (value): value is string => typeof value === "string" && isAbsolute(value),
+  );
+  const candidates = process.platform === "win32"
+    ? windowsRoots.flatMap((root) => [
+      join(root, "Docker", "Docker", "resources", "bin", "docker.exe"),
+      join(root, "RedHat", "Podman", "podman.exe"),
+    ])
+    : process.platform === "darwin"
+      ? [
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+        "/opt/homebrew/bin/docker", "/usr/local/bin/docker", "/opt/homebrew/bin/podman", "/usr/local/bin/podman",
+      ]
+      : ["/usr/bin/docker", "/usr/local/bin/docker", "/usr/bin/podman", "/usr/local/bin/podman"];
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      return (await canonicalExecutable(candidate)).path;
+    } catch {
+      // Continue through fixed, trusted installation locations.
+    }
+  }
+  throw new ConnectionError(
+    "CONNECTION_TEST_FAILED",
+    "No Docker or Podman engine was found. Install one, start it, then Connect again.",
+  );
+}
+
+export function containerRunArguments(
+  profile: ConnectionProfile,
+  name: string,
+  command: readonly string[],
+  environmentNames: readonly string[] = [],
+  imageIdentity?: string,
+): string[] {
+  if (profile.config.sandbox !== "container" || typeof profile.config.image !== "string") throw new ConnectionError(
+    "CONNECTION_TYPE_MISMATCH", `Connection '${profile.id}' is not a container sandbox`, profile.id,
+  );
+  const memoryMb = typeof profile.config.memoryMb === "number" ? profile.config.memoryMb : 256;
+  const cpus = typeof profile.config.cpus === "number" ? profile.config.cpus : 1;
+  const pids = typeof profile.config.pids === "number" ? profile.config.pids : 64;
+  return [
+    "run", "--rm", "--name", name, "--pull", "never", "--network", "none", "--read-only",
+    "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", String(pids),
+    "--memory", `${memoryMb}m`, "--cpus", String(cpus), "--stop-timeout", "1",
+    "--tmpfs", "/workspace:rw,nosuid,nodev,size=64m", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+    "--workdir", "/workspace", "--user", "65534:65534",
+    ...environmentNames.flatMap((name) => ["--env", name]),
+    imageIdentity ?? profile.config.image,
+    ...command,
+  ];
+}
+
+async function containerImageIdentity(profile: ConnectionProfile, signal = new AbortController().signal): Promise<{
+  readonly engine: Awaited<ReturnType<typeof canonicalExecutable>>;
+  readonly imageId: string;
+}> {
+  if (profile.config.sandbox !== "container"
+    || (profile.kind !== "local-runtime" && !(profile.kind === "mcp" && profile.config.transport === "stdio"))) throw new ConnectionError(
+    "CONNECTION_TYPE_MISMATCH", `Connection '${profile.id}' is not a container sandbox`, profile.id,
+  );
+  const engine = await canonicalExecutable(profile.config.engine, profile.id);
+  const result = await runBoundedProcess({
+    toolId: `connection:${profile.id}`,
+    command: engine.path,
+    args: ["image", "inspect", "--format", "{{.Id}}", profile.config.image as string],
+    cwd: dirname(engine.path),
+    stdin: "",
+    timeoutMs: typeof profile.config.timeoutMs === "number" ? profile.config.timeoutMs : 30_000,
+    maxInputBytes: 1,
+    maxOutputBytes: 64 * 1_024,
+    signal,
+    environment: containerEngineEnvironment(),
+  });
+  const imageId = result.stdout.trim();
+  if (!/^(?:sha256:)?[a-f0-9]{64}$/u.test(imageId)) throw new ConnectionError(
+    "CONNECTION_TEST_FAILED", "Container engine returned an invalid image identity", profile.id,
+  );
+  return { engine, imageId };
+}
+
+async function processFingerprint(
+  profile: ConnectionProfile,
+  container?: Awaited<ReturnType<typeof containerImageIdentity>>,
+): Promise<string> {
+  if (profile.kind === "mcp") return mcpProcessFingerprint(profile, container);
+  if (profile.kind !== "local-runtime") throw new ConnectionError(
+    "CONNECTION_TYPE_MISMATCH", `Connection '${profile.id}' is not a process runtime`, profile.id,
+  );
+  container ??= profile.config.sandbox === "container" ? await containerImageIdentity(profile) : undefined;
+  const executable = container?.engine ?? await canonicalExecutable(profile.config.command, profile.id);
+  return createHash("sha256").update(JSON.stringify({
+    executable,
+    ...(container ? { imageId: container.imageId } : {}),
+    config: canonicalJson(profile.config),
+  })).digest("hex");
+}
+
 /** Stable approval identity; binds a visible Tool id to its saved Connection and exact MCP action. */
 export function mcpToolApprovalId(connectionId: string, action: string): string {
   return `mcp.${createHash("sha256").update(connectionId).update("\0").update(action).digest("hex")}`;
@@ -813,7 +1122,7 @@ export class ConnectionManager implements ConnectionCatalog {
   readonly #root: Promise<string>;
   readonly #projectFile: string;
   readonly #userFile: string;
-  readonly #vault: DpapiCredentialVault;
+  readonly #vault: CredentialVault;
   readonly #now: () => Date;
   #projectBinding: Promise<string> | undefined;
 
@@ -823,7 +1132,7 @@ export class ConnectionManager implements ConnectionCatalog {
     this.#projectFile = join(absolute, ".harnest", "connections.json");
     const userDirectory = resolve(/* turbopackIgnore: true */ options.userDataDirectory ?? defaultUserDataDirectory());
     this.#userFile = join(userDirectory, "connections.json");
-    this.#vault = new DpapiCredentialVault(userDirectory);
+    this.#vault = new CredentialVault(userDirectory);
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -925,7 +1234,8 @@ export class ConnectionManager implements ConnectionCatalog {
     const stored = await this.#vault.read(vaultBinding);
     this.#assertVaultBinding(current, stored);
     const configChanged = JSON.stringify(current.config) !== JSON.stringify(candidate.config);
-    const changedLaunch = current.kind === "mcp" && current.config.transport === "stdio" && configChanged;
+    const changedLaunch = configChanged && (current.kind === "local-runtime"
+      || (current.kind === "mcp" && current.config.transport === "stdio"));
     const changedStdioCredential = current.kind === "mcp" && current.config.transport === "stdio"
       && credentials !== undefined;
     const changedHttpResource = current.kind === "mcp" && current.config.transport === "http"
@@ -1037,9 +1347,31 @@ export class ConnectionManager implements ConnectionCatalog {
     return this.resolveCredential(decodeURIComponent(match[1]!), decodeURIComponent(match[2]!));
   }
 
-  async approveProcess(id: string): Promise<string> {
-    const profile = await this.require(id, "mcp");
-    const fingerprint = await mcpProcessFingerprint(profile);
+  async approveProcess(id: string, options: { readonly pullImage?: boolean; readonly signal?: AbortSignal } = {}): Promise<string> {
+    const profile = await this.require(id);
+    if (options.pullImage && profile.config.sandbox === "container") {
+      try {
+        await containerImageIdentity(profile, options.signal);
+      } catch {
+        const engine = await canonicalExecutable(profile.config.engine, profile.id);
+        const pulled = await runBoundedProcess({
+          toolId: `connection:${profile.id}:pull`,
+          command: engine.path,
+          args: ["pull", profile.config.image as string],
+          cwd: dirname(engine.path),
+          stdin: "",
+          timeoutMs: 300_000,
+          maxInputBytes: 1,
+          maxOutputBytes: 4 * 1_048_576,
+          signal: options.signal ?? new AbortController().signal,
+          environment: containerEngineEnvironment(),
+        });
+        if (pulled.exitCode !== 0) throw new ConnectionError(
+          "CONNECTION_TEST_FAILED", `Container image could not be downloaded: ${pulled.stderr.trim() || "engine failed"}`, profile.id,
+        );
+      }
+    }
+    const fingerprint = await processFingerprint(profile);
     await this.#vault.update(await this.#binding(profile.scope, id), (entry) => {
       this.#assertVaultBinding(profile, entry);
       return { ...entry, processApproval: fingerprint, profileBinding: connectionProfileBinding(profile) };
@@ -1047,16 +1379,18 @@ export class ConnectionManager implements ConnectionCatalog {
     return fingerprint;
   }
 
-  async assertProcessApproved(profile: ConnectionProfile): Promise<void> {
-    const fingerprint = await mcpProcessFingerprint(profile);
+  async assertProcessApproved(profile: ConnectionProfile): Promise<string | undefined> {
+    const container = profile.config.sandbox === "container" ? await containerImageIdentity(profile) : undefined;
+    const fingerprint = await processFingerprint(profile, container);
     const entry = await this.#vault.read(await this.#binding(profile.scope, profile.id));
     this.#assertVaultBinding(profile, entry);
     const approved = entry?.processApproval;
     if (!approved || approved !== fingerprint) throw new ConnectionError(
       "PROCESS_APPROVAL_REQUIRED",
-      `MCP stdio launch profile '${profile.name}' must be reviewed and approved`,
+      `Process launch profile '${profile.name}' must be reviewed and approved`,
       profile.id,
     );
+    return container?.imageId;
   }
 
   async test(id: string, options: ConnectionTestOptions = {}): Promise<ConnectionProfile> {
@@ -1075,6 +1409,51 @@ export class ConnectionManager implements ConnectionCatalog {
       } catch (cause) {
         const failed = await this.#setFailureStatus(profile, cause);
         throw new ConnectionError("CONNECTION_TEST_FAILED", failed.status.message ?? "Connection test failed", id, cause);
+      }
+    }
+    if (profile.kind === "http-api") {
+      try {
+        const url = secureEndpoint(profile.config.url, "HTTP API", profile.id);
+        const headers = new Headers({ accept: "application/json, text/plain;q=0.9, */*;q=0.1" });
+        for (const [name, value] of Object.entries(isRecord(profile.config.headers) ? profile.config.headers : {})) {
+          if (typeof value === "string") headers.set(name, value);
+        }
+        for (const [name, field] of Object.entries(isRecord(profile.config.headerCredentials)
+          ? profile.config.headerCredentials : {})) {
+          if (typeof field !== "string") continue;
+          const value = await this.resolveCredential(profile.id, field);
+          if (value === undefined) throw new Error(`Credential field '${field}' is required`);
+          headers.set(name, value);
+        }
+        const request = guardedFetch(true, {
+          timeoutMs: typeof profile.config.timeoutMs === "number" ? profile.config.timeoutMs : 30_000,
+          maxResponseBytes: 64 * 1_024,
+        });
+        let response = await request(url, { method: "HEAD", headers, redirect: "error", ...(options.signal ? { signal: options.signal } : {}) });
+        if (response.status === 405 || response.status === 501) {
+          response = await request(url, { method: "GET", headers, redirect: "error", ...(options.signal ? { signal: options.signal } : {}) });
+        }
+        if (response.status === 401 || response.status === 403) throw new Error(`HTTP API returned ${response.status} Unauthorized`);
+        if (response.status >= 500) throw new Error(`HTTP API returned ${response.status}`);
+        return await this.#setStatus(profile, {
+          state: "connected", checkedAt: timestamp(this.#now), message: `HTTP API is reachable (HTTP ${response.status})`,
+        });
+      } catch (cause) {
+        const failed = await this.#setFailureStatus(profile, cause);
+        throw new ConnectionError("CONNECTION_TEST_FAILED", failed.status.message ?? "HTTP API test failed", id, cause);
+      }
+    }
+    if (profile.kind === "local-runtime" && profile.config.sandbox === "container") {
+      try {
+        const { imageId } = await containerImageIdentity(profile, options.signal);
+        return await this.#setStatus(profile, {
+          state: "connected",
+          checkedAt: timestamp(this.#now),
+          message: `Isolated container image ${imageId.slice(0, 19)}… is ready`,
+        });
+      } catch (cause) {
+        const failed = await this.#setFailureStatus(profile, cause);
+        throw new ConnectionError("CONNECTION_TEST_FAILED", failed.status.message ?? "Sandbox test failed", id, cause);
       }
     }
     if (profile.kind !== "mcp") {
@@ -1149,6 +1528,7 @@ export class ConnectionManager implements ConnectionCatalog {
     readonly scope?: string;
     readonly allowNetworkHosts?: true | readonly string[];
     readonly timeoutMs?: number;
+    readonly forceReauthorization?: boolean;
   }): Promise<OAuthStartResult> {
     validateTimeout(options.timeoutMs, id);
     const profile = await this.require(id, "mcp");
@@ -1169,6 +1549,8 @@ export class ConnectionManager implements ConnectionCatalog {
       result = await auth(provider, {
         serverUrl: profile.config.url,
         ...(options.scope ? { scope: options.scope } : {}),
+        ...((options.forceReauthorization === true || profile.status.state === "insufficient_scope")
+          ? { forceReauthorization: true } : {}),
         fetchFn: guardedFetch(options.allowNetworkHosts, {
           timeoutMs: options.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS,
           maxResponseBytes: MAX_DISCOVERY_BYTES,
@@ -1669,6 +2051,103 @@ function connectionFailureState(
   return "error";
 }
 
+const MAX_FETCH_REQUEST_BYTES = 16 * 1_048_576;
+const NON_PUBLIC_IPV4 = new BlockList();
+const NON_PUBLIC_IPV6 = new BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
+  ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const) NON_PUBLIC_IPV4.addSubnet(network, prefix, "ipv4");
+for (const [network, prefix] of [
+  ["::", 128], ["::1", 128], ["::ffff:0:0", 96], ["64:ff9b:1::", 48], ["100::", 64],
+  ["2001:db8::", 32], ["2001:10::", 28], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+] as const) NON_PUBLIC_IPV6.addSubnet(network, prefix, "ipv6");
+
+interface PinnedAddress {
+  readonly address: string;
+  readonly family: 4 | 6;
+}
+
+export function pinnedLookup(address: PinnedAddress): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [address]);
+      return;
+    }
+    callback(null, address.address, address.family);
+  };
+}
+
+const bareHostname = (hostname: string): string => hostname.startsWith("[") && hostname.endsWith("]")
+  ? hostname.slice(1, -1) : hostname;
+
+const blockedAddress = ({ address, family }: PinnedAddress): boolean =>
+  family === 4 ? NON_PUBLIC_IPV4.check(address, "ipv4") : NON_PUBLIC_IPV6.check(address, "ipv6");
+
+async function pinnedAddress(url: URL): Promise<PinnedAddress> {
+  const hostname = bareHostname(url.hostname);
+  const literalFamily = isIP(hostname);
+  const literalLoopback = hostname === "127.0.0.1" || hostname === "::1";
+  if (literalLoopback) return { address: hostname, family: literalFamily as 4 | 6 };
+  let addresses: PinnedAddress[];
+  try {
+    addresses = literalFamily
+      ? [{ address: hostname, family: literalFamily as 4 | 6 }]
+      : (await lookup(hostname, { all: true, verbatim: true })) as PinnedAddress[];
+  } catch (cause) {
+    throw new ConnectionError("CONNECTION_INVALID", `Network host '${url.host}' could not be resolved safely`, undefined, cause);
+  }
+  if (!addresses.length || addresses.some(blockedAddress)) throw new ConnectionError(
+    "CONNECTION_INVALID",
+    `Network host '${url.host}' resolves to a private or reserved address`,
+  );
+  return addresses[0]!;
+}
+
+async function pinnedFetch(
+  url: URL,
+  request: Request,
+  address: PinnedAddress,
+  signal: AbortSignal,
+): Promise<Response> {
+  const body = request.body ? Buffer.from(await request.arrayBuffer()) : undefined;
+  if (body && body.byteLength > MAX_FETCH_REQUEST_BYTES) throw new ConnectionError(
+    "CONNECTION_INVALID", "Protocol request exceeds the safe size limit",
+  );
+  const headers = Object.fromEntries(request.headers.entries());
+  delete headers.host;
+  delete headers.connection;
+  delete headers["transfer-encoding"];
+  if (!headers["accept-encoding"]) headers["accept-encoding"] = "identity";
+  if (body && !headers["content-length"]) headers["content-length"] = String(body.byteLength);
+  return new Promise<Response>((resolveResponse, reject) => {
+    const transport = url.protocol === "https:" ? requestHttps : requestHttp;
+    const outgoing = transport(url, {
+      method: request.method,
+      headers,
+      signal,
+      maxHeaderSize: 32 * 1_024,
+      lookup: pinnedLookup(address),
+    }, (incoming) => {
+      const responseHeaders = new Headers();
+      for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+        responseHeaders.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
+      }
+      const status = incoming.statusCode ?? 500;
+      const noBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304;
+      resolveResponse(new Response(noBody ? null : Readable.toWeb(incoming) as ReadableStream<Uint8Array>, {
+        status,
+        headers: responseHeaders,
+        ...(incoming.statusMessage === undefined ? {} : { statusText: incoming.statusMessage }),
+      }));
+    });
+    outgoing.once("error", reject);
+    outgoing.end(body);
+  });
+}
+
 function assertAllowedUrl(url: URL, allowed: true | readonly string[] | undefined): void {
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.hash) {
     throw new ConnectionError("CONNECTION_INVALID", "Connection URL must use http(s) and contain no credentials or fragment");
@@ -1717,17 +2196,14 @@ export function guardedFetch(
     readonly maxStreamBytes?: number;
   } = {},
 ): FetchLike {
-  return async (request, init) => {
-    const url = new URL(request instanceof Request ? request.url : request.toString());
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
     assertAllowedUrl(url, allowed);
-    const signals = [request instanceof Request ? request.signal : undefined, init?.signal]
-      .filter((signal): signal is AbortSignal => signal !== undefined);
+    const signals = [request.signal];
     if (options.timeoutMs !== undefined) signals.push(AbortSignal.timeout(options.timeoutMs));
-    const response = await fetch(request, {
-      ...init,
-      ...(signals.length ? { signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals) } : {}),
-      redirect: "error",
-    });
+    const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
+    const response = await pinnedFetch(url, request, await pinnedAddress(url), signal);
     const maximum = options.maxResponseBytes ?? options.maxStreamBytes;
     const declared = response.headers.get("content-length");
     if (maximum !== undefined && declared && /^\d+$/.test(declared) && Number(declared) > maximum) {
@@ -1765,8 +2241,10 @@ function pointerValue(value: unknown, path: unknown, fallback: string): unknown 
 function searchResults(value: unknown, profile: ConnectionProfile, limit: number): unknown {
   const rows = pointerValue(value, profile.config.responseItemsPath, "/results");
   if (!Array.isArray(rows)) throw new Error("Search connector response must contain a results array");
+  const nextCursor = pointerValue(value, profile.config.nextCursorPath, "nextCursor");
   return {
     provider: typeof profile.config.connector === "string" ? profile.config.connector : "custom-search",
+    ...(typeof nextCursor === "string" || typeof nextCursor === "number" ? { nextCursor: String(nextCursor) } : {}),
     results: rows.slice(0, limit).flatMap((entry) => {
       if (!searchRecord(entry)) return [];
       const urlValue = pointerValue(entry, profile.config.urlField, "url");
@@ -1786,6 +2264,18 @@ function searchResults(value: unknown, profile: ConnectionProfile, limit: number
   };
 }
 
+async function toolServiceHeaders(manager: ConnectionManager, profile: ConnectionProfile): Promise<Headers> {
+  const headers = new Headers({ accept: "application/json" });
+  for (const [name, value] of Object.entries(isRecord(profile.config.headers) ? profile.config.headers : {})) {
+    if (typeof value === "string") headers.set(name, value);
+  }
+  const token = await manager.resolveCredential(profile.id, "token");
+  if (profile.config.authScheme === "bearer" && !token) throw new Error("Search credential is required");
+  if (token) headers.set("authorization", profile.config.authScheme === "bearer"
+    ? `Bearer ${token.replace(/^Bearer\s+/i, "")}` : token);
+  return headers;
+}
+
 /** Executes the stable Web Search contract through a saved, origin-bound Connection. */
 export async function executeWebSearchConnection(
   manager: ConnectionManager,
@@ -1793,6 +2283,7 @@ export async function executeWebSearchConnection(
   options: {
     readonly query: string;
     readonly limit: number;
+    readonly cursor?: string;
     readonly signal?: AbortSignal;
     readonly testOnly?: boolean;
   },
@@ -1803,14 +2294,7 @@ export async function executeWebSearchConnection(
   );
   const endpoint = secureEndpoint(profile.config.url, "Search connector", profile.id);
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit)));
-  const headers = new Headers({ accept: "application/json" });
-  for (const [name, value] of Object.entries(isRecord(profile.config.headers) ? profile.config.headers : {})) {
-    if (typeof value === "string") headers.set(name, value);
-  }
-  const token = await manager.resolveCredential(profile.id, "token");
-  if (profile.config.authScheme === "bearer" && !token) throw new Error("Search credential is required");
-  if (token) headers.set("authorization", profile.config.authScheme === "bearer"
-    ? `Bearer ${token.replace(/^Bearer\s+/i, "")}` : token);
+  const headers = await toolServiceHeaders(manager, profile);
 
   let url = endpoint;
   let init: RequestInit = {
@@ -1826,6 +2310,9 @@ export async function executeWebSearchConnection(
     const queryParameter = typeof profile.config.queryParameter === "string" ? profile.config.queryParameter : "query";
     const limitParameter = typeof profile.config.limitParameter === "string" ? profile.config.limitParameter : "limit";
     const parameters = { ...staticParameters, [queryParameter]: options.query, [limitParameter]: limit };
+    if (options.cursor && typeof profile.config.cursorParameter === "string") {
+      parameters[profile.config.cursorParameter] = options.cursor;
+    }
     if (encoding === "query") {
       url = new URL(endpoint);
       for (const [name, value] of Object.entries(parameters)) {
@@ -1855,21 +2342,72 @@ export async function executeWebSearchConnection(
   return searchResults(value, profile, limit);
 }
 
+/** Extracts one public page through the same saved Tool Service Connection. */
+export async function executeWebScrapeConnection(
+  manager: ConnectionManager,
+  profileOrId: ConnectionProfile | string,
+  options: { readonly url: string; readonly signal?: AbortSignal },
+): Promise<unknown> {
+  const profile = typeof profileOrId === "string" ? await manager.require(profileOrId) : profileOrId;
+  if (profile.kind !== "tool-service" || typeof profile.config.scrapeUrl !== "string") throw new ConnectionError(
+    "CONNECTION_TYPE_MISMATCH", "Web Scrape requires a Tool Service Connection with a scrape endpoint", profile.id,
+  );
+  let target: URL;
+  try {
+    target = new URL(options.url);
+  } catch (cause) {
+    throw new ConnectionError("CONNECTION_INVALID", "Scrape target URL is invalid", profile.id, cause);
+  }
+  const literalFamily = isIP(bareHostname(target.hostname));
+  if ((target.protocol !== "http:" && target.protocol !== "https:") || target.username || target.password || target.hash
+    || (literalFamily !== 0 && blockedAddress({ address: bareHostname(target.hostname), family: literalFamily as 4 | 6 }))) {
+    throw new ConnectionError("CONNECTION_INVALID", "Scrape target must be a public HTTP(S) URL without credentials or a fragment", profile.id);
+  }
+  await pinnedAddress(target);
+  const endpoint = secureEndpoint(profile.config.scrapeUrl, "Scrape connector", profile.id);
+  const headers = await toolServiceHeaders(manager, profile);
+  headers.set("content-type", "application/json");
+  const urlParameter = typeof profile.config.scrapeUrlParameter === "string" ? profile.config.scrapeUrlParameter : "url";
+  const parameters = {
+    ...(isRecord(profile.config.scrapeStaticParameters) ? structuredClone(profile.config.scrapeStaticParameters) : {}),
+    [urlParameter]: target.toString(),
+  };
+  const timeout = typeof profile.config.timeoutMs === "number" ? profile.config.timeoutMs : 60_000;
+  const response = await guardedFetch(true, { timeoutMs: timeout, maxResponseBytes: MAX_DISCOVERY_BYTES })(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(parameters),
+    redirect: "error",
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+  const body = await response.text();
+  let value: unknown;
+  try {
+    value = body ? JSON.parse(body) as unknown : null;
+  } catch {
+    throw new Error(`Scrape connector returned invalid JSON (HTTP ${response.status})`);
+  }
+  if (!response.ok) {
+    const message = searchRecord(value)?.error ?? searchRecord(value)?.message;
+    throw new Error(`Scrape connector returned HTTP ${response.status}${typeof message === "string" ? `: ${message}` : ""}`);
+  }
+  const content = pointerValue(value, profile.config.scrapeContentPath, "/data/markdown");
+  if (typeof content !== "string") throw new Error("Scrape connector response does not contain text content");
+  const title = pointerValue(value, profile.config.scrapeTitlePath, "/data/metadata/title");
+  const sourceUrl = pointerValue(value, profile.config.scrapeSourceUrlPath, "/data/metadata/sourceURL");
+  return {
+    provider: typeof profile.config.connector === "string" ? profile.config.connector : "custom-search",
+    url: typeof sourceUrl === "string" ? sourceUrl : target.toString(),
+    ...(typeof title === "string" ? { title } : {}),
+    content,
+  };
+}
+
 export function protocolMode(config: Readonly<Record<string, unknown>>, transport: "stdio" | "http") {
   const protocol = config.protocol ?? (transport === "http" ? "auto" : "legacy");
   if (protocol === "auto") return { mode: "auto" as const };
   if (protocol === "2026-07-28") return { mode: { pin: "2026-07-28" } as const };
   return { mode: "legacy" as const };
-}
-
-async function projectWorkingDirectory(manager: ConnectionManager, profile: ConnectionProfile): Promise<string> {
-  const project = dirname(dirname(manager.paths().projectMetadata));
-  const root = await realpath(project);
-  const configured = typeof profile.config.cwd === "string" ? profile.config.cwd : ".";
-  if (isAbsolute(configured)) throw new ConnectionError("CONNECTION_INVALID", "MCP stdio cwd must be project-relative", profile.id);
-  const target = await realpath(resolve(root, configured));
-  if (!isInside(root, target)) throw new ConnectionError("CONNECTION_INVALID", "MCP stdio cwd resolves outside the project", profile.id);
-  return target;
 }
 
 export async function openMcpConnection(
@@ -1891,15 +2429,20 @@ export async function openMcpConnection(
   );
   const timeout = options.timeoutMs ?? (typeof profile.config.timeoutMs === "number" ? profile.config.timeoutMs : 30_000);
   let transport: StdioClientTransport | StreamableHTTPClientTransport;
+  let cleanupContainer: (() => Promise<void>) | undefined;
   if (transportType === "stdio") {
-    await manager.assertProcessApproved(profile);
-    const executable = await canonicalExecutable(profile.config.command, profile.id);
-    const allowed = options.allowProcessCommands?.some((command) => process.platform === "win32"
-      ? command.toLocaleLowerCase() === executable.path.toLocaleLowerCase() : command === executable.path);
-    if (!allowed) throw new ConnectionError(
-      "PROCESS_APPROVAL_REQUIRED", `MCP stdio command '${executable.path}' is not allowed by this runtime`, profile.id,
+    if (profile.config.sandbox !== "container") throw new ConnectionError(
+      "PROCESS_APPROVAL_REQUIRED",
+      `MCP stdio Connection '${profile.name}' must use an isolated Docker or Podman image`,
+      profile.id,
     );
-    const environment = { ...getDefaultEnvironment() };
+    const imageId = await manager.assertProcessApproved(profile);
+    if (!imageId) throw new ConnectionError(
+      "PROCESS_APPROVAL_REQUIRED", `MCP stdio Connection '${profile.name}' has no approved container image`, profile.id,
+    );
+    const engine = await canonicalExecutable(profile.config.engine, profile.id);
+    const environment = containerEngineEnvironment();
+    const environmentNames: string[] = [];
     if (isRecord(profile.config.environmentCredentials)) {
       for (const [name, field] of Object.entries(profile.config.environmentCredentials)) {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof field !== "string") throw new ConnectionError(
@@ -1908,15 +2451,32 @@ export async function openMcpConnection(
         const value = await manager.resolveCredential(profile.id, field);
         if (value === undefined) throw new ConnectionError("CONNECTION_INVALID", `Credential field '${field}' is unavailable`, profile.id);
         environment[name] = value;
+        environmentNames.push(name);
       }
     }
+    const name = `harnest-mcp-${randomUUID()}`;
+    const command = [profile.config.command as string, ...(Array.isArray(profile.config.args) ? profile.config.args as string[] : [])];
     transport = new StdioClientTransport({
-      command: executable.path,
-      ...(Array.isArray(profile.config.args) ? { args: profile.config.args as string[] } : {}),
-      cwd: await projectWorkingDirectory(manager, profile),
+      command: engine.path,
+      args: containerRunArguments(profile, name, command, environmentNames, imageId),
+      cwd: dirname(engine.path),
       env: environment,
       stderr: "ignore",
     });
+    cleanupContainer = async () => {
+      await runBoundedProcess({
+        toolId: `connection:${profile.id}:cleanup`,
+        command: engine.path,
+        args: ["rm", "--force", name],
+        cwd: dirname(engine.path),
+        stdin: "",
+        timeoutMs: 5_000,
+        maxInputBytes: 1,
+        maxOutputBytes: 64 * 1_024,
+        signal: new AbortController().signal,
+        environment: containerEngineEnvironment(),
+      }).catch(() => undefined);
+    };
   } else {
     if (typeof profile.config.url !== "string") throw new ConnectionError("CONNECTION_INVALID", "MCP HTTP URL is missing", profile.id);
     const url = new URL(profile.config.url);
@@ -1973,10 +2533,12 @@ export async function openMcpConnection(
           : []),
         Promise.resolve().then(() => client.close()),
       ]);
+      await cleanupContainer?.();
     };
     return { client, transport, profile, tools: listed.tools, close };
   } catch (cause) {
     await client.close().catch(() => undefined);
+    await cleanupContainer?.();
     throw cause;
   }
 }

@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
+import type { AddressInfo } from "node:net";
+import { stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
@@ -13,10 +16,15 @@ import {
   AdapterRegistry,
   compileSpec,
   createBuiltinComponentRegistry,
+  DEFAULT_PROVIDER_MODELS,
+  DEFAULT_SANDBOX_IMAGES,
+  FIRECRAWL_CONNECTION_CONFIG,
   HarnessRuntime,
   runHarnessTests,
+  SEARXNG_CONNECTION_CONFIG,
   ToolRegistry,
   validateSpec,
+  type ConnectionProfile,
   type Diagnostic,
   type RunEndEvent,
   type ToolApprovalRequest,
@@ -24,10 +32,18 @@ import {
 } from "@harnest/core";
 import {
   FileRunStore,
+  ConnectionManager,
+  detectContainerEngine,
+  guardedFetch,
   loadAdapterModules,
   loadRuntimeModules,
   loadSpecFile,
   NodeRuntimeServices,
+  NodeSkillStore,
+  materializeRemoteSkill,
+  remoteSkillSourceLabel,
+  resolveRemoteSkillSource,
+  skillInstallSourceKey,
   type NodeRuntimeServiceOptions,
 } from "@harnest/core/node";
 
@@ -40,13 +56,29 @@ Usage:
   harnest test <file> [capabilities]
   harnest runs [file] [--limit <number>]
   harnest trace <run-id> [file] [--json]
+  harnest connections [file] [--json]
+  harnest connect <preset> [file] [options]
+  harnest connection <test|login|disconnect|revoke|delete> <id> [file]
+  harnest skill <list|install|review|approve> [value] [file]
   harnest studio [file] [--port <number>]
+
+Connection presets:
+  gemini, openai, anthropic, ollama, provider, firecrawl, searxng,
+  mcp-http, mcp-stdio, http, sandbox
+
+Connect options:
+  --id <id> --name <label> --scope <project|user> --model <id>
+  --adapter <id> --url <https-url> --secret-env <ENV_NAME>
+  --runtime <node|python> --image <image> --command <command> --arg <value>
+  --auth <oauth|token|none> --config <json>
+
+Secrets are read from --secret-env or a hidden TTY prompt and saved to the OS vault.
 
 Runtime capabilities (denied by default):
   --allow-modules               Execute reviewed adapter/component/tool modules
   --allow-files                 Read non-secret Context files inside the project
   --context-root <path>         Restrict Context reads to a project-relative root (repeatable)
-  --allow-process <command>     Allow one exact MCP stdio command (repeatable)
+  --allow-process <command>     Allow one exact reviewed legacy local Tool command (repeatable)
   --allow-network <host>        Allow one exact MCP HTTP host[:port] (repeatable)
   --approve-tool <id>           Pre-approve one exact risky Tool id (repeatable)
 
@@ -338,6 +370,438 @@ async function trace(file: string, runId: string, json: boolean): Promise<void> 
   }
 }
 
+interface ConnectValues {
+  id?: string;
+  name?: string;
+  scope?: string;
+  model?: string;
+  adapter?: string;
+  url?: string;
+  "secret-env"?: string;
+  runtime?: string;
+  image?: string;
+  command?: string;
+  arg?: string[];
+  auth?: string;
+  config?: string;
+}
+
+const connectionProject = (file: string): string => dirname(resolve(file));
+
+function objectJson(raw: string | undefined, label: string): Record<string, unknown> {
+  if (!raw) return {};
+  if (raw.length > 65_536) throw new Error(`${label} exceeds 64 KiB`);
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("must be an object");
+    return value as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`${label} must be a JSON object: ${error instanceof Error ? error.message : "invalid JSON"}`, { cause: error });
+  }
+}
+
+async function hiddenSecret(label: string): Promise<string> {
+  if (!process.stdin.isTTY || !process.stderr.isTTY || typeof process.stdin.setRawMode !== "function") {
+    throw new Error(`${label} is required; set it in an environment variable and pass --secret-env <NAME>`);
+  }
+  process.stderr.write(`${label} (hidden): `);
+  const input = process.stdin;
+  const previousRaw = input.isRaw;
+  input.setRawMode(true);
+  input.resume();
+  input.setEncoding("utf8");
+  return new Promise<string>((resolvePromise, reject) => {
+    let value = "";
+    const finish = (error?: Error) => {
+      input.off("data", onData);
+      input.setRawMode(previousRaw);
+      input.pause();
+      process.stderr.write("\n");
+      if (error) reject(error);
+      else resolvePromise(value);
+    };
+    const onData = (chunk: string | Buffer) => {
+      for (const character of String(chunk)) {
+        if (character === "\u0003") return finish(new Error("Credential entry cancelled"));
+        if (character === "\r" || character === "\n") return finish();
+        if (character === "\u007f" || character === "\b") value = value.slice(0, -1);
+        else if (character >= " ") value += character;
+        if (Buffer.byteLength(value, "utf8") > 65_536) return finish(new Error("Credential is too large"));
+      }
+    };
+    input.on("data", onData);
+  });
+}
+
+async function connectionSecret(
+  environmentName: string | undefined,
+  label: string,
+  required: boolean,
+): Promise<string | undefined> {
+  if (environmentName) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(environmentName)) throw new Error("--secret-env must be an exact environment variable name");
+    const value = process.env[environmentName];
+    if (!value) throw new Error(`Environment variable '${environmentName}' is empty or unavailable`);
+    return value;
+  }
+  return required ? hiddenSecret(label) : undefined;
+}
+
+const presetLabels: Record<string, string> = {
+  gemini: "Google AI Studio",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  ollama: "Ollama",
+  provider: "Custom model provider",
+  firecrawl: "Firecrawl",
+  searxng: "SearXNG",
+  "mcp-http": "MCP server",
+  "mcp-stdio": "MCP stdio server",
+  http: "HTTP API",
+  sandbox: "Code sandbox",
+};
+
+async function connectionInput(
+  preset: string,
+  values: ConnectValues,
+  current?: ConnectionProfile,
+): Promise<{
+  readonly kind: ConnectionProfile["kind"];
+  readonly name: string;
+  readonly scope: ConnectionProfile["scope"];
+  readonly config: Record<string, unknown>;
+  readonly credential?: { readonly field: "apiKey" | "token"; readonly label: string; readonly required: boolean };
+}> {
+  if (!(preset in presetLabels)) throw new Error(`Unknown Connection preset '${preset}'`);
+  const scope = values.scope ?? current?.scope ?? "project";
+  if (scope !== "project" && scope !== "user") throw new Error("--scope must be project or user");
+  const name = values.name?.trim() || current?.name || presetLabels[preset]!;
+  const override = objectJson(values.config, "--config");
+  let kind: ConnectionProfile["kind"];
+  let config: Record<string, unknown>;
+  let credential: { field: "apiKey" | "token"; label: string; required: boolean } | undefined;
+  if (["gemini", "openai", "anthropic", "ollama", "provider"].includes(preset)) {
+    kind = "provider";
+    const adapter = values.adapter ?? (preset === "provider" ? String(current?.config.adapter ?? "") : preset);
+    const model = values.model ?? String(current?.config.model ?? DEFAULT_PROVIDER_MODELS[adapter as keyof typeof DEFAULT_PROVIDER_MODELS] ?? "");
+    if (!adapter || !model) throw new Error("Provider Connections require --adapter and --model (built-in presets fill --adapter)");
+    config = {
+      ...(current?.config ?? {}),
+      adapter,
+      model,
+      ...((values.url ?? current?.config.baseUrl) ? { baseUrl: values.url ?? current?.config.baseUrl } : {}),
+      ...override,
+    };
+    credential = { field: "apiKey", label: `${name} API key`, required: adapter !== "ollama" };
+  } else if (preset === "firecrawl" || preset === "searxng") {
+    kind = "tool-service";
+    config = {
+      ...(preset === "firecrawl" ? FIRECRAWL_CONNECTION_CONFIG : SEARXNG_CONNECTION_CONFIG),
+      ...(current?.config ?? {}),
+      ...(values.url ? { url: values.url } : {}),
+      ...override,
+    };
+    if (!config.url) throw new Error("SearXNG requires --url <search-endpoint>");
+    if (preset === "firecrawl") {
+      config.headerCredentials = { Authorization: "token" };
+      credential = { field: "token", label: "Firecrawl API key", required: true };
+    }
+  } else if (preset === "mcp-http") {
+    kind = "mcp";
+    const authMode = values.auth ?? (current?.config.oauth === false ? "token" : "oauth");
+    if (!['oauth', 'token', 'none'].includes(authMode)) throw new Error("--auth must be oauth, token, or none");
+    const url = values.url ?? current?.config.url;
+    if (typeof url !== "string" || !url) throw new Error("MCP HTTP requires --url <server-url>");
+    config = {
+      ...(current?.config ?? {}),
+      transport: "http",
+      url,
+      oauth: authMode === "oauth",
+      ...(authMode === "token" ? { headerCredentials: { Authorization: "token" } } : {}),
+      ...override,
+    };
+    if (authMode !== "token") delete config.headerCredentials;
+    if (authMode === "token") credential = { field: "token", label: "MCP bearer token", required: true };
+  } else if (preset === "mcp-stdio") {
+    kind = "mcp";
+    const image = values.image ?? current?.config.image;
+    const command = values.command ?? current?.config.command;
+    if (typeof image !== "string" || !image || typeof command !== "string" || !command) {
+      throw new Error("MCP stdio requires --image <container-image> and --command <in-image-command>");
+    }
+    config = {
+      ...(current?.config ?? {}),
+      transport: "stdio",
+      sandbox: "container",
+      engine: await detectContainerEngine(),
+      image,
+      command,
+      args: values.arg ?? current?.config.args ?? [],
+      network: "none",
+      memoryMb: 256,
+      cpus: 1,
+      pids: 64,
+      ...override,
+    };
+  } else if (preset === "sandbox") {
+    kind = "local-runtime";
+    const runtime = values.runtime ?? String(current?.config.runtime ?? "node");
+    if (runtime !== "node" && runtime !== "python") throw new Error("--runtime must be node or python");
+    config = {
+      ...(current?.config ?? {}),
+      sandbox: "container",
+      engine: await detectContainerEngine(),
+      runtime,
+      image: values.image ?? current?.config.image ?? DEFAULT_SANDBOX_IMAGES[runtime],
+      network: "none",
+      memoryMb: 256,
+      cpus: 1,
+      pids: 64,
+      ...override,
+    };
+  } else {
+    kind = "http-api";
+    const url = values.url ?? current?.config.url;
+    if (typeof url !== "string" || !url) throw new Error("HTTP API requires --url <endpoint>");
+    config = { ...(current?.config ?? {}), url, ...override };
+    if (values["secret-env"]) {
+      config.headerCredentials = { Authorization: "token" };
+      credential = { field: "token", label: "HTTP bearer token", required: true };
+    }
+  }
+  if (current && current.kind !== kind) throw new Error(`Connection '${current.id}' is ${current.kind}; preset '${preset}' creates ${kind}`);
+  if (current && current.scope !== scope) throw new Error("A saved Connection's scope cannot be changed");
+  return { kind, name, scope, config, ...(credential ? { credential } : {}) };
+}
+
+async function providerProbe(manager: ConnectionManager, profile: ConnectionProfile): Promise<string> {
+  const adapterId = String(profile.config.adapter ?? "");
+  const model = String(profile.config.model ?? "");
+  const adapter = shippedAdapters.find((candidate) => candidate.id === adapterId);
+  if (!adapter) throw new Error(`Adapter '${adapterId}' is not shipped by this CLI; test it through its runtime module`);
+  const apiKey = await manager.resolveCredential(profile.id, "apiKey");
+  const reference = apiKey === undefined ? undefined : manager.credentialReference(profile.id, "apiKey");
+  let finished = false;
+  for await (const event of adapter.run({
+    model,
+    messages: [{ role: "user", content: "Reply OK." }],
+    maxTokens: 1,
+    ...(typeof profile.config.baseUrl === "string" ? { baseUrl: profile.config.baseUrl } : {}),
+    ...(reference ? { apiKey: reference } : {}),
+  }, {
+    signal: AbortSignal.timeout(typeof profile.config.timeoutMs === "number" ? profile.config.timeoutMs : 30_000),
+    resolveSecret: (candidate) => candidate === reference ? apiKey : undefined,
+    fetch: guardedFetch(true, { maxStreamBytes: 16 * 1_048_576 }),
+  })) if (event.type === "finish") finished = true;
+  if (!finished) throw new Error(`Adapter '${adapterId}' ended without a finish event`);
+  return `${adapterId} · ${model} responded`;
+}
+
+async function testConnection(manager: ConnectionManager, id: string): Promise<ConnectionProfile> {
+  const profile = await manager.require(id);
+  const host = (profile.kind === "mcp" || profile.kind === "tool-service") && typeof profile.config.url === "string"
+    ? new URL(profile.config.url).host : undefined;
+  return manager.test(id, {
+    ...(host ? { allowNetworkHosts: [host] } : {}),
+    ...(profile.kind === "provider" ? { probe: (candidate) => providerProbe(manager, candidate) } : {}),
+  });
+}
+
+function openBrowser(url: string): void {
+  const command = process.platform === "win32" ? "C:\\Windows\\System32\\rundll32.exe"
+    : process.platform === "darwin" ? "/usr/bin/open" : "/usr/bin/xdg-open";
+  const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
+  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+  child.once("error", () => undefined);
+  child.unref();
+}
+
+async function loginConnection(manager: ConnectionManager, id: string): Promise<ConnectionProfile> {
+  let redirectUrl = "";
+  let settle: ((error?: Error) => void) | undefined;
+  const completed = new Promise<void>((resolvePromise, reject) => {
+    settle = (error) => error ? reject(error) : resolvePromise();
+  });
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", redirectUrl || "http://127.0.0.1");
+    if (request.method !== "GET" || url.pathname !== "/oauth/callback") {
+      response.writeHead(404).end();
+      return;
+    }
+    void manager.finishOAuth(id, url.searchParams, { allowNetworkHosts: true }).then(() => {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+        "x-content-type-options": "nosniff",
+      }).end("<!doctype html><title>Harnest connected</title><p>Connection complete. You can close this window.</p>");
+      settle?.();
+    }, (cause: unknown) => {
+      response.writeHead(400, { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" })
+        .end("Authorization failed. Return to the terminal.");
+      settle?.(cause instanceof Error ? cause : new Error("OAuth callback failed"));
+    });
+  });
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  try {
+    const port = (server.address() as AddressInfo).port;
+    redirectUrl = `http://127.0.0.1:${port}/oauth/callback`;
+    const started = await manager.beginOAuth(id, { redirectUrl, allowNetworkHosts: true });
+    if (started.status === "redirect" && started.authorizationUrl) {
+      console.log(`Open this URL to authorize:\n${started.authorizationUrl}`);
+      openBrowser(started.authorizationUrl);
+      const timeout = setTimeout(() => settle?.(new Error("OAuth authorization timed out after 10 minutes")), 10 * 60_000);
+      try { await completed; } finally { clearTimeout(timeout); }
+    }
+    return testConnection(manager, id);
+  } finally {
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+  }
+}
+
+async function connect(preset: string, file: string, values: ConnectValues): Promise<void> {
+  const manager = new ConnectionManager(connectionProject(file));
+  const current = values.id ? await manager.get(values.id) : undefined;
+  const input = await connectionInput(preset, values, current);
+  const existingFields = current ? await manager.credentialPresence(current.id) : [];
+  const secret = input.credential
+    ? await connectionSecret(values["secret-env"], input.credential.label,
+        input.credential.required && !existingFields.includes(input.credential.field))
+    : undefined;
+  const credentials = secret && input.credential ? { [input.credential.field]: secret } : undefined;
+  const profile = current
+    ? await manager.update(current.id, { name: input.name, config: input.config }, credentials)
+    : await manager.create({
+        ...(values.id ? { id: values.id } : {}),
+        scope: input.scope,
+        kind: input.kind,
+        name: input.name,
+        config: input.config,
+      }, credentials);
+  if ((profile.kind === "local-runtime" || (profile.kind === "mcp" && profile.config.transport === "stdio"))
+    && profile.config.sandbox === "container") await manager.approveProcess(profile.id, { pullImage: true });
+  const tested = profile.kind === "mcp" && profile.config.transport === "http" && profile.config.oauth === true
+    ? await loginConnection(manager, profile.id) : await testConnection(manager, profile.id);
+  console.log(`${tested.id}\t${tested.status.state}\t${tested.name}`);
+}
+
+async function connections(file: string, json: boolean): Promise<void> {
+  const profiles = await new ConnectionManager(connectionProject(file)).list();
+  if (json) {
+    console.log(JSON.stringify(profiles, null, 2));
+    return;
+  }
+  if (!profiles.length) {
+    console.log("No saved Connections.");
+    return;
+  }
+  for (const profile of profiles) console.log(`${profile.id}\t${profile.status.state}\t${profile.kind}\t${profile.scope}\t${profile.name}`);
+}
+
+async function connectionAction(action: string, id: string, file: string): Promise<void> {
+  const manager = new ConnectionManager(connectionProject(file));
+  if (action === "test") {
+    const profile = await testConnection(manager, id);
+    console.log(`${profile.id}\t${profile.status.state}\t${profile.status.message ?? "ready"}`);
+    return;
+  }
+  if (action === "login") {
+    const profile = await loginConnection(manager, id);
+    console.log(`${profile.id}\t${profile.status.state}\t${profile.status.message ?? "authorized"}`);
+    return;
+  }
+  if (action === "disconnect" || action === "revoke") {
+    const profile = await manager.disconnect(id, { revoke: action === "revoke", allowNetworkHosts: true });
+    console.log(`${profile.id}\t${profile.status.state}\t${profile.status.message ?? action}`);
+    return;
+  }
+  if (action === "delete") {
+    if (!await manager.delete(id)) throw new Error(`Connection '${id}' was not found`);
+    console.log(`Deleted ${id}`);
+    return;
+  }
+  throw new Error("connection action must be test, login, disconnect, revoke, or delete");
+}
+
+async function fileIsDirectory(path: string): Promise<boolean> {
+  try { return (await stat(path)).isDirectory(); } catch { return false; }
+}
+
+async function skillCommand(
+  action: string,
+  value: string | undefined,
+  file: string,
+  values: { scope?: string; namespace?: string; version?: string; commit?: string; yes?: boolean },
+): Promise<void> {
+  const scope = values.scope ?? "project";
+  const namespace = values.namespace ?? "harnest";
+  if (scope !== "project" && scope !== "user") throw new Error("skill --scope must be project or user");
+  if (namespace !== "harnest" && namespace !== "agents") throw new Error("skill --namespace must be harnest or agents");
+  const store = new NodeSkillStore({ projectDirectory: connectionProject(file) });
+  if (action === "list") {
+    const catalog = await store.catalog();
+    for (const skill of catalog.skills) console.log(`${skill.name}\t${skill.scope}\t${skill.provenance.kind}\t${skill.description}`);
+    if (!catalog.skills.length) console.log("No installed Skills.");
+    for (const warning of catalog.warnings) console.error(`Warning: ${warning}`);
+    return;
+  }
+  if (!value) throw new Error(`skill ${action} requires a value`);
+  if (action === "install") {
+    if (await fileIsDirectory(resolve(value))) {
+      const installed = await store.install({ kind: "local", directory: resolve(value) }, { scope, namespace });
+      console.log(`${installed.name} installed from local folder`);
+      return;
+    }
+    const unresolved = /^https:\/\//i.test(value)
+      ? { kind: "git" as const, repository: value, ...(values.commit ? { commit: values.commit } : {}) }
+      : { kind: "package" as const, package: value, ...(values.version ? { version: values.version } : {}) };
+    const source = await resolveRemoteSkillSource(unresolved);
+    const materialized = await materializeRemoteSkill(source);
+    try {
+      const remoteStore = new NodeSkillStore({
+        projectDirectory: connectionProject(file),
+        materializeRemote: () => materialized.directory,
+      });
+      const installed = await remoteStore.install(source, {
+        scope,
+        namespace,
+        approval: { sourceKey: skillInstallSourceKey(source) },
+      });
+      console.log(`${installed.name} installed from ${remoteSkillSourceLabel(source)}`);
+      if (installed.scriptsPresent) console.log(`Review scripts with: harnest skill review ${installed.name} ${file}`);
+    } finally {
+      await materialized.cleanup();
+    }
+    return;
+  }
+  const scripts = await store.reviewScripts(value);
+  for (const script of scripts) {
+    console.log(`\n${script.path}\n${script.sha256}\n${script.approved ? "APPROVED" : "NOT APPROVED"}\n${script.content}`);
+  }
+  if (!scripts.length) {
+    console.log(`Skill '${value}' has no scripts.`);
+    return;
+  }
+  if (action === "review") return;
+  if (action !== "approve") throw new Error("skill action must be list, install, review, or approve");
+  if (!values.yes) {
+    if (!process.stdin.isTTY || !process.stderr.isTTY) throw new Error("Non-interactive script approval requires --yes");
+    const terminal = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const answer = await terminal.question("Approve the exact script hashes shown above? [y/N] ");
+      if (!/^(?:y|yes)$/i.test(answer.trim())) throw new Error("Script approval cancelled");
+    } finally {
+      terminal.close();
+    }
+  }
+  for (const script of scripts.filter((candidate) => !candidate.approved)) {
+    await store.approveScript(value, script.path, script.sha256);
+  }
+  console.log(`Approved ${scripts.length} exact script hash(es) for ${value}`);
+}
+
 async function studio(file: string, port: string, capabilities: CapabilityValues): Promise<void> {
   const portNumber = Number(port);
   if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65_535) {
@@ -445,6 +909,73 @@ async function main(): Promise<void> {
     const runId = positionals[0];
     if (!runId) throw new Error("trace requires <run-id>");
     await trace(positionals[1] ?? "harnest.yaml", runId, values.json ?? false);
+    return;
+  }
+
+  if (command === "connections") {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      strict: true,
+      options: { json: { type: "boolean" } },
+    });
+    await connections(positionals[0] ?? "harnest.yaml", values.json ?? false);
+    return;
+  }
+
+  if (command === "connect") {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      strict: true,
+      options: {
+        id: { type: "string" },
+        name: { type: "string" },
+        scope: { type: "string" },
+        model: { type: "string" },
+        adapter: { type: "string" },
+        url: { type: "string" },
+        "secret-env": { type: "string" },
+        runtime: { type: "string" },
+        image: { type: "string" },
+        command: { type: "string" },
+        arg: { type: "string", multiple: true },
+        auth: { type: "string" },
+        config: { type: "string" },
+      },
+    });
+    const preset = positionals[0];
+    if (!preset) throw new Error("connect requires a preset");
+    await connect(preset, positionals[1] ?? "harnest.yaml", values as ConnectValues);
+    return;
+  }
+
+  if (command === "connection") {
+    const { positionals } = parseArgs({ args, allowPositionals: true, strict: true });
+    const [action, id, file = "harnest.yaml"] = positionals;
+    if (!action || !id) throw new Error("connection requires <test|login|disconnect|revoke|delete> <id> [file]");
+    await connectionAction(action, id, file);
+    return;
+  }
+
+  if (command === "skill") {
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      strict: true,
+      options: {
+        scope: { type: "string" },
+        namespace: { type: "string" },
+        version: { type: "string" },
+        commit: { type: "string" },
+        yes: { type: "boolean", short: "y" },
+      },
+    });
+    const action = positionals[0];
+    if (!action) throw new Error("skill requires list, install, review, or approve");
+    const value = action === "list" ? undefined : positionals[1];
+    const file = action === "list" ? positionals[1] ?? "harnest.yaml" : positionals[2] ?? "harnest.yaml";
+    await skillCommand(action, value, file, values);
     return;
   }
 

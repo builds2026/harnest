@@ -20,6 +20,7 @@ import type {
   GraphBody,
   PredicateSpec,
 } from "./spec.js";
+import { skillConnectionRequirement } from "./skill.js";
 import {
   snapshotSafeJsonSchema,
   type ToolApprovalDecision,
@@ -92,6 +93,11 @@ export interface RuntimeServices {
   /** Optional synchronous resolver for secrets that were unlocked by a service operation. */
   resolveSecret?(reference: string): string | undefined;
   releaseRun?(runId: string): void | Promise<void>;
+  fetchProvider?(
+    url: string | URL,
+    init: RequestInit | undefined,
+    context: ServiceExecutionContext,
+  ): Promise<Response>;
   loadContext?(
     config: Readonly<Record<string, unknown>>,
     query: unknown,
@@ -624,14 +630,16 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     const requiredTools = Array.isArray(requirements?.tools)
       ? requirements.tools.filter((item): item is string => typeof item === "string") : [];
     const requiredConnections = Array.isArray(requirements?.connections)
-      ? requirements.connections.filter((item): item is string => typeof item === "string") : [];
+      ? requirements.connections.filter((item): item is string => typeof item === "string")
+        .map((requirement) => ({ requirement, ...skillConnectionRequirement(requirement) })) : [];
     const requiredPermissions = Array.isArray(requirements?.permissions)
       ? requirements.permissions.filter((item): item is string => typeof item === "string") : [];
     const grantedPermissions = new Set(Array.isArray(skill.payload?.grantedPermissions)
       ? skill.payload.grantedPermissions.filter((item): item is string => typeof item === "string") : []);
     const missing = [
       ...requiredTools.filter((id) => !connectedToolIds.has(id)).map((id) => `tool:${id}`),
-      ...requiredConnections.filter((id) => !connectedConnectionIds.has(id)).map((id) => `connection:${id}`),
+      ...requiredConnections.filter(({ id }) => !connectedConnectionIds.has(id))
+        .map(({ requirement }) => `connection:${requirement}`),
       ...requiredPermissions.filter((id) => !grantedPermissions.has(id)).map((id) => `permission:${id}`),
     ];
     if (missing.length) throw new ComponentExecutionError(
@@ -696,6 +704,9 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     const iterator = adapter.run(request, {
       signal: context.signal,
       resolveSecret: context.resolveSecret,
+      ...(context.services.fetchProvider ? {
+        fetch: (url, init) => context.services.fetchProvider!(url, init, serviceContext(context)),
+      } : {}),
     })[Symbol.asyncIterator]();
     const calls: ModelToolCall[] = [];
     let turnUsage: TokenUsage = {};

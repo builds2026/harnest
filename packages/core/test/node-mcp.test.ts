@@ -14,7 +14,7 @@ const context: ServiceExecutionContext = {
 };
 
 describe("NodeRuntimeServices MCP boundary", () => {
-  it("preserves reviewed v1.1 raw stdio MCP behind an exact process allowlist", async () => {
+  it("fails closed for legacy raw stdio MCP without an OS sandbox", async () => {
     const project = fileURLToPath(new URL("../../../examples/mcp-tool-agent/", import.meta.url));
     const services = new NodeRuntimeServices(project, { allowProcessCommands: ["node"] });
     try {
@@ -24,10 +24,7 @@ describe("NodeRuntimeServices MCP boundary", () => {
         command: "node",
         args: ["server.mjs"],
         tool: "lookup-city",
-      }, { city: "Seoul" }, context)).resolves.toMatchObject({
-        value: { city: "Seoul", country: "South Korea" },
-        metadata: { transport: "stdio", tool: "lookup-city", isError: false },
-      });
+      }, { city: "Seoul" }, context)).rejects.toThrow("Raw MCP stdio is disabled");
     } finally {
       await services.close();
     }

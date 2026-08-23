@@ -92,3 +92,25 @@ export const connectionKindLabel = (kind: ConnectionKind) => ({
 
 export const connectionCanRun = (connection: Pick<ConnectionSummary, "status">) =>
   connection.status === "connected" || connection.status === "unknown";
+
+export function missingConnectionSetup(
+  components: readonly { type: string; config: Readonly<Record<string, unknown>> }[],
+  connections: readonly ConnectionSummary[],
+  tools: readonly { id: string; connectionKinds?: readonly ConnectionKind[] }[],
+): { id: string; kind: ConnectionKind } | undefined {
+  for (const component of components) {
+    const id = typeof component.config.connectionId === "string" && component.config.connectionId
+      ? component.config.connectionId : undefined;
+    if (!id) continue;
+    const saved = connections.find((connection) => connection.id === id);
+    const tool = component.type === "tool" ? tools.find((item) => item.id === component.config.tool) : undefined;
+    const kind: ConnectionKind | undefined = component.type === "model" ? "provider"
+      : component.type === "mcp-tool" || component.config.source === "mcp" ? "mcp-http"
+        : ["builtin.code-runner", "builtin.file", "builtin.shell"].includes(String(component.config.tool)) ? "local-runtime"
+          : ["builtin.web-search", "builtin.web-scrape"].includes(String(component.config.tool)) ? "tool-service"
+            : component.config.tool === "builtin.http" ? "http-api"
+              : tool?.connectionKinds?.[0] ?? saved?.kind;
+    if (kind && (!saved || !connectionCanRun(saved) || saved.kind !== kind)) return { id, kind };
+  }
+  return undefined;
+}

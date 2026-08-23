@@ -155,6 +155,29 @@ function providerContents(request: ModelRequest): unknown[] {
     });
 }
 
+const SCHEMA_MAP_KEYWORDS = new Set([
+  "$defs", "definitions", "dependentSchemas", "dependencies", "patternProperties", "properties",
+]);
+const SCHEMA_LITERAL_KEYWORDS = new Set([
+  "const", "default", "dependentRequired", "discriminator", "enum", "example", "examples", "externalDocs", "xml",
+]);
+
+function geminiToolSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(geminiToolSchema);
+  const record = asRecord(value);
+  if (!record) return value;
+  // Gemini currently rejects this valid JSON Schema keyword in function declarations;
+  // Harnest still enforces the original schema before executing the Tool.
+  return Object.fromEntries(Object.entries(record)
+    .filter(([key]) => key !== "additionalProperties")
+    .map(([key, entry]) => {
+      const entries = SCHEMA_MAP_KEYWORDS.has(key) ? asRecord(entry) : undefined;
+      if (entries) return [key, Object.fromEntries(Object.entries(entries)
+        .map(([name, schema]) => [name, Array.isArray(schema) ? schema : geminiToolSchema(schema)]))];
+      return [key, SCHEMA_LITERAL_KEYWORDS.has(key) || key.startsWith("x-") ? entry : geminiToolSchema(entry)];
+    }));
+}
+
 export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAdapter {
   const id = options.id ?? "gemini";
   const credential = options.apiKey ?? DEFAULT_API_KEY;
@@ -185,7 +208,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
           tools: [{ functionDeclarations: request.tools.map((tool) => ({
             name: tool.name,
             description: tool.description,
-            parametersJsonSchema: tool.inputSchema,
+            parametersJsonSchema: geminiToolSchema(tool.inputSchema),
           })) }],
         } : {}),
         ...(system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } }),
@@ -194,7 +217,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
 
       let response: Response;
       try {
-        response = await fetch(
+        response = await (context.fetch ?? fetch)(
           endpoint(
             request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL,
             options.apiVersion ?? "v1beta",

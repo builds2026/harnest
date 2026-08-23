@@ -8,7 +8,7 @@ import {
   type ConnectionTool,
   type HarnessSpec,
 } from "@harnest/core";
-import { ConnectionManager, loadSpecFile } from "@harnest/core/node";
+import { ConnectionManager, detectContainerEngine, loadSpecFile } from "@harnest/core/node";
 import { ApiRequestError } from "./api-server";
 import { EMPTY_SPEC } from "./default-spec";
 import {
@@ -63,7 +63,7 @@ export function parseConnectionMutation(value: unknown, requireId = false): Conn
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new ApiRequestError("CONNECTION_INPUT_INVALID", `Unknown connection field '${key}'`);
   }
-  if (requireId && (typeof input.id !== "string" || !CONNECTION_ID.test(input.id))) {
+  if ((requireId || input.id !== undefined) && (typeof input.id !== "string" || !CONNECTION_ID.test(input.id))) {
     throw new ApiRequestError("CONNECTION_ID_INVALID", "A valid connection id is required");
   }
   if (typeof input.name !== "string" || !input.name.trim() || input.name.trim().length > 80) {
@@ -105,7 +105,7 @@ const browserKind = (profile: ConnectionProfile): ConnectionKind => profile.kind
   ? profile.config.transport === "stdio" ? "mcp-stdio" : "mcp-http"
   : profile.kind;
 
-function coreConfig(input: ConnectionMutation, current?: ConnectionProfile): Readonly<Record<string, unknown>> {
+async function coreConfig(input: ConnectionMutation, current?: ConnectionProfile): Promise<Readonly<Record<string, unknown>>> {
   const config = { ...(input.config ?? {}) };
   if (input.kind === "provider") {
     const adapter = typeof config.adapter === "string" && config.adapter.trim()
@@ -124,10 +124,24 @@ function coreConfig(input: ConnectionMutation, current?: ConnectionProfile): Rea
     && (input.secrets?.token || current?.credentialFields.includes("token"))) {
     return { ...config, headerCredentials: { Authorization: "token" } };
   }
-  if (input.kind !== "mcp-http" && input.kind !== "mcp-stdio") return config;
-  const transport = input.kind === "mcp-stdio" ? "stdio" : "http";
-  const normalized: Record<string, unknown> = { ...config, transport };
-  if (transport === "http" && (input.secrets?.token || current?.credentialFields.includes("token"))) {
+  if (input.kind === "local-runtime" || input.kind === "mcp-stdio") {
+    const engine = typeof config.engine === "string" && config.engine.trim()
+      ? config.engine.trim() : await detectContainerEngine();
+    const isolated = {
+      ...config,
+      sandbox: "container",
+      engine,
+      network: "none",
+      memoryMb: typeof config.memoryMb === "number" ? config.memoryMb : 256,
+      cpus: typeof config.cpus === "number" ? config.cpus : 1,
+      pids: typeof config.pids === "number" ? config.pids : 64,
+    };
+    if (input.kind === "local-runtime") return isolated;
+    return { ...isolated, transport: "stdio" };
+  }
+  if (input.kind !== "mcp-http") return config;
+  const normalized: Record<string, unknown> = { ...config, transport: "http" };
+  if (input.secrets?.token || current?.credentialFields.includes("token")) {
     normalized.headerCredentials = { Authorization: "token" };
   }
   return normalized;
@@ -186,14 +200,15 @@ export class StudioConnectionService {
     }
     const resources = await runtimeResourcesFor(spec);
     const runId = `connection_test_${profile.id}`;
+    const serviceContext = {
+      signal: new AbortController().signal,
+      runId,
+      nodeId: "connection-test",
+      iteration: 0,
+      resolveSecret: () => undefined,
+    };
     try {
-      const resolved = await resources.services.resolveConnection(profile.id, {
-        signal: new AbortController().signal,
-        runId,
-        nodeId: "connection-test",
-        iteration: 0,
-        resolveSecret: () => undefined,
-      });
+      const resolved = await resources.services.resolveConnection(profile.id, serviceContext);
       const config = jsonObject(resolved.value, "Provider connection");
       const adapterId = typeof config.adapter === "string" ? config.adapter : "";
       const model = typeof config.model === "string" ? config.model : "";
@@ -207,7 +222,11 @@ export class StudioConnectionService {
         maxTokens: 1,
         ...(typeof config.baseUrl === "string" ? { baseUrl: config.baseUrl } : {}),
         ...(typeof config.apiKey === "string" ? { apiKey: config.apiKey } : {}),
-      }, { signal, resolveSecret: (reference) => resources.services.resolveSecret(reference) })) {
+      }, {
+        signal,
+        resolveSecret: (reference) => resources.services.resolveSecret(reference),
+        fetch: (url, init) => resources.services.fetchProvider(url, init),
+      })) {
         if (event.type === "finish") finished = true;
       }
       if (!finished) throw new Error(`Adapter '${adapterId}' ended without a finish event`);
@@ -242,10 +261,11 @@ export class StudioConnectionService {
 
   async create(input: ConnectionMutation): Promise<ConnectionSummary> {
     const profile = await this.#manager.create({
+      ...(input.id ? { id: input.id } : {}),
       scope: input.scope,
       kind: coreKind(input.kind),
       name: input.name,
-      config: coreConfig(input),
+      config: await coreConfig(input),
     } satisfies ConnectionCreateInput, input.secrets);
     return this.#summary(profile);
   }
@@ -257,7 +277,7 @@ export class StudioConnectionService {
     }
     const profile = await this.#manager.update(input.id, {
       name: input.name,
-      config: coreConfig(input, current),
+      config: await coreConfig(input, current),
     }, input.secrets && Object.keys(input.secrets).length ? input.secrets : undefined);
     return this.#summary(profile);
   }
@@ -313,10 +333,13 @@ export class StudioConnectionService {
       };
     }
     if (action === "approve-process") {
-      await this.#manager.approveProcess(id);
+      await this.#manager.approveProcess(id, { pullImage: true });
+      const tested = await this.#manager.test(id, runtime);
       return {
-        connection: await this.#summary(await this.#manager.require(id)),
-        message: "This exact MCP process launch profile is approved. Changes require approval again.",
+        connection: await this.#summary(tested),
+        message: target.kind === "mcp"
+          ? `${tested.tools?.length ?? 0} MCP tool(s) discovered in the isolated container.`
+          : tested.status.message ?? "Code sandbox is ready.",
       };
     }
     if (action === "disconnect" || action === "revoke") {
@@ -338,6 +361,7 @@ export class StudioConnectionService {
       const started = await this.#manager.beginOAuth(id, {
         redirectUrl: options.redirectUrl,
         allowNetworkHosts: networkHosts,
+        forceReauthorization: true,
       });
       const refreshed = await this.#manager.require(id);
       return {
