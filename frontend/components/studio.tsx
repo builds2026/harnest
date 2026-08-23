@@ -991,14 +991,14 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ yaml: stringifySpec(draftToSpec(document.draft)) }),
       });
-      const payload = await response.json() as { ok: boolean; diagnostics: Diagnostic[]; catalog?: ComponentManifest[] };
+      const payload = await response.json() as { ok: boolean; diagnostics: Diagnostic[]; catalog?: ComponentManifest[]; plan?: { nodeCount: number; layerCount: number; entrypoint: string } };
       dispatch({ type: "validation-result", semanticRevision, diagnostics: payload.diagnostics ?? [] });
       if (payload.catalog?.length) {
         setCatalog(payload.catalog);
         dispatch({ type: "set-catalog", catalog: payload.catalog });
       }
       if (!payload.ok) setActiveDock("problems");
-      setStatusNote(payload.ok ? "Runtime valid — ready to run" : `${payload.diagnostics.length} runtime issue(s) block running`);
+      setStatusNote(payload.ok ? `Runtime compiled — ${payload.plan?.nodeCount ?? 0} node(s), ${payload.plan?.layerCount ?? 0} layer(s), entrypoint ${payload.plan?.entrypoint ?? "unknown"}` : `${payload.diagnostics.length} runtime issue(s) block running`);
     } catch (error) {
       const diagnostic: Diagnostic = { code: "VALIDATE_REQUEST", path: "$", message: error instanceof Error ? error.message : "Validation request failed", severity: "error" };
       dispatch({ type: "validation-result", semanticRevision, diagnostics: [diagnostic] });
