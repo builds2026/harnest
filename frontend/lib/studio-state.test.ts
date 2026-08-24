@@ -164,4 +164,18 @@ describe("Studio document state", () => {
 
     expect(studioDocumentReducer(committed, { type: "undo" }).draft.nodes[0]!.position).toEqual({ x: 10, y: 20 });
   });
+
+  it("ignores an autosave response when a newer revision already exists", () => {
+    const initial = createDocumentState(spec, BUILTIN_COMPONENT_MANIFESTS);
+    const firstDraft = structuredClone(initial.draft);
+    firstDraft.nodes[1]!.data.component.config = { template: "First {{input}}" };
+    const first = studioDocumentReducer(initial, { type: "replace-draft", draft: firstDraft, touch: "semantic" });
+    const secondDraft = structuredClone(first.draft);
+    secondDraft.nodes[1]!.data.component.config = { template: "Second {{input}}" };
+    const second = studioDocumentReducer(first, { type: "replace-draft", draft: secondDraft, touch: "semantic" });
+
+    const staleResponse = studioDocumentReducer(second, { type: "save-result", revision: first.revision });
+    expect(staleResponse.savedRevision).toBe(0);
+    expect(studioDocumentReducer(staleResponse, { type: "save-result", revision: second.revision }).savedRevision).toBe(second.revision);
+  });
 });

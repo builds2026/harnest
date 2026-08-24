@@ -13,7 +13,7 @@
     "build:packages": "tsc -b",
     "build": "npm run build:packages && npm run build --workspace @harnest/studio",
     "typecheck": "tsc -b && npm run typecheck --workspace @harnest/studio",
-    "test": "npm run build:packages && vitest run --exclude \"**/dist/**\"",
+    "test": "npm run build:packages && vitest run --exclude \"**/dist/**\" --exclude \"frontend/e2e/**\"",
     "lint": "eslint .",
     "studio": "npm run harnest -- studio harnest.yaml",
     "harnest": "tsx packages/cli/src/index.ts"

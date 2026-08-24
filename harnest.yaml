@@ -1,63 +1,246 @@
-components:
-  - id: prompt
-    type: prompt
-    config:
-      template: "Answer this request clearly: {{input}}"
-  - id: model
-    type: model
-    config:
-      adapter: echo
-      model: echo-v1
-  - id: agent
-    type: agent
-    config:
-      system: You are a concise local demo agent.
-  - id: output
-    type: output
-    config:
-      format: text
-connections:
-  - from:
-      component: model
-      port: model
-    to:
-      component: agent
-      port: model
-  - from:
-      component: prompt
-      port: prompt
-    to:
-      component: agent
-      port: prompt
-  - from:
-      component: agent
-      port: response
-    to:
-      component: output
-      port: value
-entrypoint: output
 version: "0.2"
-runtime:
-  timeoutMs: 30000
-  adapters:
-    - ./examples/custom-adapter/echo-adapter.mjs
+
+components:
+  - id: plan
+    type: subgraph
+    config: { subgraph: planner }
+  - id: executeUntilDone
+    type: loop
+    config:
+      subgraph: engineeringLoop
+      maxIterations: 4
+      timeoutMs: 240000
+      maxTokens: 1000000
+      until: { source: value, path: /evaluation/passed, op: truthy }
+  - id: finalAnswer
+    type: output
+    config: { format: text }
+
+connections:
+  - id: plan_to_loop
+    from: { component: plan, port: value }
+    to: { component: executeUntilDone, port: value }
+  - id: loop_to_output
+    from: { component: executeUntilDone, port: value }
+    to: { component: finalAnswer, port: value }
+    select: /draft
+entrypoint: finalAnswer
+
+subgraphs:
+  planner:
+    components:
+      - id: model
+        type: model
+        config:
+          connectionId: connection_2731128fcaa842d2ad52a278398815f9
+          fallbackConnectionId: connection_b95c7dbc9bab4f83a37e289f058e0b75
+          temperature: 0.1
+          maxTokens: 2500
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            사용자의 원래 요청을 빠뜨리지 말고 실행 계획을 작성하라.
+            목표, 필요한 최신 정보, 계산/코드 작업, 검증 기준, 최종 산출물 형식을 포함한다.
+            다음 실행 에이전트가 원래 요청을 재구성할 수 있도록 요청 전문도 포함한다.
+
+            사용자 요청:
+            {{input}}
+      - id: policy
+        type: context
+        config:
+          source: text
+          text: 사실 확인이 필요한 내용은 웹 도구로 검증하고, 계산·파싱·데이터 처리는 코드 샌드박스로 검증한다.
+      - id: plannerMemory
+        type: memory
+        config:
+          key: universalHarnessPreferences
+          operation: read
+          initial: { language: ko, citations: true, verifyBeforeFinal: true }
+      - id: agent
+        type: agent
+        config:
+          system: 당신은 실행 계획 담당자다. 답변을 완성하지 말고 다음 에이전트가 실행할 구체적인 계획을 작성하라.
+          maxTurns: 2
+          maxTokens: 3000
+      - id: output
+        type: output
+        config: { format: text }
+    connections:
+      - { id: planner_model, from: { component: model, port: model }, to: { component: agent, port: model } }
+      - { id: planner_prompt, from: { component: prompt, port: prompt }, to: { component: agent, port: prompt } }
+      - { id: planner_policy, from: { component: policy, port: context }, to: { component: agent, port: context } }
+      - { id: planner_memory, from: { component: plannerMemory, port: memory }, to: { component: agent, port: memory } }
+      - { id: planner_output, from: { component: agent, port: response }, to: { component: output, port: value } }
+    entrypoint: output
+
+  engineeringLoop:
+    components:
+      - id: model
+        type: model
+        config:
+          connectionId: connection_2731128fcaa842d2ad52a278398815f9
+          fallbackConnectionId: connection_b95c7dbc9bab4f83a37e289f058e0b75
+          temperature: 0.2
+          maxTokens: 6000
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            아래 입력은 최초 실행 계획이거나 직전 반복 결과다.
+            아직 목표가 완성되지 않았다면 부족한 근거·계산·검증을 찾아 도구로 보완하라.
+            웹 검색 결과의 URL을 근거 가까이에 인용하고, 코드 실행 결과를 직접 확인하라.
+            충분히 검증된 최종 답변을 만들었을 때만 답변 첫 줄에 [FINAL]을 출력하라.
+            미완료라면 [CONTINUE]로 시작하고 다음 반복에 필요한 작업과 현재까지의 결과를 모두 남겨라.
+
+            현재 작업 상태:
+            {{input}}
+      - id: operatingPolicy
+        type: context
+        config:
+          source: text
+          text: |-
+            최소한의 도구만 사용하되 추측으로 최신 사실을 만들지 않는다.
+            검색은 발견, 스크래핑은 원문 확인, 코드 샌드박스는 계산·파싱·파일 생성·테스트에 사용한다.
+            도구 실패 시 입력을 고쳐 재시도하며 같은 실패를 무한 반복하지 않는다.
+            사용자 요청 언어로 답하고 불확실성, 제약, 남은 위험을 명시한다.
+      - id: workingMemory
+        type: memory
+        config:
+          key: universalHarnessWorkingMemory
+          operation: read
+          initial: { objective: finish the user goal, iterationPolicy: inspect-act-verify }
+      - id: webSearch
+        type: tool
+        config:
+          tool: builtin.web-search
+          connectionId: connection_2b89fce0b0ce477997fb43c97e3bda7f
+          source: builtin
+          risk: read
+          label: Web Search
+      - id: webScrape
+        type: tool
+        config:
+          tool: builtin.web-scrape
+          connectionId: connection_2b89fce0b0ce477997fb43c97e3bda7f
+          source: builtin
+          risk: read
+          label: Web Scrape
+      - id: codeInterpreter
+        type: tool
+        config:
+          tool: builtin.code-runner
+          connectionId: connection_aa06453f960843febae518949effeda6
+          source: builtin
+          risk: destructive
+          label: Python Code Interpreter
+      - id: fileWorkspace
+        type: tool
+        config:
+          tool: builtin.file
+          connectionId: connection_aa06453f960843febae518949effeda6
+          source: builtin
+          risk: write
+          label: Workspace Files
+      - id: sandboxShell
+        type: tool
+        config:
+          tool: builtin.shell
+          connectionId: connection_aa06453f960843febae518949effeda6
+          source: builtin
+          risk: destructive
+          label: Sandbox Shell
+      - id: webResearchSkill
+        type: skill
+        config: { skill: loop-engineering }
+      - id: agent
+        type: agent
+        config:
+          system: |-
+            당신은 목표 달성형 리서치·코딩 에이전트다.
+            입력을 관찰하고, 필요한 도구를 호출하고, 결과를 검증하는 루프를 스스로 수행한다.
+            검색만 하고 끝내거나 코드를 작성만 하지 말고 실제 도구 결과를 확인한 뒤 결론을 낸다.
+            완성 조건을 충족하기 전에는 [FINAL]을 쓰지 않는다.
+          maxTurns: 12
+          maxToolCalls: 16
+          toolTimeoutMs: 60000
+          timeoutMs: 180000
+          maxTokens: 1000000
+          toolError: model
+          allowTools:
+            - builtin.web-search
+            - builtin.web-scrape
+            - builtin.code-runner
+            - builtin.file
+            - builtin.shell
+      - id: completionCheck
+        type: evaluator
+        config: { type: includes, value: "[FINAL]" }
+      - id: completionRoute
+        type: router
+        config:
+          condition: { source: value, path: /passed, op: truthy }
+      - id: iterationResult
+        type: join
+        config:
+          mode: object
+          keys: [draft, evaluation, completed, continue]
+    connections:
+      - { id: loop_model, from: { component: model, port: model }, to: { component: agent, port: model } }
+      - { id: loop_prompt, from: { component: prompt, port: prompt }, to: { component: agent, port: prompt } }
+      - { id: loop_policy, from: { component: operatingPolicy, port: context }, to: { component: agent, port: context } }
+      - { id: loop_memory, from: { component: workingMemory, port: memory }, to: { component: agent, port: memory } }
+      - { id: loop_search, from: { component: webSearch, port: tool }, to: { component: agent, port: tools } }
+      - { id: loop_scrape, from: { component: webScrape, port: tool }, to: { component: agent, port: tools } }
+      - { id: loop_code, from: { component: codeInterpreter, port: tool }, to: { component: agent, port: tools } }
+      - { id: loop_files, from: { component: fileWorkspace, port: tool }, to: { component: agent, port: tools } }
+      - { id: loop_shell, from: { component: sandboxShell, port: tool }, to: { component: agent, port: tools } }
+      - { id: loop_skill, from: { component: webResearchSkill, port: skill }, to: { component: agent, port: skills } }
+      - { id: loop_check, from: { component: agent, port: response }, to: { component: completionCheck, port: value } }
+      - { id: loop_route, from: { component: completionCheck, port: evaluation }, to: { component: completionRoute, port: value } }
+      - { id: loop_join_draft, from: { component: completionCheck, port: value }, to: { component: iterationResult, port: values } }
+      - { id: loop_join_evaluation, from: { component: completionCheck, port: evaluation }, to: { component: iterationResult, port: values } }
+      - { id: loop_join_completed, from: { component: completionRoute, port: "true" }, to: { component: iterationResult, port: values } }
+      - { id: loop_join_continue, from: { component: completionRoute, port: "false" }, to: { component: iterationResult, port: values } }
+    entrypoint: iterationResult
+
+runtime: { timeoutMs: 300000 }
+
 tests:
-  - id: passes-input
-    input: hello harness
-    assertion:
-      type: includes
-      value: hello harness
+  - id: computes-and-finishes
+    input: Python 코드 인터프리터로 1부터 100까지의 합을 계산하고 결과를 설명해줘.
+    assertions:
+      - { type: includes, value: "[FINAL]" }
+      - { type: includes, value: "5050" }
+      - { type: iterations, min: 1, max: 4 }
+
 studio:
   positions:
-    prompt:
-      x: 80
-      y: 90
-    model:
-      x: 80
-      y: 280
-    agent:
-      x: 390
-      y: 180
-    output:
-      x: 784
-      y: 224
+    plan: { x: 40, y: 160 }
+    executeUntilDone: { x: 360, y: 160 }
+    finalAnswer: { x: 720, y: 160 }
+  subgraphs:
+    planner:
+      positions:
+        model: { x: 40, y: 40 }
+        prompt: { x: 40, y: 210 }
+        policy: { x: 40, y: 390 }
+        plannerMemory: { x: 40, y: 540 }
+        agent: { x: 390, y: 220 }
+        output: { x: 740, y: 220 }
+    engineeringLoop:
+      positions:
+        model: { x: 40, y: 40 }
+        prompt: { x: 48, y: 208 }
+        operatingPolicy: { x: 40, y: 410 }
+        workingMemory: { x: 40, y: 590 }
+        webSearch: { x: 360, y: 30 }
+        webScrape: { x: 360, y: 170 }
+        codeInterpreter: { x: 360, y: 310 }
+        fileWorkspace: { x: 360, y: 450 }
+        sandboxShell: { x: 360, y: 590 }
+        webResearchSkill: { x: 360, y: 730 }
+        agent: { x: 700, y: 235 }
+        completionCheck: { x: 1030, y: 160 }
+        completionRoute: { x: 1030, y: 340 }
+        iterationResult: { x: 1330, y: 240 }

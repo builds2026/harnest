@@ -755,13 +755,18 @@ const BUILTIN_INPUTS = {
       query: { type: "string", minLength: 1 },
       limit: { type: "integer", minimum: 1, maximum: 20, default: 5 },
       cursor: { type: "string", minLength: 1, maxLength: 4_096 },
+      maxContentCharacters: { type: "integer", minimum: 0, maximum: 20_000, default: 1_000 },
+      maxSnippetCharacters: { type: "integer", minimum: 0, maximum: 5_000, default: 500 },
     },
     required: ["query"],
     additionalProperties: false,
   },
   webScrape: {
     type: "object",
-    properties: { url: { type: "string", minLength: 1, maxLength: 8_192 } },
+    properties: {
+      url: { type: "string", minLength: 1, maxLength: 8_192 },
+      maxCharacters: { type: "integer", minimum: 1_000, maximum: 100_000, default: 12_000 },
+    },
     required: ["url"],
     additionalProperties: false,
   },
@@ -1803,7 +1808,7 @@ export class NodeToolStore {
       }
       const deadline = mergeSignals(context.signal, this.#timeout());
       try {
-        output = await signalRace(Promise.resolve(webSearch({
+        const searched = await signalRace(Promise.resolve(webSearch({
           query: input.query as string,
           limit: typeof input.limit === "number" ? input.limit : 5,
           ...(typeof input.cursor === "string" ? { cursor: input.cursor } : {}),
@@ -1811,6 +1816,21 @@ export class NodeToolStore {
           context,
           ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
         })), deadline.signal);
+        const contentLimit = typeof input.maxContentCharacters === "number" ? input.maxContentCharacters : 1_000;
+        const snippetLimit = typeof input.maxSnippetCharacters === "number" ? input.maxSnippetCharacters : 500;
+        output = isRecord(searched) && Array.isArray(searched.results) ? {
+          ...searched,
+          results: searched.results.map((result) => {
+            if (!isRecord(result)) return result;
+            return {
+              ...result,
+              ...(typeof result.content === "string" && result.content.length > contentLimit
+                ? { content: result.content.slice(0, contentLimit), contentTruncated: true } : {}),
+              ...(typeof result.snippet === "string" && result.snippet.length > snippetLimit
+                ? { snippet: result.snippet.slice(0, snippetLimit), snippetTruncated: true } : {}),
+            };
+          }),
+        } : searched;
       } finally {
         deadline.cleanup();
       }
@@ -1821,12 +1841,16 @@ export class NodeToolStore {
       );
       const deadline = mergeSignals(context.signal, this.#timeout());
       try {
-        output = await signalRace(Promise.resolve(webScrape({
+        const scraped = await signalRace(Promise.resolve(webScrape({
           url: input.url as string,
           signal: deadline.signal,
           context,
           ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
         })), deadline.signal);
+        const limit = typeof input.maxCharacters === "number" ? input.maxCharacters : 12_000;
+        output = isRecord(scraped) && typeof scraped.content === "string" && scraped.content.length > limit
+          ? { ...scraped, content: scraped.content.slice(0, limit), truncated: true }
+          : scraped;
       } finally {
         deadline.cleanup();
       }

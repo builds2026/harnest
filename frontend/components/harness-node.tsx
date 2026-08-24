@@ -6,6 +6,8 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { memo, useMemo, useRef, useState, type CSSProperties } from "react";
 import { colorFor, componentSummary, glyphFor } from "@/lib/component-catalog";
 import type { CanvasPortAnchor, CanvasPortInsertion, HarnessNode } from "@/lib/studio-state";
+import { componentLabel } from "@/i18n/manifest";
+import { useI18n } from "./i18n-provider";
 
 function PortInsertMenu({
   anchor,
@@ -16,6 +18,7 @@ function PortInsertMenu({
   getOptions: (anchor: CanvasPortAnchor) => readonly CanvasPortInsertion[];
   onInsert: (anchor: CanvasPortAnchor, insertion: CanvasPortInsertion) => void;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [options, setOptions] = useState<readonly CanvasPortInsertion[]>([]);
@@ -25,7 +28,8 @@ function PortInsertMenu({
     return options.filter((option) => !value || `${option.label} ${option.type} ${option.category} ${option.description}`
       .toLocaleLowerCase().includes(value));
   }, [options, query]);
-  const directionLabel = anchor.direction === "output" ? "after" : "before";
+  const directionLabel = t(anchor.direction === "output" ? "port.direction.after" : "port.direction.before");
+  const target = `${anchor.nodeId}.${anchor.port}`;
 
   return <Popover.Root open={open} onOpenChange={(next) => {
     setOpen(next);
@@ -34,22 +38,22 @@ function PortInsertMenu({
   }} modal="trap-focus">
     <Popover.Trigger
       className="port-add nodrag nopan"
-      aria-label={`Add a compatible component ${directionLabel} ${anchor.nodeId}.${anchor.port}`}
-      title={`Add compatible component ${directionLabel} this port`}
+      aria-label={t("port.addAccessible", { direction: directionLabel, target })}
+      title={t("port.addTitle", { direction: directionLabel })}
     >+</Popover.Trigger>
     <Popover.Portal>
       <Popover.Positioner side={anchor.direction === "output" ? "right" : "left"} align="center" sideOffset={12} collisionPadding={12}>
         <Popover.Popup className="port-picker" initialFocus={search}>
-          <header><span>Connect {directionLabel}</span><strong>{anchor.nodeId}.{anchor.port}</strong></header>
-          <label><span className="sr-only">Search compatible components</span><input ref={search} type="search" placeholder="Search components…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+          <header><span>{t("port.connect", { direction: directionLabel })}</span><strong>{target}</strong></header>
+          <label><span className="sr-only">{t("port.search")}</span><input ref={search} type="search" placeholder={t("port.search.placeholder")} value={query} onChange={(event) => setQuery(event.target.value)} /></label>
           <div className="port-picker-list">
             {visible.length ? visible.map((option) => <button
               key={`${option.type}:${option.connectPort}`}
               type="button"
               onClick={() => { onInsert(anchor, option); setOpen(false); }}
-            ><span className="port-picker-glyph" style={{ "--port-color": colorFor(option.category) } as CSSProperties}>{glyphFor(option.label)}</span><span><strong>{option.label}</strong><small>{option.category} · {option.connectPort}:{option.connectType}</small><small>{option.description}</small></span></button>) : <p>No compatible component matches this search.</p>}
+            ><span className="port-picker-glyph" style={{ "--port-color": colorFor(option.category) } as CSSProperties}>{glyphFor(option.label)}</span><span><strong>{componentLabel(t, option.type, option.label)}</strong><small>{option.category} · {option.connectPort}:{option.connectType}</small><small>{option.description}</small></span></button>) : <p>{t("port.empty")}</p>}
           </div>
-          <Popover.Close className="sr-only">Close compatible component menu</Popover.Close>
+          <Popover.Close className="sr-only">{t("port.close")}</Popover.Close>
         </Popover.Popup>
       </Popover.Positioner>
     </Popover.Portal>
@@ -108,8 +112,10 @@ function PortRow({
 }
 
 function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
+  const { t } = useI18n();
   const component = data.component;
   const manifest = data.manifest;
+  const label = componentLabel(t, manifest.type, manifest.label);
   const color = colorFor(manifest.category);
   const ports = manifest.ports;
   const inputs = Object.entries(ports.inputs) as [string, PortDefinition][];
@@ -122,10 +128,10 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
   return (
     <div className={`h-node is-${runState}`} style={style}>
       <div className="node-header">
-        <span className="node-glyph" aria-hidden="true">{glyphFor(manifest.label)}</span>
+        <span className="node-glyph" aria-hidden="true">{glyphFor(label)}</span>
         <span>
           <span className="node-label">{component.id}</span>
-          <span className="node-kind">{manifest.label}</span>
+          <span className="node-kind">{label}</span>
         </span>
         <span className="node-signals">
           {data.iteration !== undefined && <span className="node-iteration" title={`Iteration ${data.iteration}`}>↻{data.iteration}</span>}
@@ -152,8 +158,8 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
         ))}
         {manifest.type === "agent" && !inputs.some(([name]) => /skill/i.test(name)) && (
           <div className="agent-attachment-row">
-            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "tools")}>+ Tool</button>
-            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "skills")}>+ Skill</button>
+            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "tools")}>+ {t("builder.catalog.tools")}</button>
+            <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "skills")}>+ {t("builder.catalog.skills")}</button>
           </div>
         )}
         <div className="node-summary" title={componentSummary(component, manifest)}>{componentSummary(component, manifest)}</div>

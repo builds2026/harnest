@@ -1,16 +1,28 @@
 import "server-only";
 import { hasLiteralStudioHost, isLiteralLoopbackHostname } from "./studio-host";
+import { classifyApiError, type ApiErrorDetails } from "./api";
 
 export class ApiRequestError extends Error {
   constructor(
     readonly code: string,
     message: string,
     readonly status = 400,
+    readonly details: Partial<Pick<ApiErrorDetails, "category" | "recoverable" | "action" | "retryAfterMs">> = {},
   ) {
     super(message);
     this.name = "ApiRequestError";
   }
 }
+
+const errorResponse = (
+  code: string,
+  message: string,
+  status: number,
+  overrides: Partial<Pick<ApiErrorDetails, "category" | "recoverable" | "action" | "retryAfterMs">> = {},
+) => Response.json({
+  ok: false,
+  error: { code, message, ...classifyApiError(code, status), ...overrides },
+}, { status });
 
 export function assertSameOrigin(request: Request): void {
   const url = new URL(request.url);
@@ -75,7 +87,7 @@ export async function readJsonBody(request: Request, maxBytes = 65_536): Promise
 
 export const apiErrorResponse = (error: unknown) => {
   if (error instanceof ApiRequestError) {
-    return Response.json({ ok: false, error: { code: error.code, message: error.message } }, { status: error.status });
+    return errorResponse(error.code, error.message, error.status, error.details);
   }
   if (error && typeof error === "object" && "name" in error && error.name === "ConnectionError"
     && "code" in error && typeof error.code === "string" && "message" in error && typeof error.message === "string") {
@@ -84,7 +96,7 @@ export const apiErrorResponse = (error: unknown) => {
         : error.code === "CREDENTIAL_BACKEND_UNAVAILABLE" || error.code === "CREDENTIAL_STORE_FAILED" ? 503
           : error.code === "CONNECTION_TEST_FAILED" ? 422
             : 400;
-    return Response.json({ ok: false, error: { code: error.code, message: error.message } }, { status });
+    return errorResponse(error.code, error.message, status);
   }
   if (error && typeof error === "object" && "name" in error
     && (error.name === "ToolStoreError" || error.name === "SkillStoreError" || error.name === "SkillParseError")
@@ -94,10 +106,7 @@ export const apiErrorResponse = (error: unknown) => {
         : /CAPABILITY_REQUIRED/.test(error.code) ? 503
           : /EXECUTION|OUTPUT|INPUT/.test(error.code) ? 422
             : 400;
-    return Response.json({ ok: false, error: { code: error.code, message: error.message } }, { status });
+    return errorResponse(error.code, error.message, status);
   }
-  return Response.json({
-    ok: false,
-    error: { code: "REQUEST_FAILED", message: "Request failed" },
-  }, { status: 500 });
+  return errorResponse("REQUEST_FAILED", "Request failed", 500);
 };

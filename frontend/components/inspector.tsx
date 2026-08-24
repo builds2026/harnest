@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Tabs } from "@base-ui/react/tabs";
 import type { InspectorField } from "@harnest/core";
 import { configValue, withConfigValue } from "@/lib/component-catalog";
@@ -12,11 +12,12 @@ import type {
 } from "@/lib/studio-state";
 import {
   connectionCanRun,
-  connectionKindLabel,
   type ConnectionKind,
   type ConnectionSummary,
 } from "@/lib/connections";
 import type { ToolCatalogItem } from "@/lib/studio-catalog";
+import { componentLabel, connectionLabel, fieldLabel } from "@/i18n/manifest";
+import { useI18n } from "./i18n-provider";
 
 type EdgeCondition = { source?: string; path?: string; op?: string; value?: unknown };
 type EdgeState = { key?: string; merge?: string };
@@ -35,6 +36,7 @@ function JsonField({
   value,
   required,
   disabled,
+  path,
   onChange,
 }: {
   id: string;
@@ -42,8 +44,10 @@ function JsonField({
   value: unknown;
   required?: boolean;
   disabled?: boolean;
+  path?: string;
   onChange: (value: unknown) => void;
 }) {
+  const { t } = useI18n();
   const [text, setText] = useState(() => value === undefined ? "" : JSON.stringify(value, null, 2));
   const [error, setError] = useState("");
   const messageId = `${id}-message`;
@@ -63,12 +67,12 @@ function JsonField({
       onChange(JSON.parse(text) as unknown);
       setError("");
     } catch {
-      setError("Enter valid JSON before leaving this field.");
+      setError(t("inspector.jsonInvalid"));
     }
   };
 
   return (
-    <div className="field">
+    <div className="field" data-config-path={path}>
       <label htmlFor={id}>{label}</label>
       <textarea
         id={id}
@@ -82,7 +86,7 @@ function JsonField({
         onChange={(event) => setText(event.target.value)}
         onBlur={commit}
       />
-      <span id={messageId} className={`field-help ${error ? "is-error" : ""}`}>{error || "JSON is applied when focus leaves the field."}</span>
+      <span id={messageId} className={`field-help ${error ? "is-error" : ""}`}>{error || t("inspector.jsonHelp")}</span>
     </div>
   );
 }
@@ -98,8 +102,10 @@ function ConfigField({
   disabled: boolean;
   onChange: (component: HarnessComponent) => void;
 }) {
+  const { t } = useI18n();
   const prefix = useId().replace(/:/g, "");
   const id = fieldId(`${prefix}-${component.id}`, field.path);
+  const label = fieldLabel(t, field.path, field.label);
   const config = component.config as Record<string, unknown>;
   const value = configValue(config, field.path);
   const update = (next: unknown) => onChange({
@@ -108,24 +114,24 @@ function ConfigField({
   } as HarnessComponent);
 
   if (field.control === "json") return (
-    <JsonField id={id} label={field.label} value={value} required={field.required} disabled={disabled} onChange={update} />
+    <JsonField id={id} label={label} value={value} required={field.required} disabled={disabled} path={field.path} onChange={update} />
   );
 
   if (field.control === "checkbox") return (
-    <div className="field field-checkbox">
+    <div className="field field-checkbox" data-config-path={field.path}>
       <input id={id} type="checkbox" disabled={disabled} checked={Boolean(value)} onChange={(event) => update(event.target.checked)} />
-      <label htmlFor={id}>{field.label}</label>
+      <label htmlFor={id}>{label}</label>
     </div>
   );
 
   if (field.control === "select") return (
-    <div className="field">
-      <label htmlFor={id}>{field.label}</label>
+    <div className="field" data-config-path={field.path}>
+      <label htmlFor={id}>{label}</label>
       <select id={id} required={field.required} disabled={disabled} value={value === undefined ? "" : String(value)} onChange={(event) => {
         const selected = field.options?.find((option) => String(option.value) === event.target.value);
         update(selected?.value ?? optionalText(event.target.value));
       }}>
-        {!field.required && <option value="">Not set</option>}
+        {!field.required && <option value="">{t("common.notSet")}</option>}
         {field.options?.map((option) => <option key={String(option.value)} value={String(option.value)}>{option.label}</option>)}
       </select>
     </div>
@@ -133,8 +139,8 @@ function ConfigField({
 
   const multiline = field.control === "textarea";
   return (
-    <div className="field">
-      <label htmlFor={id}>{field.label}</label>
+    <div className="field" data-config-path={field.path}>
+      <label htmlFor={id}>{label}</label>
       {multiline ? (
         <textarea id={id} required={field.required} disabled={disabled} value={value === undefined ? "" : String(value)} onChange={(event) => update(field.required ? event.target.value : optionalText(event.target.value))} />
       ) : (
@@ -200,6 +206,7 @@ function ConnectionField({
   onChange: (component: HarnessComponent) => void;
   onConnect: (kind?: ConnectionKind) => void;
 }) {
+  const { t } = useI18n();
   const kinds = connectionKindsFor(component, tools);
   if (!kinds.length) return null;
   const config = component.config as Record<string, unknown>;
@@ -223,27 +230,27 @@ function ConnectionField({
   } as HarnessComponent);
 
   return (
-    <div className="connection-field">
-      <div className="field-section">Connection</div>
+    <div className="connection-field" data-config-path="connectionId">
+      <div className="field-section">{t("inspector.connection")}</div>
       <div className="field">
-        <label htmlFor={`connection-${component.id}`}>Reusable connection</label>
+        <label htmlFor={`connection-${component.id}`}>{t("inspector.reusableConnection")}</label>
         <select id={`connection-${component.id}`} disabled={locked} value={selectedId} onChange={(event) => update(event.target.value)}>
-          <option value="">Choose a connection</option>
-          {compatible.map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionKindLabel(connection.kind)} · {connection.status.replaceAll("_", " ")}</option>)}
+          <option value="">{t("inspector.chooseConnection")}</option>
+          {compatible.map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionLabel(t, connection.kind)} · {t(`connections.status.${connection.status}`)}</option>)}
         </select>
         {selected
-          ? <span className={`field-help connection-inline-status is-${selected.status}`}>{selected.status.replaceAll("_", " ")}</span>
-          : <span className="field-help">Credentials stay in the local store; only this ID is saved in harnest.yaml.</span>}
+          ? <span className={`field-help connection-inline-status is-${selected.status}`}>{t(`connections.status.${selected.status}`)}</span>
+          : <span className="field-help">{t("inspector.credentialHelp")}</span>}
       </div>
       {component.type === "model" && <div className="field">
-        <label htmlFor={`fallback-connection-${component.id}`}>Fallback provider</label>
+        <label htmlFor={`fallback-connection-${component.id}`}>{t("inspector.fallback")}</label>
         <select id={`fallback-connection-${component.id}`} disabled={locked || !selectedId} value={fallbackId} onChange={(event) => updateFallback(event.target.value)}>
-          <option value="">No fallback</option>
-          {compatible.filter(({ id }) => id !== selectedId).map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connection.status.replaceAll("_", " ")}</option>)}
+          <option value="">{t("inspector.noFallback")}</option>
+          {compatible.filter(({ id }) => id !== selectedId).map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {t(`connections.status.${connection.status}`)}</option>)}
         </select>
-        <span className="field-help">Used once when the primary provider reports a retryable failure.</span>
+        <span className="field-help">{t("inspector.fallbackHelp")}</span>
       </div>}
-      <button type="button" className="button" disabled={locked} onClick={() => onConnect(preferred)}>{compatible.length ? "Manage connections" : "Connect"}</button>
+      <button type="button" className="button" disabled={locked} onClick={() => onConnect(preferred)}>{compatible.length ? t("inspector.manageConnections") : t("common.connect")}</button>
     </div>
   );
 }
@@ -259,6 +266,7 @@ function EdgeInspector({
   onChange: (connection: HarnessConnection) => void;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   const connection = edge.data?.connection as EditableConnection;
   const id = useId().replace(/:/g, "");
   const condition = connection.condition ?? {};
@@ -275,22 +283,22 @@ function EdgeInspector({
 
   return (
     <div className="inspector-body">
-      <div className="component-id"><span>{edge.id}</span><span>Connection</span></div>
+      <div className="component-id"><span>{edge.id}</span><span>{t("inspector.connection")}</span></div>
       <div className="edge-route">{connection.from.component}.{connection.from.port}<span>→</span>{connection.to.component}.{connection.to.port}</div>
       <fieldset disabled={locked} className="inspector-fieldset">
         <div className="field-grid">
-          <div className="field-section">Condition</div>
-          <div className="field"><label htmlFor={`${id}-source`}>Source</label><select id={`${id}-source`} value={condition.source ?? ""} onChange={(event) => patchCondition({ source: optionalText(event.target.value) })}><option value="">Default (edge value)</option><option value="value">Edge value (explicit)</option><option value="state">Run state</option><option value="input">Run input</option></select></div>
-          <div className="field"><label htmlFor={`${id}-path`}>JSON Pointer</label><input id={`${id}-path`} placeholder="/result/score" value={condition.path ?? ""} onChange={(event) => patchCondition({ path: optionalText(event.target.value) })} /></div>
-          <div className="field"><label htmlFor={`${id}-operator`}>Operator</label><select id={`${id}-operator`} value={condition.op ?? ""} onChange={(event) => patchCondition({ op: optionalText(event.target.value) })}><option value="">Always</option>{["equals", "notEquals", "contains", "matches", "exists", "truthy", "gt", "gte", "lt", "lte"].map((operator) => <option key={operator} value={operator}>{operator}</option>)}</select></div>
-          <JsonField id={`${id}-condition-value`} label="Compare with" value={condition.value} disabled={locked} onChange={(value) => patchCondition({ value })} />
-          <div className="field-section">Data flow</div>
-          <div className="field"><label htmlFor={`${id}-select`}>Select JSON Pointer</label><input id={`${id}-select`} placeholder="/answer/text" value={connection.select ?? ""} onChange={(event) => patch({ select: optionalText(event.target.value) })} /></div>
-          <div className="field"><label htmlFor={`${id}-state-key`}>State key</label><input id={`${id}-state-key`} placeholder="draft" value={state.key ?? ""} onChange={(event) => patchState({ key: optionalText(event.target.value) })} /></div>
-          <div className="field"><label htmlFor={`${id}-state-merge`}>Merge strategy</label><select id={`${id}-state-merge`} value={state.merge ?? ""} onChange={(event) => patchState({ merge: optionalText(event.target.value) })}><option value="">Default (replace)</option><option value="replace">Replace (explicit)</option><option value="append">Append</option></select></div>
+          <div className="field-section">{t("inspector.edge.condition")}</div>
+          <div className="field"><label htmlFor={`${id}-source`}>{t("inspector.edge.source")}</label><select id={`${id}-source`} value={condition.source ?? ""} onChange={(event) => patchCondition({ source: optionalText(event.target.value) })}><option value="">{t("inspector.edge.source.default")}</option><option value="value">{t("inspector.edge.source.value")}</option><option value="state">{t("inspector.edge.source.state")}</option><option value="input">{t("inspector.edge.source.input")}</option></select></div>
+          <div className="field"><label htmlFor={`${id}-path`}>{t("inspector.edge.jsonPointer")}</label><input id={`${id}-path`} placeholder="/result/score" value={condition.path ?? ""} onChange={(event) => patchCondition({ path: optionalText(event.target.value) })} /></div>
+          <div className="field"><label htmlFor={`${id}-operator`}>{t("inspector.edge.operator")}</label><select id={`${id}-operator`} value={condition.op ?? ""} onChange={(event) => patchCondition({ op: optionalText(event.target.value) })}><option value="">{t("inspector.edge.always")}</option>{["equals", "notEquals", "contains", "matches", "exists", "truthy", "gt", "gte", "lt", "lte"].map((operator) => <option key={operator} value={operator}>{operator}</option>)}</select></div>
+          <JsonField id={`${id}-condition-value`} label={t("inspector.edge.compare")} value={condition.value} disabled={locked} onChange={(value) => patchCondition({ value })} />
+          <div className="field-section">{t("inspector.edge.dataFlow")}</div>
+          <div className="field"><label htmlFor={`${id}-select`}>{t("inspector.edge.selectPointer")}</label><input id={`${id}-select`} placeholder="/answer/text" value={connection.select ?? ""} onChange={(event) => patch({ select: optionalText(event.target.value) })} /></div>
+          <div className="field"><label htmlFor={`${id}-state-key`}>{t("inspector.edge.stateKey")}</label><input id={`${id}-state-key`} placeholder="draft" value={state.key ?? ""} onChange={(event) => patchState({ key: optionalText(event.target.value) })} /></div>
+          <div className="field"><label htmlFor={`${id}-state-merge`}>{t("inspector.edge.merge")}</label><select id={`${id}-state-merge`} value={state.merge ?? ""} onChange={(event) => patchState({ merge: optionalText(event.target.value) })}><option value="">{t("inspector.edge.merge.default")}</option><option value="replace">{t("inspector.edge.merge.replace")}</option><option value="append">{t("inspector.edge.merge.append")}</option></select></div>
         </div>
       </fieldset>
-      <div className="inspector-actions"><button className="button" disabled={locked} onClick={onDelete}>Delete connection</button></div>
+      <div className="inspector-actions"><button className="button" disabled={locked} onClick={onDelete}>{t("inspector.deleteConnection")}</button></div>
     </div>
   );
 }
@@ -311,6 +319,8 @@ export function Inspector({
   connections,
   tools,
   onOpenConnections,
+  focusPath,
+  focusVersion = 0,
 }: {
   node?: HarnessNode;
   edge?: HarnessEdge;
@@ -327,9 +337,37 @@ export function Inspector({
   connections?: readonly ConnectionSummary[];
   tools?: readonly ToolCatalogItem[];
   onOpenConnections?: (kind?: ConnectionKind) => void;
+  focusPath?: string;
+  focusVersion?: number;
 }) {
+  const { t } = useI18n();
+  const inspectorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!focusPath || !node) return undefined;
+    let timeout: number | undefined;
+    const frame = requestAnimationFrame(() => {
+      const candidates = [...(inspectorRef.current?.querySelectorAll<HTMLElement>("[data-config-path]") ?? [])];
+      const normalized = focusPath.replace(/^\$\.?/, "");
+      const target = candidates.find((element) => {
+        const path = element.dataset.configPath;
+        return Boolean(path && (normalized === path || normalized.endsWith(`.${path}`) || normalized.endsWith(`/${path}`)));
+      });
+      if (!target) return;
+      const advanced = target.closest<HTMLDetailsElement>("details");
+      if (advanced) advanced.open = true;
+      target.classList.add("is-diagnostic-focus");
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      target.querySelector<HTMLElement>("input, select, textarea, button")?.focus({ preventScroll: true });
+      timeout = window.setTimeout(() => target.classList.remove("is-diagnostic-focus"), 1_800);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (timeout) window.clearTimeout(timeout);
+    };
+  }, [focusPath, focusVersion, node?.id]);
+
   if (edge) return <EdgeInspector edge={edge} locked={locked} onChange={onEdgeChange} onDelete={onDeleteEdge} />;
-  if (!node) return <div className="inspector-empty">Select a component or connection to configure its runtime contract.</div>;
+  if (!node) return <div className="inspector-empty">{t("inspector.empty")}</div>;
 
   const component = node.data.component;
   const manifest = node.data.manifest;
@@ -344,35 +382,35 @@ export function Inspector({
   const lastRun = node.data.lastRun;
 
   return (
-    <div className="inspector-body">
-      <div className="component-id"><span>{component.id}</span><span>{manifest.label}{entrypoint === component.id ? " · entrypoint" : ""}</span></div>
+    <div ref={inspectorRef} className="inspector-body">
+      <div className="component-id"><span>{component.id}</span><span>{componentLabel(t, manifest.type, manifest.label)}{entrypoint === component.id ? ` · ${t("inspector.entrypoint")}` : ""}</span></div>
       <Tabs.Root key={component.id} defaultValue="settings" className="inspector-tabs">
         <Tabs.List className="inspector-tab-list" aria-label={`${component.id} inspector`}>
-          <Tabs.Tab value="settings">Settings</Tabs.Tab>
-          <Tabs.Tab value="last-run">Last run{lastRun ? <span className={`tab-state is-${lastRun.state}`} /> : null}</Tabs.Tab>
+          <Tabs.Tab value="settings">{t("inspector.settings")}</Tabs.Tab>
+          <Tabs.Tab value="last-run">{t("inspector.lastRun")}{lastRun ? <span className={`tab-state is-${lastRun.state}`} /> : null}</Tabs.Tab>
           <Tabs.Indicator className="inspector-tab-indicator" />
         </Tabs.List>
         <Tabs.Panel value="settings" className="inspector-tab-panel">
           <fieldset disabled={locked} className="inspector-fieldset">
             <div className="field-grid">
               {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
-              {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">This legacy Model contains a plaintext API key. Move it to a write-only Provider Connection, then remove it in Advanced YAML.</div>}
+              {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">{t("inspector.legacySecret")}</div>}
               {primaryFields.length
                 ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
-                : <div className="field-help">This component has no editable configuration.</div>}
-              {advancedFields.length > 0 && <details className="advanced-panel"><summary>Advanced</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
+                : <div className="field-help">{t("inspector.noConfig")}</div>}
+              {advancedFields.length > 0 && <details className="advanced-panel"><summary>{t("inspector.advanced")}</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
             </div>
           </fieldset>
           <div className="inspector-actions is-split">
             <span>
-              {subgraph && onOpenSubgraph && <button className="button" disabled={locked} onClick={() => onOpenSubgraph(subgraph)}>{subgraphs?.includes(subgraph) ? "Open subgraph" : "Create subgraph"}</button>}
-              {canSetEntrypoint && entrypoint !== component.id && <button className="button" disabled={locked} onClick={onSetEntrypoint}>Set as entrypoint</button>}
+              {subgraph && onOpenSubgraph && <button className="button" disabled={locked} onClick={() => onOpenSubgraph(subgraph)}>{subgraphs?.includes(subgraph) ? t("inspector.openSubgraph") : t("inspector.createSubgraph")}</button>}
+              {canSetEntrypoint && entrypoint !== component.id && <button className="button" disabled={locked} onClick={onSetEntrypoint}>{t("inspector.setEntrypoint")}</button>}
             </span>
-            <button className="button" disabled={locked} onClick={onDelete}>Delete component</button>
+            <button className="button" disabled={locked} onClick={onDelete}>{t("inspector.deleteComponent")}</button>
           </div>
         </Tabs.Panel>
         <Tabs.Panel value="last-run" className="inspector-tab-panel">
-          {lastRun ? <div className="last-run-summary"><div className={`last-run-state is-${lastRun.state}`}><span>{lastRun.state}</span><strong>{lastRun.durationMs === undefined ? "In progress" : `${Math.round(lastRun.durationMs)} ms`}</strong></div><dl><div><dt>Run</dt><dd>{lastRun.runId ?? "Current trace"}</dd></div><div><dt>Events</dt><dd>{lastRun.eventCount}</dd></div><div><dt>Validation</dt><dd>{node.data.diagnostics?.length ? `${node.data.diagnostics.length} issue(s)` : "No node issues"}</dd></div></dl>{lastRun.error && <p role="alert">{lastRun.error}</p>}</div> : <div className="inspector-run-empty"><span>◇</span><strong>No run data for this component</strong><p>Run this harness in Playground or the Test dock. The next node execution will appear here without changing the spec.</p></div>}
+          {lastRun ? <div className="last-run-summary"><div className={`last-run-state is-${lastRun.state}`}><span>{lastRun.state}</span><strong>{lastRun.durationMs === undefined ? t("inspector.inProgress") : `${Math.round(lastRun.durationMs)} ms`}</strong></div><dl><div><dt>{t("inspector.run")}</dt><dd>{lastRun.runId ?? t("inspector.currentTrace")}</dd></div><div><dt>{t("inspector.events")}</dt><dd>{lastRun.eventCount}</dd></div><div><dt>{t("inspector.validation")}</dt><dd>{node.data.diagnostics?.length ? t("save.issues", { count: node.data.diagnostics.length }) : t("inspector.noIssues")}</dd></div></dl>{lastRun.error && <p role="alert">{lastRun.error}</p>}</div> : <div className="inspector-run-empty"><span>◇</span><strong>{t("inspector.noRun")}</strong><p>{t("inspector.noRunDescription")}</p></div>}
         </Tabs.Panel>
       </Tabs.Root>
     </div>

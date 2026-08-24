@@ -1,9 +1,8 @@
-version: "0.2"
 components:
   - id: model
     type: model
     config:
-      connectionId: gemini-main
+      connectionId: connection_cc9063f1447347a494e969e17f72dc7a
       model: gemini-3.5-flash-lite
       temperature: 0.2
       maxTokens: 4000
@@ -71,33 +70,84 @@ components:
     config:
       format: text
 connections:
-  - from: { component: model, port: model }
-    to: { component: agent, port: model }
-  - from: { component: prompt, port: prompt }
-    to: { component: agent, port: prompt }
-  - from: { component: guidance, port: context }
-    to: { component: agent, port: context }
-  - from: { component: preferences, port: memory }
-    to: { component: agent, port: memory }
-  - from: { component: webSearch, port: tool }
-    to: { component: agent, port: tools }
-  - from: { component: webScrape, port: tool }
-    to: { component: agent, port: tools }
-  - from: { component: codeRunner, port: tool }
-    to: { component: agent, port: tools }
-  - from: { component: agent, port: response }
-    to: { component: output, port: value }
+  - from:
+      component: model
+      port: model
+    to:
+      component: agent
+      port: model
+  - from:
+      component: prompt
+      port: prompt
+    to:
+      component: agent
+      port: prompt
+  - from:
+      component: guidance
+      port: context
+    to:
+      component: agent
+      port: context
+  - from:
+      component: preferences
+      port: memory
+    to:
+      component: agent
+      port: memory
+  - from:
+      component: webSearch
+      port: tool
+    to:
+      component: agent
+      port: tools
+  - from:
+      component: webScrape
+      port: tool
+    to:
+      component: agent
+      port: tools
+  - from:
+      component: codeRunner
+      port: tool
+    to:
+      component: agent
+      port: tools
+  - from:
+      component: agent
+      port: response
+    to:
+      component: output
+      port: value
 entrypoint: output
+version: "0.2"
 runtime:
   timeoutMs: 120000
 studio:
   positions:
-    model: { x: 40, y: 40 }
-    prompt: { x: 40, y: 220 }
-    guidance: { x: 40, y: 430 }
-    preferences: { x: 40, y: 590 }
-    webSearch: { x: 350, y: 40 }
-    webScrape: { x: 350, y: 200 }
-    codeRunner: { x: 350, y: 360 }
-    agent: { x: 690, y: 220 }
-    output: { x: 1040, y: 220 }
+    model:
+      x: 40
+      y: 40
+    prompt:
+      x: 40
+      y: 220
+    guidance:
+      x: 40
+      y: 430
+    preferences:
+      x: 40
+      y: 590
+    webSearch:
+      x: 350
+      y: 40
+    webScrape:
+      x: 350
+      y: 200
+    codeRunner:
+      x: 350
+      y: 360
+    agent:
+      x: 672
+      y: 304
+    output:
+      x: 1040
+      y: 220

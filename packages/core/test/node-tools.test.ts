@@ -545,11 +545,13 @@ describe("built-in tool definitions", () => {
     try {
       await mkdir(join(root, "data"));
       await writeFile(join(root, "data", "note.txt"), "hello", "utf8");
-      const webSearch = vi.fn(async ({ query }) => ({ query, hits: [] }));
+      const webSearch = vi.fn(async ({ query }) => ({ query, results: [{ content: "x".repeat(3_000) }] }));
+      const webScrape = vi.fn(async () => ({ content: "x".repeat(20_000) }));
       const store = new NodeToolStore({
         projectDirectory: root,
         capabilities: {
           webSearch,
+          webScrape,
           authorizeFile: () => true,
         },
       });
@@ -563,11 +565,17 @@ describe("built-in tool definitions", () => {
         "builtin.code-runner",
       ]);
       const search = definitions.find(({ id }) => id === "builtin.web-search");
+      const scrape = definitions.find(({ id }) => id === "builtin.web-scrape");
       const file = definitions.find(({ id }) => id === "builtin.file");
-      if (!search || !file) throw new Error("fixture");
+      if (!search || !scrape || !file) throw new Error("fixture");
       expect(search.connectionKinds).toEqual(["tool-service"]);
       await expect(search.execute({ query: "Harnest" }, context))
-        .resolves.toEqual({ query: "Harnest", hits: [] });
+        .resolves.toEqual({
+          query: "Harnest",
+          results: [{ content: "x".repeat(1_000), contentTruncated: true }],
+        });
+      await expect(scrape.execute({ url: "https://example.com" }, context))
+        .resolves.toEqual({ content: "x".repeat(12_000), truncated: true });
       await expect(file.execute({ operation: "read", path: "data/note.txt" }, context))
         .resolves.toBe("hello");
       await expect(file.execute({ operation: "read", path: "../outside.txt" }, context))

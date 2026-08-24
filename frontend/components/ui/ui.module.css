@@ -1,0 +1,106 @@
+.button,
+.iconButton,
+.control {
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  background: var(--surface-raised);
+  font: inherit;
+}
+
+.button {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: var(--radius-sm);
+  font-weight: 680;
+  white-space: nowrap;
+  box-shadow: var(--shadow-xs);
+}
+
+.small { min-height: 30px; padding: 5px 9px; font-size: 11px; }
+.medium { min-height: 36px; padding: 7px 12px; font-size: 12px; }
+.button:hover:not(:disabled), .iconButton:hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-hover); }
+.button:disabled, .iconButton:disabled { cursor: not-allowed; opacity: .48; }
+.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
+.primary:hover:not(:disabled) { border-color: var(--accent-strong); background: var(--accent-strong); }
+.danger { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); color: var(--danger); background: var(--danger-soft); }
+.quiet { border-color: transparent; background: transparent; box-shadow: none; }
+
+.iconButton {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
+  border-radius: var(--radius-sm);
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+.control {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  outline: 0;
+}
+.control:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.textarea { min-height: 88px; resize: vertical; }
+.field { display: grid; gap: 6px; }
+.field > label { color: var(--text-secondary); font-size: 11px; font-weight: 700; }
+.fieldMessage { color: var(--text-tertiary); font-size: 11px; line-height: 1.4; }
+.fieldError { color: var(--danger); }
+
+.switchRow, .checkboxRow { display: inline-flex; align-items: center; gap: 9px; }
+.switch { width: 34px; height: 20px; padding: 2px; border: 0; border-radius: 999px; background: var(--border-strong); }
+.switch[data-checked] { background: var(--accent); }
+.switchThumb { display: block; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: var(--shadow-xs); transition: transform 140ms ease; }
+.switch[data-checked] .switchThumb { transform: translateX(14px); }
+.checkbox { display: grid; width: 18px; height: 18px; place-items: center; padding: 0; border: 1px solid var(--border-strong); border-radius: 5px; color: #fff; background: var(--surface-raised); font-size: 11px; }
+.checkbox[data-checked] { border-color: var(--accent); background: var(--accent); }
+
+.badge { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; font-size: 10px; font-weight: 750; }
+.tone-neutral { color: var(--text-secondary); background: var(--surface-muted); }
+.tone-info { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+.tone-success { color: var(--success); background: var(--success-soft); border-color: color-mix(in srgb, var(--success) 30%, var(--border)); }
+.tone-warning { color: var(--warning); background: var(--warning-soft); border-color: color-mix(in srgb, var(--warning) 30%, var(--border)); }
+.tone-danger { color: var(--danger); background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); }
+.statusDot { display: inline-block; width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+
+.skeleton { display: grid; gap: 10px; padding: 16px; }
+.skeleton span { height: 12px; border-radius: 999px; background: linear-gradient(90deg, var(--surface-muted), var(--surface-hover), var(--surface-muted)); background-size: 200% 100%; animation: shimmer 1.4s ease infinite; }
+.skeleton span:nth-child(2n) { width: 78%; }
+.skeleton span:nth-child(3n) { width: 56%; }
+
+.state { display: grid; max-width: 440px; justify-items: start; gap: 8px; padding: 24px; color: var(--text-secondary); }
+.state strong { color: var(--text-primary); font-size: 14px; }
+.state p { margin: 0 0 4px; line-height: 1.55; }
+.stateGlyph { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid var(--border); border-radius: 10px; color: var(--accent); background: var(--accent-soft); font-family: var(--mono); font-weight: 800; }
+.compact { padding: 14px; }
+.errorState .stateGlyph { color: var(--danger); background: var(--danger-soft); }
+.state details { max-width: 100%; }
+.state pre { max-width: 100%; overflow: auto; padding: 10px; border-radius: var(--radius-sm); background: var(--code-bg); color: var(--code-text); }
+
+.notice { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-secondary); background: var(--surface-muted); font-size: 12px; }
+.notice strong { display: block; margin-bottom: 2px; color: var(--text-primary); }
+
+.backdrop { position: fixed; inset: 0; z-index: 200; background: var(--overlay); }
+.dialogViewport { position: fixed; inset: 0; z-index: 201; display: grid; place-items: center; padding: 20px; }
+.dialog { width: min(440px, 100%); padding: 22px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-raised); box-shadow: var(--shadow-lg); }
+.dialogTitle { margin: 0; font-size: 17px; }
+.dialogDescription { margin: 8px 0 20px; color: var(--text-secondary); line-height: 1.55; }
+.dialogActions { display: flex; justify-content: flex-end; gap: 8px; }
+.visuallyHidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .spinner, .skeleton span { animation: none; } .switchThumb { transition: none; } }

@@ -1,0 +1,83 @@
+.trail {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.trail li {
+  position: relative;
+  display: flex;
+  min-width: 62px;
+  align-items: center;
+  gap: 5px;
+  color: var(--header-muted);
+  font-size: 10px;
+}
+
+.trail li:not(:last-child)::after {
+  width: 20px;
+  height: 1px;
+  margin: 0 7px;
+  background: color-mix(in srgb, var(--header-text) 16%, transparent);
+  content: "";
+}
+
+.trail li > span {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--header-text) 28%, transparent);
+  border-radius: 50%;
+  font-size: 9px;
+}
+
+.trail li strong { font-weight: 650; white-space: nowrap; }
+.trail .complete { color: color-mix(in srgb, var(--success) 82%, white); }
+.trail .complete > span { border-color: var(--success); background: color-mix(in srgb, var(--success) 25%, transparent); }
+.trail .current { color: var(--header-text); }
+.trail .current > span { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.trail .error { color: color-mix(in srgb, var(--danger) 82%, white); }
+.trail .error > span { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 24%, transparent); }
+
+.journey {
+  position: absolute;
+  z-index: 8;
+  top: 58px;
+  right: 18px;
+  width: min(350px, calc(100% - 36px));
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(12px);
+}
+
+.journey > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 17px 17px 12px; }
+.journey header span { color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.journey header strong { display: block; margin-top: 5px; color: var(--text-primary); font-size: 14px; }
+.journey header p { margin: 5px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
+.journey header > button { width: 26px; height: 26px; flex: 0 0 auto; border: 0; border-radius: 7px; color: var(--text-secondary); background: transparent; font-size: 18px; }
+.journey header > button:hover { background: var(--surface-hover); }
+.progress { position: relative; height: 4px; background: var(--surface-muted); }
+.progress > span { display: block; height: 100%; background: var(--accent); transition: width 180ms ease; }
+.progress small { position: absolute; top: -21px; right: 17px; color: var(--text-tertiary); font-size: 9px; }
+.journey ol { display: grid; gap: 0; margin: 0; padding: 8px 17px 14px; list-style: none; }
+.journey li { display: grid; grid-template-columns: 24px 1fr; gap: 9px; padding: 8px 0; color: var(--text-tertiary); }
+.journey li > span { display: grid; width: 20px; height: 20px; place-items: center; border: 1px solid var(--border); border-radius: 50%; font-size: 9px; font-weight: 750; }
+.journey li strong { color: var(--text-secondary); font-size: 11px; }
+.journey li p { margin: 3px 0 7px; font-size: 10px; line-height: 1.4; }
+.journey .stepComplete > span { border-color: var(--success); color: var(--success); background: var(--success-soft); }
+.journey .stepComplete strong { color: var(--text-tertiary); text-decoration: line-through; }
+.journey .stepCurrent > span { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.journey .stepCurrent strong { color: var(--text-primary); }
+
+@media (max-width: 1180px) { .trail li strong { display: none; } .trail li { min-width: 22px; } .trail li:not(:last-child)::after { width: 12px; margin-inline: 4px; } }
+@media (max-width: 680px) { .trail { display: none; } .journey { position: static; width: auto; margin: 12px; } }
+@media (prefers-reduced-motion: reduce) { .progress > span { transition: none; } }

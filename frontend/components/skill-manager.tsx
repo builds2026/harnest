@@ -1,6 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Dialog } from "@base-ui/react/dialog";
+import { apiErrorMessage, requestJson } from "@/lib/api-client";
+import { useI18n } from "./i18n-provider";
 
 type SkillSourceKind = "local" | "git" | "package";
 type InstalledSkill = {
@@ -11,16 +14,12 @@ type InstalledSkill = {
 };
 type ScriptReview = { path: string; bytes: number; sha256: string; content: string; approved: boolean };
 
-const requestMessage = async (response: Response) => {
-  const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null;
-  return payload?.error?.message ?? `Request failed with ${response.status}`;
-};
-
 export function SkillManager({ open, onClose, onChanged }: {
   open: boolean;
   onClose: () => void;
   onChanged: () => void | Promise<void>;
 }) {
+  const { t } = useI18n();
   const [kind, setKind] = useState<SkillSourceKind>("local");
   const [scope, setScope] = useState<"project" | "user">("project");
   const [namespace, setNamespace] = useState<"harnest" | "agents">("harnest");
@@ -37,9 +36,7 @@ export function SkillManager({ open, onClose, onChanged }: {
   const first = useRef<HTMLInputElement>(null);
 
   const loadInstalled = async () => {
-    const response = await fetch("/api/skills", { cache: "no-store" });
-    if (!response.ok) throw new Error(await requestMessage(response));
-    const payload = await response.json() as { skills: InstalledSkill[]; warnings: string[] };
+    const payload = await requestJson<{ skills: InstalledSkill[]; warnings: string[] }>("/api/skills", { cache: "no-store" });
     setInstalled(payload.skills);
     setWarnings(payload.warnings);
     return payload.skills;
@@ -49,12 +46,10 @@ export function SkillManager({ open, onClose, onChanged }: {
     setBusy(true);
     setMessage("");
     try {
-      const response = await fetch(`/api/skills?review=${encodeURIComponent(skill.id)}`, { cache: "no-store" });
-      if (!response.ok) throw new Error(await requestMessage(response));
-      setScripts((await response.json() as { scripts: ScriptReview[] }).scripts);
+      setScripts((await requestJson<{ scripts: ScriptReview[] }>(`/api/skills?review=${encodeURIComponent(skill.id)}`, { cache: "no-store" })).scripts);
       setReviewSkill(skill);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Skill scripts could not be reviewed.");
+      setMessage(apiErrorMessage(error, t("skills.reviewFailed"), t));
     } finally {
       setBusy(false);
     }
@@ -65,7 +60,7 @@ export function SkillManager({ open, onClose, onChanged }: {
     setMessage("");
     setReviewSkill(undefined);
     setScripts([]);
-    void loadInstalled().catch((error: unknown) => setMessage(error instanceof Error ? error.message : "Skills could not be loaded."));
+    void loadInstalled().catch((error: unknown) => setMessage(apiErrorMessage(error, t("skills.loadFailed"), t)));
     queueMicrotask(() => first.current?.focus());
   }, [open]);
 
@@ -79,20 +74,18 @@ export function SkillManager({ open, onClose, onChanged }: {
       const source = kind === "local" ? { kind, directory }
         : kind === "git" ? { kind, repository }
           : { kind, package: packageName, ...(version ? { version } : {}) };
-      const response = await fetch("/api/skills", {
+      const payload = await requestJson<{ skill: { label: string; scriptsPresent: boolean }; source: string }>("/api/skills", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ source, scope, namespace, approved: kind !== "local" }),
-      });
-      if (!response.ok) throw new Error(await requestMessage(response));
-      const payload = await response.json() as { skill: { label: string; scriptsPresent: boolean }; source: string };
+      }, { timeoutMs: 120_000 });
       await onChanged();
       const skills = await loadInstalled();
-      setMessage(`${payload.skill.label} installed from ${payload.source}.${payload.skill.scriptsPresent ? " Review its scripts before use." : ""}`);
+      setMessage(`${t("skills.installed", { name: payload.skill.label, source: payload.source })}${payload.skill.scriptsPresent ? t("skills.installedReview") : ""}`);
       const installedSkill = skills.find((skill) => skill.id === payload.skill.label);
       if (installedSkill?.scriptsPresent) await review(installedSkill);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Skill installation failed.");
+      setMessage(apiErrorMessage(error, t("skills.installFailed"), t));
     } finally {
       setBusy(false);
     }
@@ -105,7 +98,7 @@ export function SkillManager({ open, onClose, onChanged }: {
     setBusy(true);
     setMessage("");
     try {
-      const response = await fetch("/api/skills", {
+      await requestJson<unknown>("/api/skills", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -113,38 +106,42 @@ export function SkillManager({ open, onClose, onChanged }: {
           skill: reviewSkill.id,
           scripts: pending.map(({ path, sha256 }) => ({ path, sha256 })),
         }),
-      });
-      if (!response.ok) throw new Error(await requestMessage(response));
+      }, { timeoutMs: 120_000 });
       setScripts((current) => current.map((script) => ({ ...script, approved: true })));
-      setMessage(`${reviewSkill.label} scripts approved for these exact hashes.`);
+      setMessage(t("skills.approvedMessage", { name: reviewSkill.label }));
       await onChanged();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Skill scripts could not be approved.");
+      setMessage(apiErrorMessage(error, t("skills.approvalFailed"), t));
     } finally {
       setBusy(false);
     }
   };
 
-  return <div className="sheet-backdrop">
-    <section className="connection-sheet skill-sheet" role="dialog" aria-modal="true" aria-labelledby="skill-sheet-title">
-      <header className="sheet-header"><div><span className="sheet-eyebrow">Progressive instruction catalog</span><h2 id="skill-sheet-title">Skills</h2></div><button className="sheet-close" aria-label="Close skills" disabled={busy} onClick={onClose}>×</button></header>
+  return <Dialog.Root open={open} onOpenChange={(next) => { if (!next && !busy) onClose(); }}>
+    <Dialog.Portal>
+      <Dialog.Backdrop className="sheet-backdrop" />
+      <Dialog.Viewport className="connection-sheet-viewport">
+    <Dialog.Popup className="connection-sheet skill-sheet">
+      <header className="sheet-header"><div><span className="sheet-eyebrow">{t("skills.eyebrow")}</span><Dialog.Title id="skill-sheet-title">{t("skills.title")}</Dialog.Title></div><Dialog.Close className="sheet-close" aria-label={t("skills.close")} disabled={busy}>×</Dialog.Close></header>
       {message && <div className="sheet-message" role="status">{message}</div>}
-      {warnings.length > 0 && <details className="source-review"><summary>{warnings.length} installed skill{warnings.length === 1 ? " needs" : "s need"} attention</summary><p>Invalid skills stay disabled until their SKILL.md metadata is corrected.</p><ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}
-      {installed.some((skill) => skill.scriptsPresent) && !reviewSkill && <div className="source-review"><span>Scripts need explicit trust</span><p>Review code and its SHA-256 before allowing a model to load it.</p><div className="sheet-actions">{installed.filter((skill) => skill.scriptsPresent).map((skill) => <button key={skill.id} type="button" className="button" disabled={busy} onClick={() => void review(skill)}>Review {skill.label}</button>)}</div></div>}
-      {reviewSkill && <div className="approval-body source-review"><span>{reviewSkill.label} · script review</span><p>Requirements: {[...reviewSkill.requirements.tools.map((value) => `tool:${value}`), ...reviewSkill.requirements.connections.map((value) => `connection:${value}`), ...reviewSkill.requirements.permissions.map((value) => `permission:${value}`)].join(", ") || "none"}</p>{scripts.map((script) => <details key={script.path} open={!script.approved}><summary>{script.approved ? "Approved" : "Review"} · {script.path} · {script.bytes} bytes</summary><code>{script.sha256}</code><pre>{script.content}</pre></details>)}<div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={() => { setReviewSkill(undefined); setScripts([]); }}>Back</button><button type="button" className="button button-primary" disabled={busy || scripts.every((script) => script.approved)} onClick={() => void approveScripts()}>{busy ? "Approving…" : "Approve exact hashes"}</button></div></div>}
+      {warnings.length > 0 && <details className="source-review"><summary>{t("skills.warning", { count: warnings.length })}</summary><p>{t("skills.warningHelp")}</p><ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></details>}
+      {installed.some((skill) => skill.scriptsPresent) && !reviewSkill && <div className="source-review"><span>{t("skills.scriptsTrust")}</span><p>{t("skills.scriptsTrustHelp")}</p><div className="sheet-actions">{installed.filter((skill) => skill.scriptsPresent).map((skill) => <button key={skill.id} type="button" className="button" disabled={busy} onClick={() => void review(skill)}>{t("skills.review", { name: skill.label })}</button>)}</div></div>}
+      {reviewSkill && <div className="approval-body source-review"><span>{t("skills.scriptReview", { name: reviewSkill.label })}</span><p>{t("skills.requirements", { value: [...reviewSkill.requirements.tools.map((value) => `tool:${value}`), ...reviewSkill.requirements.connections.map((value) => `connection:${value}`), ...reviewSkill.requirements.permissions.map((value) => `permission:${value}`)].join(", ") || t("common.none") })}</p>{scripts.map((script) => <details key={script.path} open={!script.approved}><summary>{script.approved ? t("skills.approved") : t("skills.reviewState")} · {script.path} · {script.bytes} bytes</summary><code>{script.sha256}</code><pre>{script.content}</pre></details>)}<div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={() => { setReviewSkill(undefined); setScripts([]); }}>{t("common.back")}</button><button type="button" className="button button-primary" disabled={busy || scripts.every((script) => script.approved)} onClick={() => void approveScripts()}>{busy ? t("skills.approving") : t("skills.approve")}</button></div></div>}
       <form className="connection-form" onSubmit={submit}>
-        <h3>Add a skill</h3>
+        <h3>{t("skills.add")}</h3>
         <div className="field-grid">
-          <div className="field"><label htmlFor="skill-source-kind">Source</label><select id="skill-source-kind" value={kind} onChange={(event) => setKind(event.target.value as SkillSourceKind)}><option value="local">Local folder</option><option value="git">GitHub or GitLab</option><option value="package">npm package</option></select></div>
-          <div className="field"><label htmlFor="skill-scope">Scope</label><select id="skill-scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="project">This project</option><option value="user">All local projects</option></select></div>
-          <div className="field"><label htmlFor="skill-namespace">Namespace</label><select id="skill-namespace" value={namespace} onChange={(event) => setNamespace(event.target.value as typeof namespace)}><option value="harnest">.harnest</option><option value="agents">.agents compatible</option></select></div>
-          {kind === "local" && <div className="field"><label htmlFor="skill-directory">Folder containing SKILL.md</label><input ref={first} id="skill-directory" required placeholder="C:\\path\\to\\skill-name" value={directory} onChange={(event) => setDirectory(event.target.value)} /><span className="field-help">The server copies a bounded, non-symlinked tree into the selected local catalog.</span></div>}
-          {kind === "git" && <div className="field"><label htmlFor="skill-repository">Repository URL</label><input ref={first} id="skill-repository" type="url" required placeholder="https://github.com/owner/skill" value={repository} onChange={(event) => setRepository(event.target.value)} /><span className="field-help">Install resolves and records the current exact commit automatically.</span></div>}
-          {kind === "package" && <><div className="field"><label htmlFor="skill-package">Package</label><input ref={first} id="skill-package" required placeholder="@scope/skill" value={packageName} onChange={(event) => setPackageName(event.target.value)} /></div><div className="field"><label htmlFor="skill-version">Version <span className="optional">optional</span></label><input id="skill-version" placeholder="latest" value={version} onChange={(event) => setVersion(event.target.value)} /><span className="field-help">The exact version and registry sha512 are verified before extraction.</span></div></>}
-          {kind !== "local" && <div className="source-review"><span>Safe install</span><p>Clicking Install approves the resolved immutable source. Links, path traversal, oversized archives, and integrity mismatches are rejected.</p></div>}
+          <div className="field"><label htmlFor="skill-source-kind">{t("skills.source")}</label><select id="skill-source-kind" value={kind} onChange={(event) => setKind(event.target.value as SkillSourceKind)}><option value="local">{t("skills.source.local")}</option><option value="git">{t("skills.source.git")}</option><option value="package">{t("skills.source.package")}</option></select></div>
+          <div className="field"><label htmlFor="skill-scope">{t("skills.scope")}</label><select id="skill-scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="project">{t("connections.form.scope.project")}</option><option value="user">{t("connections.form.scope.user")}</option></select></div>
+          <div className="field"><label htmlFor="skill-namespace">{t("skills.namespace")}</label><select id="skill-namespace" value={namespace} onChange={(event) => setNamespace(event.target.value as typeof namespace)}><option value="harnest">{t("skills.namespace.harnest")}</option><option value="agents">{t("skills.namespace.agents")}</option></select></div>
+          {kind === "local" && <div className="field"><label htmlFor="skill-directory">{t("skills.folder")}</label><input ref={first} id="skill-directory" required placeholder="C:\\path\\to\\skill-name" value={directory} onChange={(event) => setDirectory(event.target.value)} /><span className="field-help">{t("skills.folderHelp")}</span></div>}
+          {kind === "git" && <div className="field"><label htmlFor="skill-repository">{t("skills.repository")}</label><input ref={first} id="skill-repository" type="url" required placeholder="https://github.com/owner/skill" value={repository} onChange={(event) => setRepository(event.target.value)} /><span className="field-help">{t("skills.repositoryHelp")}</span></div>}
+          {kind === "package" && <><div className="field"><label htmlFor="skill-package">{t("skills.package")}</label><input ref={first} id="skill-package" required placeholder="@scope/skill" value={packageName} onChange={(event) => setPackageName(event.target.value)} /></div><div className="field"><label htmlFor="skill-version">{t("skills.version")} <span className="optional">{t("skills.optional")}</span></label><input id="skill-version" placeholder="latest" value={version} onChange={(event) => setVersion(event.target.value)} /><span className="field-help">{t("skills.versionHelp")}</span></div></>}
+          {kind !== "local" && <div className="source-review"><span>{t("skills.safeInstall")}</span><p>{t("skills.safeInstallHelp")}</p></div>}
         </div>
-        <div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? "Installing…" : "Install skill"}</button></div>
+        <div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{t("common.cancel")}</button><button className="button button-primary" disabled={busy}>{busy ? t("skills.installing") : t("skills.install")}</button></div>
       </form>
-    </section>
-  </div>;
+    </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  </Dialog.Root>;
 }

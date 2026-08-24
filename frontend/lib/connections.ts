@@ -46,6 +46,24 @@ export type ConnectionAction =
   | "reauth"
   | "revoke";
 
+/** Ephemeral browser-only progress. Persistent health remains ConnectionStatus. */
+export type ConnectionOperationPhase =
+  | "idle"
+  | "saving"
+  | "authorizing"
+  | "testing"
+  | "discovering"
+  | "approving"
+  | "retrying";
+
+export const connectionOperationForAction = (action: ConnectionAction): ConnectionOperationPhase => action === "reauth"
+  ? "authorizing"
+  : action === "discover"
+    ? "discovering"
+    : action === "approve-process"
+      ? "approving"
+      : "testing";
+
 export interface ConnectionMutation {
   readonly id?: string;
   readonly name: string;
