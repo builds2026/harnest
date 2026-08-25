@@ -1,4 +1,13 @@
-import type { HarnessAssertion, HarnessSpec } from "./spec.js";
+import type { ConnectionSpec, HarnessAssertion, HarnessSpec } from "./spec.js";
+
+export type HarnessPlanSummary = {
+  readonly nodeCount: number;
+  readonly edgeCount: number;
+  readonly layerCount: number;
+  readonly entrypoint: string;
+  readonly sourceVersion: "0.1" | "0.2";
+  readonly timeoutMs?: number;
+};
 
 export interface HarnessIntegrationContract {
   readonly contractVersion: "1";
@@ -7,6 +16,7 @@ export interface HarnessIntegrationContract {
   readonly graphCount: number;
   readonly componentCount: number;
   readonly connectionCount: number;
+  readonly plan: HarnessPlanSummary;
   readonly componentTypes: Readonly<Record<string, number>>;
   readonly providers: readonly {
     readonly component: string;
@@ -40,6 +50,41 @@ export interface HarnessIntegrationContract {
 
 const text = (value: unknown) => typeof value === "string" && value ? value : undefined;
 const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const layerCount = (componentIds: readonly string[], connections: readonly ConnectionSpec[]): number => {
+  const remaining = new Set(componentIds);
+  const inbound = new Map(componentIds.map((id) => [id, 0]));
+  const outbound = new Map(componentIds.map((id) => [id, [] as string[]]));
+  for (const connection of connections) {
+    if (!remaining.has(connection.from.component) || !remaining.has(connection.to.component)) continue;
+    inbound.set(connection.to.component, (inbound.get(connection.to.component) ?? 0) + 1);
+    outbound.get(connection.from.component)?.push(connection.to.component);
+  }
+  let count = 0;
+  while (remaining.size) {
+    const ready = [...remaining].filter((id) => (inbound.get(id) ?? 0) === 0);
+    if (!ready.length) return count;
+    count += 1;
+    for (const id of ready) {
+      remaining.delete(id);
+      for (const target of outbound.get(id) ?? []) inbound.set(target, (inbound.get(target) ?? 0) - 1);
+    }
+  }
+  return count;
+};
+
+const summarizePlan = (spec: HarnessSpec): HarnessPlanSummary => {
+  const componentIds = spec.components.map(({ id }) => id);
+  const timeoutMs = number(spec.runtime?.timeoutMs);
+  return {
+    nodeCount: spec.components.length,
+    edgeCount: spec.connections.length,
+    layerCount: layerCount(componentIds, spec.connections),
+    entrypoint: spec.entrypoint,
+    sourceVersion: spec.version,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  };
+};
 
 /** A stable, secret-free description of what one HarnessSpec can expose. */
 export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
@@ -115,6 +160,7 @@ export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
     graphCount: graphs.length,
     componentCount: components.length,
     connectionCount: graphs.reduce((total, graph) => total + graph.connections.length, 0),
+    plan: summarizePlan(spec),
     componentTypes: Object.fromEntries(Object.entries(componentTypes).sort(([left], [right]) => left.localeCompare(right))),
     providers,
     tools,
