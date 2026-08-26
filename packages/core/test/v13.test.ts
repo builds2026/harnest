@@ -26,6 +26,14 @@ describe("v1.3 Integration Contract", () => {
     const contract = describeHarness(spec);
     expect(contract.capabilities).toEqual(expect.arrayContaining(["conversation", "file-attachments", "code-sandbox", "artifacts", "evaluation"]));
     expect(contract.requiredConnections).toEqual(["gemini-main", "sandbox-main"]);
+    expect(contract.plan).toEqual({
+      nodeCount: 5,
+      edgeCount: 4,
+      layerCount: 3,
+      entrypoint: "output",
+      sourceVersion: "0.2",
+      timeoutMs: 30_000,
+    });
     expect(contract.output).toEqual({ component: "output", format: "json", schemaDeclared: true });
     expect(contract.policy).toEqual({ timeoutMs: 30_000, retryAttempts: 2, maxTokens: 8_000, maxCostUsd: 1 });
     expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http", "mcp"]);
