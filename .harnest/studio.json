@@ -1,0 +1,98 @@
+{
+  "positions": {
+    "plan": {
+      "x": 16,
+      "y": 128
+    },
+    "executeUntilDone": {
+      "x": 374.7027027027027,
+      "y": 166.43243243243245
+    },
+    "finalAnswer": {
+      "x": 720,
+      "y": 160
+    }
+  },
+  "subgraphs": {
+    "planner": {
+      "positions": {
+        "model": {
+          "x": 40,
+          "y": 40
+        },
+        "prompt": {
+          "x": 32,
+          "y": 224
+        },
+        "policy": {
+          "x": 40,
+          "y": 390
+        },
+        "plannerMemory": {
+          "x": 40,
+          "y": 540
+        },
+        "agent": {
+          "x": 390,
+          "y": 220
+        },
+        "output": {
+          "x": 740,
+          "y": 220
+        }
+      }
+    },
+    "engineeringLoop": {
+      "positions": {
+        "model": {
+          "x": 40,
+          "y": 40
+        },
+        "prompt": {
+          "x": 16,
+          "y": -192
+        },
+        "operatingPolicy": {
+          "x": 40,
+          "y": 410
+        },
+        "workingMemory": {
+          "x": 40,
+          "y": 590
+        },
+        "webSearch": {
+          "x": 360,
+          "y": 30
+        },
+        "webScrape": {
+          "x": 360,
+          "y": 170
+        },
+        "codeInterpreter": {
+          "x": 360,
+          "y": 310
+        },
+        "fileWorkspace": {
+          "x": 360,
+          "y": 450
+        },
+        "sandboxShell": {
+          "x": 360,
+          "y": 590
+        },
+        "webResearchSkill": {
+          "x": 360,
+          "y": 730
+        },
+        "agent": {
+          "x": 700,
+          "y": 235
+        },
+        "iterationState": {
+          "x": 1030,
+          "y": 240
+        }
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-import type { AdapterContext, ModelEvent, ModelRequest } from "@harnest/core";
+import type { AdapterContext, ModelEvent, ModelRequest } from "@harnestai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createAnthropicAdapter } from "../src/index.js";
@@ -11,6 +11,31 @@ async function collect(iterable: AsyncIterable<ModelEvent>): Promise<ModelEvent[
 
 describe("Anthropic adapter", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("maps image and PDF input to Messages content blocks", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":1}}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}',
+        "",
+      ].join("\n\n"));
+    }));
+    await collect(createAnthropicAdapter().run({
+      model: "claude-test",
+      messages: [{ role: "user", content: [
+        { type: "text", text: "Inspect" },
+        { type: "media", mimeType: "image/png", data: "aW1hZ2U=" },
+        { type: "media", mimeType: "application/pdf", data: "cGRm" },
+      ] }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+    expect(body).toMatchObject({ messages: [{ content: [
+      { type: "text", text: "Inspect" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+      { type: "document", source: { type: "base64", media_type: "application/pdf", data: "cGRm" } },
+    ] }] });
+  });
 
   it("maps Messages SSE and top-level system messages", async () => {
     let receivedInit: RequestInit | undefined;
@@ -90,6 +115,40 @@ describe("Anthropic adapter", () => {
         { role: "user", content: [{ type: "tool_result", tool_use_id: "old", content: "1" }] },
       ],
     });
+  });
+
+  it("places an explicit cache breakpoint and maps cache read/write usage", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10,"cache_read_input_tokens":30,"cache_creation_input_tokens":4}}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+        'event: message_stop\ndata: {"type":"message_stop"}',
+        "",
+      ].join("\n\n"));
+    }));
+    const events = await collect(createAnthropicAdapter().run({
+      model: "claude-test",
+      messages: [
+        { role: "system", content: "Stable system" },
+        { role: "user", content: "Stable document" },
+        { role: "user", content: "Question" },
+      ],
+      promptCache: { mode: "explicit", key: "b".repeat(64), prefixMessageCount: 2 },
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+
+    expect(body).toMatchObject({
+      system: [{ type: "text", text: "Stable system" }],
+      messages: [{ role: "user", content: [
+        { type: "text", text: "Stable document", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "Question" },
+      ] }],
+    });
+    expect(events).toEqual(expect.arrayContaining([
+      { type: "usage", usage: { inputTokens: 44, outputTokens: 2, totalTokens: 46, cachedInputTokens: 30, cacheWriteInputTokens: 4 } },
+      { type: "cache", status: "hit", mode: "explicit", cachedInputTokens: 30, cacheWriteInputTokens: 4 },
+    ]));
   });
 
   it("rejects oversized streamed Tool arguments", async () => {

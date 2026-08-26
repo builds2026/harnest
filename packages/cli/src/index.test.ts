@@ -7,25 +7,31 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { HarnestClient } from "@harnestai/sdk";
 import {
   AdapterRegistry,
   createBuiltinComponentRegistry,
   ToolRegistry,
   type HarnessSpec,
   type ServiceExecutionContext,
-} from "@harnest/core";
+} from "@harnestai/core";
 import {
   FileRunStore,
   loadRuntimeModules,
   NodeRuntimeServices,
   NodeToolStore,
-} from "@harnest/core/node";
+} from "@harnestai/core/node";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const cli = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const mcpDirectory = join(root, "examples", "mcp-tool-agent");
+const headlessCredentialEnvironment = (dataHome: string) => ({
+  ...process.env,
+  XDG_DATA_HOME: dataHome,
+  HARNEST_CREDENTIAL_KEY: Buffer.alloc(32, 17).toString("base64"),
+});
 let testRoot: string;
 
 const context = (nodeId = "node"): ServiceExecutionContext => ({
@@ -407,7 +413,7 @@ runtime:
       ok: false,
       diagnostics: [expect.objectContaining({ code: "RUNTIME_MODULE_UNTRUSTED" })],
     });
-  });
+  }, 15_000);
 
   it("rejects raw stdio MCP and keeps raw HTTP host-gated", async () => {
     const services = new NodeRuntimeServices(mcpDirectory, {
@@ -446,16 +452,20 @@ describe("harnest CLI", () => {
     const directory = join(testRoot, "initialized");
     const created = await exec(process.execPath, [cli, "init", directory], { cwd: root });
     expect(created.stdout).toContain("Created");
-    const initialized = await import("@harnest/core/node").then(({ loadSpecFile }) => loadSpecFile(join(directory, "harnest.yaml")));
+    const initialized = await import("@harnestai/core/node").then(({ loadSpecFile }) => loadSpecFile(join(directory, "harnest.yaml")));
     expect(initialized).toMatchObject({
       ok: true,
       spec: expect.objectContaining({ version: "0.2", entrypoint: "output" }),
     });
+    const openedAsProject = await import("@harnestai/core/node").then(({ loadSpecFile }) => loadSpecFile(directory));
+    expect(openedAsProject).toMatchObject({ ok: true, spec: expect.objectContaining({ version: "0.2" }) });
+    await expect(readFile(join(directory, ".harnest", "project.json"), "utf8")).resolves.toContain('"version": 1');
+    await expect(readFile(join(directory, ".harnest", "prompts", "main.md"), "utf8")).resolves.toContain("{{input}}");
     await expect(exec(process.execPath, [cli, "init", directory], { cwd: root })).rejects.toMatchObject({
       code: 1,
       stderr: expect.stringContaining("Refusing to replace existing"),
     });
-  });
+  }, 15_000);
 
   it("prints the secret-free Integration Contract as JSON", async () => {
     const directory = join(testRoot, "initialized");
@@ -465,16 +475,50 @@ describe("harnest CLI", () => {
     expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http", "mcp"]);
   });
 
+  it("lists and revokes persistent Tool permissions through the CLI", async () => {
+    const directory = join(testRoot, "permission-project");
+    await exec(process.execPath, [cli, "init", directory], { cwd: root });
+    const file = join(directory, "harnest.yaml");
+    const services = new NodeRuntimeServices(directory, {
+      harnessId: file,
+      requestToolApproval: () => ({ approved: true, source: "user", mode: "always" }),
+    });
+    await services.requestToolApproval({
+      runId: "permission-run",
+      nodeId: "agent",
+      callId: "permission-call",
+      turn: 1,
+      tool: {
+        id: "builtin.shell", label: "Shell", description: "Run", inputSchema: { type: "object" },
+        risk: "destructive", connectionId: "runtime-main",
+      },
+      input: {},
+    }, context("permission"));
+    await services.close();
+
+    const listed = await exec(process.execPath, [cli, "permissions", "list", directory, "--json"], { cwd: root });
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ toolId: "builtin.shell", connectionId: "runtime-main" }),
+    ]);
+    const revoked = await exec(process.execPath, [
+      cli, "permissions", "revoke", "builtin.shell", directory, "--connection", "runtime-main", "--json",
+    ], { cwd: root });
+    expect(JSON.parse(revoked.stdout)).toMatchObject({ ok: true, toolId: "builtin.shell" });
+    expect(JSON.parse((await exec(process.execPath, [cli, "permissions", "list", directory, "--json"], { cwd: root })).stdout)).toEqual([]);
+  }, 15_000);
+
   it("packages harnest.yaml and assets as a standard single-file bundle", async () => {
     const directory = join(testRoot, "bundled");
     await exec(process.execPath, [cli, "init", directory], { cwd: root });
     await mkdir(join(directory, "assets"));
     await writeFile(join(directory, "assets", "guide.txt"), "deployable asset", "utf8");
+    await writeFile(join(directory, ".env"), "GEMINI_API_KEY=do-not-package", "utf8");
+    await writeFile(join(directory, ".harnest", "tool-permissions.json"), '{"secret":"do-not-package"}', "utf8");
     const output = join(directory, "support-agent.harnest");
     const bundled = await exec(process.execPath, [
-      cli, "bundle", join(directory, "harnest.yaml"), "--output", output,
+      cli, "bundle", directory, "--output", output,
     ], { cwd: root });
-    expect(bundled.stdout).toContain("Bundled 2 files");
+    expect(bundled.stdout).toContain("Bundled 5 files");
     const archive = await readFile(output);
     const end = archive.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
     expect(end).toBeGreaterThan(0);
@@ -489,7 +533,14 @@ describe("harnest CLI", () => {
       names.push(archive.subarray(offset + 46, offset + 46 + nameLength).toString("utf8"));
       offset += 46 + nameLength + extraLength + commentLength;
     }
-    expect(names).toEqual(["harnest.yaml", "assets/guide.txt"]);
+    expect(names).toEqual([
+      "harnest.yaml",
+      "assets/guide.txt",
+      ".harnest/project.json",
+      ".harnest/prompts/main.md",
+      ".harnest/studio.json",
+    ]);
+    expect(archive.toString("utf8")).not.toContain("do-not-package");
     await expect(exec(process.execPath, [
       cli, "bundle", join(directory, "harnest.yaml"), "--output", output,
     ], { cwd: root })).rejects.toMatchObject({
@@ -566,6 +617,7 @@ describe("harnest CLI", () => {
   it("creates, tests, lists, and deletes a saved Connection", async () => {
     const directory = await project("cli-connections");
     const file = join(directory, "harnest.yaml");
+    const environment = headlessCredentialEnvironment(join(directory, "xdg"));
     const server = createServer((_request, response) => response.writeHead(204).end());
     await new Promise<void>((resolvePromise, reject) => {
       server.once("error", reject);
@@ -575,15 +627,21 @@ describe("harnest CLI", () => {
       const port = (server.address() as AddressInfo).port;
       const connected = await exec(process.execPath, [
         cli, "connect", "http", file, "--id", "fixture-http", "--url", `http://127.0.0.1:${port}`,
-      ], { cwd: root });
+      ], { cwd: root, env: environment });
       expect(connected.stdout).toContain("fixture-http\tconnected");
-      const listed = await exec(process.execPath, [cli, "connections", file, "--json"], { cwd: root });
+      const listed = await exec(process.execPath, [cli, "connections", file, "--json"], {
+        cwd: root,
+        env: environment,
+      });
       expect(JSON.parse(listed.stdout)).toContainEqual(expect.objectContaining({
         id: "fixture-http",
         kind: "http-api",
         status: expect.objectContaining({ state: "connected" }),
       }));
-      const removed = await exec(process.execPath, [cli, "connection", "delete", "fixture-http", file], { cwd: root });
+      const removed = await exec(process.execPath, [cli, "connection", "delete", "fixture-http", file], {
+        cwd: root,
+        env: environment,
+      });
       expect(removed.stdout).toContain("Deleted fixture-http");
     } finally {
       await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
@@ -611,6 +669,190 @@ entrypoint: output
       stderr: expect.stringContaining("CONNECTION_NOT_FOUND"),
     });
   });
+
+  it("serves reconnectable v1 SSE/commands and all canonical HTTP permission decisions", async () => {
+    const directory = await cliToolProject("http-approvals", "external");
+    const reservation = createServer();
+    await new Promise<void>((resolveListen) => reservation.listen(0, "127.0.0.1", resolveListen));
+    const port = (reservation.address() as AddressInfo).port;
+    await new Promise<void>((resolveClose) => reservation.close(() => resolveClose()));
+    let output = "";
+    const startApi = () => {
+      output = "";
+      const child = spawn(process.execPath, [cli, "serve", directory, "--port", String(port), "--allow-modules"], {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { output += chunk; });
+      child.stderr.on("data", (chunk: string) => { output += chunk; });
+      return child;
+    };
+    let api = startApi();
+    const stopApi = async () => {
+      if (api.exitCode !== null || api.signalCode !== null) return;
+      const exited = new Promise<void>((resolveExit) => api.once("exit", () => resolveExit()));
+      api.kill("SIGTERM");
+      await exited;
+    };
+    const waitUntilReady = async () => {
+      for (let attempt = 0; attempt < 200 && !output.includes("Harnest API ready"); attempt += 1) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      expect(output).toContain("Harnest API ready");
+    };
+    const base = `http://127.0.0.1:${port}`;
+    const waitForApproval = async () => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = await fetch(`${base}/approvals`);
+        if (response.ok) {
+          const body = await response.json() as { approvals: Array<Record<string, unknown>> };
+          if (body.approvals[0]) return body.approvals[0];
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      throw new Error(`Approval did not appear: ${output}`);
+    };
+    const invoke = () => fetch(`${base}/invoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ input: "Find Seoul" }),
+    });
+    const decide = async (
+      approval: Record<string, unknown>,
+      decision: "deny" | "allow_once" | "allow_for_run" | "allow_always" | "once" | "always",
+    ) => {
+      const response = await fetch(`${base}/approvals`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...approval, decision, input: undefined, expiresAt: undefined, toolId: undefined, risk: undefined }),
+      });
+      expect(response.status).toBe(200);
+    };
+    const resolveInvoke = async (
+      run: Promise<Response>,
+      decision: "deny" | "allow_once" | "allow_for_run" | "allow_always" | "once" | "always",
+    ): Promise<Response> => {
+      const completed = run.then((response) => ({ response }));
+      while (true) {
+        const next = await Promise.race([completed, waitForApproval().then((approval) => ({ approval }))]);
+        if ("response" in next) return next.response;
+        await decide(next.approval, decision);
+      }
+    };
+    try {
+      await waitUntilReady();
+
+      await expect(fetch(`${base}/v1/capabilities`).then((response) => response.json())).resolves.toMatchObject({
+        protocolVersion: "1.0",
+        events: { transport: "sse", reconnect: ["after", "Last-Event-ID"] },
+      });
+
+      const client = new HarnestClient(base);
+      const createOptions = { idempotencyKey: "retry/client:crash-window", context: {
+        contextRef: "ctx_must_never_leak",
+        revisions: { conversation: "r2", memory: 3, pkm: "r4" },
+        attachments: [],
+      } };
+      const created = await client.create("Find Seoul", createOptions);
+      await expect(client.create("Find Seoul", createOptions)).resolves.toMatchObject({ runId: created.runId });
+      const controller = new AbortController();
+      let requested: { readonly protocolVersion: string; readonly type: string; readonly sequence: number; readonly data: unknown } | undefined;
+      try {
+        for await (const envelope of client.events(created.runId, { signal: controller.signal })) {
+          if (envelope.type === "interaction.requested") { requested = envelope; break; }
+        }
+      } finally {
+        controller.abort();
+      }
+      expect(requested, output).toMatchObject({ protocolVersion: "1.0", type: "interaction.requested" });
+      const interaction = requested?.data as { id?: string; checkpoint?: { digest?: string } };
+      const pausedState = await client.snapshotState(created.runId);
+      const pausedSnapshot = pausedState.snapshot;
+      expect(pausedState.active).toBe(true);
+      expect(pausedSnapshot).toMatchObject({ status: "paused" });
+      expect(JSON.stringify(pausedSnapshot)).not.toContain("ctx_must_never_leak");
+      const activePausedReplay = await fetch(`${base}/v1/runs/${created.runId}/events?after=${requested!.sequence}`, {
+        signal: AbortSignal.timeout(3_000),
+      }).then((response) => response.text());
+      expect(activePausedReplay).toContain("event: run.paused\n");
+      await stopApi();
+      api = startApi();
+      await waitUntilReady();
+      const recoveredClient = new HarnestClient(base);
+      await expect(recoveredClient.create("Find Seoul", createOptions)).resolves.toMatchObject({ runId: created.runId });
+      const recoveredState = await recoveredClient.snapshotState(created.runId);
+      const recoveredSnapshot = recoveredState.snapshot;
+      expect(recoveredState.active).toBe(false);
+      expect(recoveredSnapshot).toMatchObject({ status: "paused" });
+      expect(JSON.stringify(recoveredSnapshot)).not.toContain("ctx_must_never_leak");
+      const pausedReplay = await fetch(`${base}/v1/runs/${created.runId}/events?after=${Number(recoveredSnapshot.sequence)}`, {
+        signal: AbortSignal.timeout(3_000),
+      }).then((response) => response.text());
+      expect(pausedReplay).toBe(": connected\n\n");
+      await expect(recoveredClient.respond(created.runId, {
+        interactionId: interaction.id!,
+        checkpointDigest: interaction.checkpoint!.digest!,
+        action: "submit",
+        permission: "allow_once",
+      })).rejects.toMatchObject({ status: 409, code: "RUN_RECOVERY_REQUIRED" });
+      await expect(recoveredClient.create("Find Seoul", {
+        resumeRunId: created.runId,
+        context: createOptions.context,
+        idempotencyKey: "resume/client:crash-window",
+      })).resolves.toMatchObject({ runId: created.runId });
+      await recoveredClient.respond(created.runId, {
+        interactionId: interaction.id!,
+        checkpointDigest: interaction.checkpoint!.digest!,
+        action: "submit",
+        permission: "allow_once",
+      });
+      await expect(recoveredClient.wait(created.runId, {
+        lastEventId: String(requested!.sequence),
+      })).resolves.toMatchObject({ type: "run-end", output: expect.stringContaining("South Korea") });
+      const replay = await fetch(`${base}/v1/runs/${created.runId}/events?after=${requested!.sequence}`)
+        .then((response) => response.text())
+        .catch((cause) => { throw new Error(`Replay request failed: ${output}`, { cause }); });
+      expect(replay).toMatch(/^: connected\n\nid: \d+\nevent: [a-z.]+\ndata: /u);
+      expect(replay).toContain("event: interaction.resolved\n");
+      expect(replay).toContain("event: run.completed\n");
+      expect(replay).not.toContain("event: interaction.requested\n");
+      expect(replay).not.toContain("ctx_must_never_leak");
+
+      const deniedRun = invoke();
+      const denied = await resolveInvoke(deniedRun, "deny");
+      expect(denied.status).toBe(200);
+      expect(JSON.stringify(await denied.json())).toContain("Denied by the API operator");
+
+      const onceRun = invoke();
+      expect(JSON.stringify(await (await resolveInvoke(onceRun, "allow_once")).json())).toContain("South Korea");
+      await expect(fetch(`${base}/permissions`).then((response) => response.json()))
+        .resolves.toMatchObject({ permissions: [] });
+
+      const runAllowed = invoke();
+      expect(JSON.stringify(await (await resolveInvoke(runAllowed, "allow_for_run")).json())).toContain("South Korea");
+      await expect(fetch(`${base}/permissions`).then((response) => response.json()))
+        .resolves.toMatchObject({ permissions: [] });
+
+      const legacyOnce = invoke();
+      expect(JSON.stringify(await (await resolveInvoke(legacyOnce, "once")).json())).toContain("South Korea");
+
+      const alwaysRun = invoke();
+      expect(JSON.stringify(await (await resolveInvoke(alwaysRun, "allow_always")).json())).toContain("South Korea");
+      await expect(fetch(`${base}/permissions`).then((response) => response.json())).resolves.toMatchObject({
+        permissions: expect.arrayContaining([expect.objectContaining({ toolId: "custom.city" })]),
+      });
+
+      const alreadyAllowed = await Promise.race([
+        invoke(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Persisted permission did not bypass approval")), 5_000)),
+      ]);
+      expect(JSON.stringify(await alreadyAllowed.json())).toContain("South Korea");
+    } finally {
+      await stopApi();
+    }
+  }, 40_000);
 
   it("validates, runs, lists, and reads a persisted trace", async () => {
     const directory = await project("cli");

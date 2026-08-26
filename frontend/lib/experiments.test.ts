@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { HarnessSpec } from "@harnest/core";
+import type { HarnessSpec } from "@harnestai/core";
 import { applyExperimentVariant, experimentQuality, parseExperimentValue } from "./experiments";
 
 describe("experiment variants", () => {

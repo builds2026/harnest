@@ -9,6 +9,7 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
+    { "path": "../protocol" },
     { "path": "../core" },
     { "path": "../adapter-openai" },
     { "path": "../adapter-anthropic" },

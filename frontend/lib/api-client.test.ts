@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiErrorMessage, ClientApiError, requestJson } from "./api-client";
+import { classifyApiError } from "./api";
 import { translate } from "../i18n/core";
 
 describe("requestJson", () => {
@@ -26,5 +27,11 @@ describe("requestJson", () => {
   it("presents classified client failures in the active locale", () => {
     const error = new ClientApiError({ code: "REQUEST_TIMEOUT", message: "The request timed out.", category: "timeout", recoverable: true, action: "retry" });
     expect(apiErrorMessage(error, "fallback", (key, values) => translate("ko-KR", key, values))).toBe("서비스 응답 시간이 초과되었습니다. 다시 시도하세요.");
+  });
+
+  it("does not present a credential vault backend failure as an expired API key", () => {
+    expect(classifyApiError("CREDENTIAL_BACKEND_UNAVAILABLE", 503)).toEqual({
+      category: "server", recoverable: true, action: "open-settings",
+    });
   });
 });

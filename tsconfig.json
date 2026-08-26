@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/protocol" },
     { "path": "./packages/core" },
     { "path": "./packages/adapter-openai" },
     { "path": "./packages/adapter-anthropic" },

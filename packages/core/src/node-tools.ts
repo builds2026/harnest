@@ -14,7 +14,7 @@ import { isAbsolute, dirname, relative, resolve, sep } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { parseDocument } from "yaml";
 import { inspectSafeRegex } from "./safe-regex.js";
-import { atomicWriteVerifiedFile, readVerifiedFile } from "./safe-files.js";
+import { atomicWriteVerifiedFile, isSensitiveWorkspacePath, readVerifiedFile } from "./safe-files.js";
 import type {
   ToolDefinition,
   ToolExecutionContext,
@@ -149,6 +149,8 @@ export interface ProcessCapabilityRequest {
 
 export interface ProcessExecutionRequest extends BoundedProcessOptions {
   readonly connectionId?: string;
+  /** Stable runtime run id used by hosts to isolate a per-run workspace. */
+  readonly runId?: string;
 }
 
 export interface FileCapabilityRequest {
@@ -1735,7 +1737,7 @@ export class NodeToolStore {
       cwd,
       stdin,
       this.#timeout(manifest.timeoutMs),
-      context.signal,
+      context,
       options,
     );
     if (manifest.output === "text") return result.stdout;
@@ -1877,7 +1879,7 @@ export class NodeToolStore {
         root,
         typeof input.stdin === "string" ? input.stdin : "",
         this.#timeout(),
-        context.signal,
+        context,
         options,
       );
     } else {
@@ -1889,7 +1891,7 @@ export class NodeToolStore {
         throw new ToolStoreError("TOOL_CAPABILITY_REQUIRED", `Code runner '${runtime}' is not configured`, id);
       }
       const root = await this.#root;
-      output = await this.#runProcess(id, command, ["-"], root, input.code as string, this.#timeout(), context.signal, options);
+      output = await this.#runProcess(id, command, ["-"], root, input.code as string, this.#timeout(), context, options);
     }
     this.#validateOutput(manifest, output);
     return output;
@@ -1948,6 +1950,9 @@ export class NodeToolStore {
     if (!isInside(root, lexical)) throw new ToolStoreError(
       "TOOL_CAPABILITY_DENIED", `Project path '${configured}' is outside the project`,
     );
+    if (isSensitiveWorkspacePath(root, lexical)) throw new ToolStoreError(
+      "TOOL_CAPABILITY_DENIED", `Project path '${configured}' is a protected secret or runtime path`, "builtin.file",
+    );
     const parent = await realpath(dirname(lexical));
     if (!isInside(root, parent)) throw new ToolStoreError(
       "TOOL_CAPABILITY_DENIED", `Project path '${configured}' has an unsafe parent`,
@@ -1996,7 +2001,7 @@ export class NodeToolStore {
     cwd: string,
     stdin: string,
     timeoutMs: number,
-    parentSignal: AbortSignal,
+    context: ToolExecutionContext,
     options: ToolExecuteOptions,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     if (Buffer.byteLength(stdin, "utf8") > this.#maxInput()) {
@@ -2024,7 +2029,8 @@ export class NodeToolStore {
       timeoutMs,
       maxInputBytes: this.#maxInput(),
       maxOutputBytes: this.#maxOutput(),
-      signal: parentSignal,
+      signal: context.signal,
+      runId: context.runId,
       ...(this.#options.processEnvironment ? { environment: this.#options.processEnvironment } : {}),
       ...(options.connectionId === undefined ? {} : { connectionId: options.connectionId }),
     };

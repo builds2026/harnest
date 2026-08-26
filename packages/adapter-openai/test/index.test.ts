@@ -1,4 +1,4 @@
-import type { AdapterContext, ModelEvent, ModelRequest } from "@harnest/core";
+import type { AdapterContext, ModelEvent, ModelRequest } from "@harnestai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOpenAICompatibleAdapter } from "../src/index.js";
@@ -18,6 +18,25 @@ async function collect(iterable: AsyncIterable<ModelEvent>): Promise<ModelEvent[
 
 describe("OpenAI-compatible adapter", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("maps image input to a bounded data URL content part", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    }));
+    await collect(createOpenAICompatibleAdapter().run({
+      model: "gpt-test",
+      messages: [{ role: "user", content: [
+        { type: "text", text: "Describe" },
+        { type: "media", mimeType: "image/png", data: "aW1hZ2U=" },
+      ] }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+    expect(body).toMatchObject({ messages: [{ content: [
+      { type: "text", text: "Describe" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } },
+    ] }] });
+  });
 
   it("maps chat completion SSE, usage, request settings, and cancellation", async () => {
     const controller = new AbortController();
@@ -93,6 +112,37 @@ describe("OpenAI-compatible adapter", () => {
       adapterId: "openai",
       code: "invalid_stream",
     });
+  });
+
+  it("uses official prompt cache keys but never sends extensions to custom compatible endpoints", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response([
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":2,"total_tokens":22,"prompt_tokens_details":{"cached_tokens":16}}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+    }));
+    const cachedRequest: ModelRequest = {
+      ...request,
+      promptCache: { mode: "automatic", key: "c".repeat(64), prefixMessageCount: 1 },
+    };
+    const context: AdapterContext = { signal: new AbortController().signal, resolveSecret: () => "secret" };
+    const official = await collect(createOpenAICompatibleAdapter().run(cachedRequest, context));
+    const custom = await collect(createOpenAICompatibleAdapter().run({
+      ...cachedRequest,
+      baseUrl: "https://compatible.example/v1",
+    }, context));
+
+    expect(bodies[0]).toMatchObject({ prompt_cache_key: "c".repeat(64) });
+    expect(bodies[1]).not.toHaveProperty("prompt_cache_key");
+    expect(official).toEqual(expect.arrayContaining([
+      { type: "usage", usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22, cachedInputTokens: 16 } },
+      { type: "cache", status: "hit", mode: "automatic", cachedInputTokens: 16 },
+    ]));
+    expect(custom[0]).toMatchObject({ type: "cache", status: "bypass", mode: "automatic" });
   });
 
   it("normalizes streamed Tool calls and encodes Tool results", async () => {

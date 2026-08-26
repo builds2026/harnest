@@ -377,6 +377,75 @@ describe("v1.1 subgraphs, loops, retry, and budgets", () => {
     expect(result.trace.filter((event) => event.type === "iteration" && event.phase === "end")).toHaveLength(3);
   });
 
+  it("preserves structured Loop state while merging each iteration result", async () => {
+    const advance = definition("test.structured-step", (_component, _inputs, context) => ({
+      outputs: { value: {
+        originalRequest: "overwrite attempt",
+        plan: [],
+        status: context.iteration >= 2 ? "complete" : "continue",
+        currentResult: `iteration-${context.iteration}`,
+        validation: { passed: context.iteration >= 2, summary: "checked" },
+        remainingWork: context.iteration >= 2 ? [] : ["verify"],
+        finalAnswer: context.iteration >= 2 ? "done" : "",
+      } },
+    }), { retrySafe: true });
+    const graph = spec(
+      [
+        { id: "loop", type: "loop", config: {
+          subgraph: "step",
+          maxIterations: 3,
+          carry: "merge",
+          checkpoint: "structured",
+          until: { path: "/status", op: "equals", value: "complete" },
+        } },
+        { id: "out", type: "output", config: {} },
+      ],
+      [{ from: { component: "loop", port: "value" }, to: { component: "out", port: "value" } }],
+      "out",
+      { subgraphs: { step: { components: [{ id: "step", type: "test.structured-step", config: {} }], connections: [], entrypoint: "step" } } },
+    );
+    const result = await new HarnessRuntime(graph, new AdapterRegistry(), { components: registryWith(advance) }).invoke({
+      originalRequest: "keep me",
+      plan: ["inspect", "verify"],
+      status: "continue",
+    });
+    expect(result.output).toEqual({
+      originalRequest: "keep me",
+      plan: ["inspect", "verify"],
+      status: "complete",
+      currentResult: "iteration-2",
+      validation: { passed: true, summary: "checked" },
+      remainingWork: [],
+      finalAnswer: "done",
+    });
+  });
+
+  it("rejects a structured Loop that claims completion without verified final state", async () => {
+    const incomplete = definition("test.invalid-completion", () => ({
+      outputs: { value: {
+        status: "complete",
+        validation: { passed: false, summary: "not checked" },
+        remainingWork: ["verify"],
+        finalAnswer: "",
+      } },
+    }), { retrySafe: true });
+    const graph = spec(
+      [
+        { id: "loop", type: "loop", config: {
+          subgraph: "step", maxIterations: 1, carry: "merge", checkpoint: "structured",
+          until: { path: "/status", op: "equals", value: "complete" },
+        } },
+        { id: "out", type: "output", config: {} },
+      ],
+      [{ from: { component: "loop", port: "value" }, to: { component: "out", port: "value" } }],
+      "out",
+      { subgraphs: { step: { components: [{ id: "step", type: "test.invalid-completion", config: {} }], connections: [], entrypoint: "step" } } },
+    );
+    await expect(new HarnessRuntime(graph, new AdapterRegistry(), { components: registryWith(incomplete) }).invoke({
+      originalRequest: "keep me", plan: ["verify"], status: "continue",
+    })).rejects.toMatchObject({ code: "LOOP_COMPLETION_INVALID" });
+  });
+
   it("can rerun from a connected Evaluator result", async () => {
     const components = registryWith(increment);
     const graph = spec(

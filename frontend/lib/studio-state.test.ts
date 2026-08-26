@@ -1,4 +1,4 @@
-import { BUILTIN_COMPONENT_MANIFESTS, stringifySpec, type HarnessSpec } from "@harnest/core";
+import { BUILTIN_COMPONENT_MANIFESTS, stringifySpec, type HarnessSpec } from "@harnestai/core";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -71,7 +71,10 @@ describe("Studio document state", () => {
     const advanced: HarnessSpec = {
       version: "0.2",
       components: [
-        { id: "source", type: "prompt", config: { template: "{{input}}" } },
+        { id: "source", type: "prompt", config: { template: "{{input}}" }, policy: {
+          timeoutMs: 4_000,
+          retry: { maxAttempts: 3, backoffMs: 50, maxBackoffMs: 500 },
+        } },
         { id: "sink", type: "output", config: { format: "text" } },
       ],
       connections: [{
@@ -83,6 +86,13 @@ describe("Studio document state", () => {
         state: { key: "latest.answer", merge: "replace" },
       }],
       entrypoint: "sink",
+      runtime: {
+        timeoutMs: 120_000,
+        adapters: ["@example/adapter"],
+        modules: ["@example/components"],
+        retry: { maxAttempts: 2, backoffMs: 100, maxBackoffMs: 1_000 },
+        budget: { maxTokens: 250_000, maxCostUsd: 2.5 },
+      },
       subgraphs: {
         revise: {
           components: [
@@ -177,5 +187,31 @@ describe("Studio document state", () => {
     const staleResponse = studioDocumentReducer(second, { type: "save-result", revision: first.revision });
     expect(staleResponse.savedRevision).toBe(0);
     expect(studioDocumentReducer(staleResponse, { type: "save-result", revision: second.revision }).savedRevision).toBe(second.revision);
+  });
+
+  it("keeps canvas selection and edit history when the catalog finishes loading", () => {
+    const initial = createDocumentState(spec, []);
+    const selectedDraft = structuredClone(initial.draft);
+    selectedDraft.nodes[1]!.selected = true;
+    selectedDraft.nodes[1]!.data.component.config = { template: "Editing {{input}}" };
+    const editing = studioDocumentReducer(initial, {
+      type: "replace-draft",
+      draft: selectedDraft,
+      touch: "semantic",
+    });
+
+    const loaded = studioDocumentReducer(editing, {
+      type: "set-catalog",
+      catalog: BUILTIN_COMPONENT_MANIFESTS,
+    });
+
+    expect(loaded.draft.nodes[1]).toMatchObject({
+      selected: true,
+      data: {
+        component: { config: { template: "Editing {{input}}" } },
+        manifest: { type: "prompt" },
+      },
+    });
+    expect(studioDocumentReducer(loaded, { type: "undo" }).draft.nodes[1]!.data.manifest.type).toBe("prompt");
   });
 });

@@ -175,6 +175,12 @@ export interface InstallSkillOptions {
   readonly approval?: SkillInstallApproval;
 }
 
+export interface CreateSkillOptions {
+  readonly scope?: SkillScope;
+  readonly namespace?: SkillNamespace;
+  readonly source?: "editor" | "upload";
+}
+
 export interface LoadSkillResourceOptions {
   readonly encoding?: "utf8" | "bytes";
 }
@@ -845,6 +851,76 @@ export class NodeSkillStore {
     approvals.push({ skill: name, path, sha256: review.sha256, approvedAt: new Date().toISOString() });
     await this.#writeScriptApprovals(approvals);
     return { ...review, approved: true };
+  }
+
+  async create(document: string, options: CreateSkillOptions = {}): Promise<SkillCatalogEntry> {
+    const scope = options.scope ?? "project";
+    const namespace = options.namespace ?? "harnest";
+    if ((scope !== "project" && scope !== "user") || (namespace !== "agents" && namespace !== "harnest")) {
+      throw new SkillStoreError("SKILL_INSTALL_INVALID", "Skill scope or namespace is invalid");
+    }
+    const content = Buffer.from(document, "utf8");
+    const maximum = boundedInteger(this.#options.maxSkillBytes, 524_288, 4_194_304);
+    if (content.byteLength === 0 || content.byteLength > maximum || content.includes(0)) {
+      throw new SkillStoreError("SKILL_READ_LIMIT", `Skill document must contain 1–${maximum} UTF-8 bytes`);
+    }
+    const parsed = parseSkillDocument(document);
+    if (!SKILL_NAME_PATTERN.test(parsed.descriptor.name)) {
+      throw new SkillStoreError("SKILL_INSTALL_INVALID", "Skill name is invalid");
+    }
+    const base = scope === "project" ? await this.#projectRoot : await this.#userRoot;
+    const installRoot = await containedDirectory(base, resolve(base, `.${namespace}`, "skills"));
+    const destination = resolve(installRoot, parsed.descriptor.name);
+    if (!isInside(installRoot, destination)) throw new SkillStoreError(
+      "SKILL_INSTALL_INVALID", "Skill destination is invalid",
+    );
+    try {
+      await lstat(destination);
+      throw new SkillStoreError(
+        "SKILL_INSTALL_EXISTS",
+        `Skill '${parsed.descriptor.name}' already exists in ${scope}/.${namespace}`,
+        { skill: parsed.descriptor.name },
+      );
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    const temporary = resolve(installRoot, `.${parsed.descriptor.name}.${randomUUID()}.tmp`);
+    try {
+      await mkdir(temporary, { mode: 0o700 });
+      await writeFile(join(temporary, "SKILL.md"), content, { mode: 0o600, flag: "wx" });
+      const contentHash = await skillTreeHash(temporary, {
+        maxFiles: 2,
+        maxTotalBytes: maximum,
+        maxPerFile: maximum,
+        maxDepth: 1,
+      });
+      const provenance: LocalSkillProvenance = {
+        kind: "local",
+        source: `harnest-studio:${options.source ?? "editor"}`,
+        installedAt: new Date().toISOString(),
+        contentHash,
+      };
+      await writeFile(join(temporary, PROVENANCE_FILE), `${JSON.stringify(provenance, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await rename(temporary, destination);
+      return {
+        name: parsed.descriptor.name,
+        description: parsed.descriptor.description,
+        descriptor: parsed.descriptor,
+        scope,
+        namespace,
+        directory: destination,
+        scriptsPresent: false,
+        scriptTrust: "not-required",
+        provenance,
+        provenanceVerified: true,
+      };
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
   }
 
   async install(source: SkillInstallSource, options: InstallSkillOptions): Promise<SkillCatalogEntry> {

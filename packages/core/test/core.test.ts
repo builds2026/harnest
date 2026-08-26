@@ -7,6 +7,7 @@ import {
   AdapterRegistry,
   DiagnosticError,
   HarnessRuntime,
+  BUILTIN_COMPONENT_MANIFESTS,
   compileSpec,
   parseNdjson,
   parseSpec,
@@ -74,6 +75,14 @@ function fakeAdapter(events: ModelEvent[], called = { count: 0 }): ModelAdapter 
 }
 
 describe("HarnessSpec", () => {
+  it("exposes every built-in config property through Inspector metadata", () => {
+    for (const manifest of BUILTIN_COMPONENT_MANIFESTS) {
+      const properties = (manifest.configSchema.properties ?? {}) as Record<string, unknown>;
+      const inspectorPaths = new Set(manifest.inspector.map(({ path }) => path.split(".")[0]));
+      expect([...Object.keys(properties).filter((path) => !inspectorPaths.has(path))], manifest.type).toEqual([]);
+    }
+  });
+
   it("round-trips YAML and rejects duplicate keys", () => {
     const parsed = parseSpec(stringifySpec(validSpec()));
     expect(parsed.ok).toBe(true);
@@ -131,6 +140,13 @@ describe("HarnessSpec", () => {
     model.config.apiKey = undefined;
     expect(validateSpec(spec, { registry: credentials, env: {} }).diagnostics.map(({ code }) => code))
       .toContain("ENV_MISSING");
+    const connected = validSpec();
+    connected.version = "0.2";
+    const connectedModel = connected.components[0];
+    if (connectedModel?.type !== "model") throw new Error("fixture");
+    connectedModel.config.connectionId = "saved-provider";
+    expect(validateSpec(connected, { registry: credentials, env: {} }).diagnostics.map(({ code }) => code))
+      .not.toContain("ENV_MISSING");
     output.config.schema = { $schema: "https://example.invalid/schema" };
     expect(validateSpec(spec).diagnostics.map(({ code }) => code)).toContain("OUTPUT_SCHEMA_DEFINITION_INVALID");
   });
@@ -155,8 +171,8 @@ describe("adapters and runtime", () => {
   it("streams, accumulates usage, validates JSON and records a trace", async () => {
     const called = { count: 0 };
     const registry = new AdapterRegistry().register(fakeAdapter([
-      { type: "text-delta", text: '{"answer":' },
-      { type: "text-delta", text: '"ok"}' },
+      { type: "text-delta", text: '```json\n{"answer":' },
+      { type: "text-delta", text: '"ok"}\n```' },
       { type: "usage", usage: { inputTokens: 3, outputTokens: 2 } },
       { type: "finish", reason: "stop", model: "test-model" },
     ], called));
@@ -166,6 +182,34 @@ describe("adapters and runtime", () => {
     expect(result.trace.some((event) => event.type === "text-delta")).toBe(true);
     expect(result.runId).toMatch(/^[0-9a-f-]{36}$/);
     expect(called.count).toBe(1);
+  });
+
+  it("publishes bounded artifact references before the final result", async () => {
+    const artifact = {
+      id: `artifact_${"a".repeat(24)}`,
+      name: "chart.png",
+      mimeType: "image/png",
+      size: 128,
+      sha256: "b".repeat(64),
+      ref: `harnest-artifact:run/${`artifact_${"a".repeat(24)}`}`,
+      preview: "image" as const,
+      status: "ready" as const,
+    };
+    const runtime = new HarnessRuntime(validSpec(), new AdapterRegistry().register(fakeAdapter([
+      { type: "text-delta", text: '{"answer":"done"}' },
+      { type: "finish", reason: "stop" },
+    ])), { services: { listArtifacts: () => [artifact] } });
+    const result = await runtime.invoke("make a chart");
+    expect(result.artifacts).toEqual([artifact]);
+    const created = result.trace.findIndex((event) => event.type === "artifact-created");
+    const ended = result.trace.findIndex((event) => event.type === "run-end");
+    expect(created).toBeGreaterThan(0);
+    expect(created).toBeLessThan(ended);
+    expect(result.trace[created]).toMatchObject({ type: "artifact-created", artifact });
+    expect(result.trace.slice(-2)).toEqual([
+      expect.objectContaining({ type: "artifact", artifact }),
+      expect.objectContaining({ type: "run-end", artifacts: [artifact] }),
+    ]);
   });
 
   it("rejects an invalid spec before calling an adapter", () => {

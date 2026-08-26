@@ -1,4 +1,4 @@
-import { parseSpec, validateSpec } from "@harnest/core";
+import { parseSpec, validateSpec } from "@harnestai/core";
 import { apiErrorResponse, assertSameOrigin, readJsonBody } from "../../../lib/api-server";
 import { diagnosticResponse, hasErrors, requestDiagnostic, runtimeResourcesFor } from "../../../lib/server";
 

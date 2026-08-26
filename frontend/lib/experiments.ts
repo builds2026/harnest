@@ -1,4 +1,4 @@
-import type { HarnessSpec, RunEvent } from "@harnest/core";
+import type { HarnessSpec, RunEvent } from "@harnestai/core";
 
 export interface ExperimentVariant {
   readonly id: string;

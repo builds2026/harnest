@@ -1,6 +1,6 @@
 {
-  "name": "@harnest/sdk",
-  "version": "0.1.0",
+  "name": "@harnestai/sdk",
+  "version": "0.2.0-beta.1",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -9,15 +9,40 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
     }
   },
-  "files": ["dist"],
-  "scripts": { "build": "tsc -b" },
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "dist/node.js",
+    "dist/node.js.map",
+    "dist/node.d.ts",
+    "dist/node.d.ts.map"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
   "dependencies": {
-    "@harnest/adapter-anthropic": "0.1.0",
-    "@harnest/adapter-gemini": "0.1.0",
-    "@harnest/adapter-local": "0.1.0",
-    "@harnest/adapter-openai": "0.1.0",
-    "@harnest/core": "0.1.0"
+    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
+    "@harnestai/adapter-gemini": "0.2.0-beta.1",
+    "@harnestai/adapter-local": "0.2.0-beta.1",
+    "@harnestai/adapter-openai": "0.2.0-beta.1",
+    "@harnestai/core": "0.2.0-beta.1",
+    "@harnestai/protocol": "0.2.0-beta.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/builds2026/harnest.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

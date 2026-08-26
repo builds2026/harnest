@@ -7,7 +7,7 @@ import {
   DEFAULT_SANDBOX_IMAGES,
   FIRECRAWL_CONNECTION_CONFIG,
   SEARXNG_CONNECTION_CONFIG,
-} from "@harnest/core";
+} from "@harnestai/core/browser";
 import {
   connectionCanRun,
   connectionOperationForAction,
@@ -107,6 +107,11 @@ function ConnectionForm({
   useEffect(() => firstField.current?.focus(), []);
 
   const update = (key: string, value: unknown) => setConfig((current) => ({ ...current, [key]: value }));
+  const updateOptionalNumber = (key: string, value: string) => setConfig((current) => {
+    const next = { ...current };
+    if (value === "") delete next[key]; else next[key] = Number(value);
+    return next;
+  });
   const builtinAdapter = ["gemini", "openai", "anthropic", "ollama"].includes(String(config.adapter ?? ""));
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -144,6 +149,15 @@ function ConnectionForm({
             else delete next.baseUrl;
             return next;
           })} /><span className="field-help">{t("connections.form.endpointHelp")}</span></div>
+          <details className="advanced-panel"><summary>{t("connections.form.cacheAdvanced")}</summary><div className="field-grid">
+            <div className="field"><label htmlFor="connection-context-window">{t("connections.form.contextWindow")}</label><input id="connection-context-window" type="number" min={1} value={typeof config.contextWindowTokens === "number" ? config.contextWindowTokens : ""} onChange={(event) => updateOptionalNumber("contextWindowTokens", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-cache-dialect">{t("connections.form.cacheDialect")}</label><select id="connection-cache-dialect" value={String(config.cacheDialect ?? "auto")} onChange={(event) => update("cacheDialect", event.target.value)}><option value="auto">{t("connections.form.cacheAuto")}</option><option value="native">{t("connections.form.cacheNative")}</option><option value="none">{t("connections.form.cacheNone")}</option></select></div>
+            <div className="field"><label htmlFor="connection-input-price">{t("field.inputCostPerMillion")}</label><input id="connection-input-price" type="number" min={0} step="any" value={typeof config.inputCostPerMillion === "number" ? config.inputCostPerMillion : ""} onChange={(event) => updateOptionalNumber("inputCostPerMillion", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-output-price">{t("field.outputCostPerMillion")}</label><input id="connection-output-price" type="number" min={0} step="any" value={typeof config.outputCostPerMillion === "number" ? config.outputCostPerMillion : ""} onChange={(event) => updateOptionalNumber("outputCostPerMillion", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-cached-price">{t("connections.form.cachedInputPrice")}</label><input id="connection-cached-price" type="number" min={0} step="any" value={typeof config.cachedInputCostPerMillion === "number" ? config.cachedInputCostPerMillion : ""} onChange={(event) => updateOptionalNumber("cachedInputCostPerMillion", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-cache-write-price">{t("connections.form.cacheWritePrice")}</label><input id="connection-cache-write-price" type="number" min={0} step="any" value={typeof config.cacheWriteCostPerMillion === "number" ? config.cacheWriteCostPerMillion : ""} onChange={(event) => updateOptionalNumber("cacheWriteCostPerMillion", event.target.value)} /></div>
+            <div className="field"><label htmlFor="connection-cache-storage-price">{t("connections.form.cacheStoragePrice")}</label><input id="connection-cache-storage-price" type="number" min={0} step="any" value={typeof config.cacheStorageCostPerMillionHour === "number" ? config.cacheStorageCostPerMillionHour : ""} onChange={(event) => updateOptionalNumber("cacheStorageCostPerMillionHour", event.target.value)} /></div>
+          </div></details>
         </>}
         {kind === "tool-service" && <>
           <div className="field"><label htmlFor="connection-connector">{t("connections.form.searchService")}</label><select id="connection-connector" value={String(config.connector ?? "firecrawl")} onChange={(event) => {

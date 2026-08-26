@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Tabs } from "@base-ui/react/tabs";
-import type { InspectorField } from "@harnest/core";
+import type { HarnessSpec, InspectorField } from "@harnestai/core";
 import { configValue, withConfigValue } from "@/lib/component-catalog";
 import type {
   HarnessComponent,
@@ -18,6 +18,7 @@ import {
 import type { ToolCatalogItem } from "@/lib/studio-catalog";
 import { componentLabel, connectionLabel, fieldLabel } from "@/i18n/manifest";
 import { useI18n } from "./i18n-provider";
+import { apiErrorMessage, requestJson } from "@/lib/api-client";
 
 type EdgeCondition = { source?: string; path?: string; op?: string; value?: unknown };
 type EdgeState = { key?: string; merge?: string };
@@ -26,6 +27,68 @@ type EditableConnection = HarnessConnection & {
   select?: string;
   state?: EdgeState;
 };
+
+interface ProjectBindingView {
+  readonly kind: "prompt" | "context" | "schema";
+  readonly component: string;
+  readonly graph?: string;
+  readonly path: string;
+}
+
+function ProjectBindingField({ component, graph, locked, onChanged }: {
+  component: HarnessComponent;
+  graph?: string;
+  locked: boolean;
+  onChanged: () => void | Promise<void>;
+}) {
+  const { t } = useI18n();
+  const kind = component.type === "prompt" ? "prompt" : component.type === "context" ? "context" : component.type === "output" ? "schema" : undefined;
+  const root = kind === "prompt" ? ".harnest/prompts/" : kind === "context" ? ".harnest/context/" : ".harnest/schemas/";
+  const [files, setFiles] = useState<readonly string[]>([]);
+  const [selected, setSelected] = useState("");
+  const [available, setAvailable] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    if (!kind) return;
+    try {
+      const payload = await requestJson<{
+        project: { manifest: { bindings?: ProjectBindingView[] } } | null;
+        files: Array<{ path: string }>;
+      }>("/api/project", { cache: "no-store" });
+      setAvailable(Boolean(payload.project));
+      setFiles(payload.files.map(({ path }) => path).filter((path) => path.startsWith(root)));
+      setSelected(payload.project?.manifest.bindings?.find((binding) => binding.kind === kind
+        && binding.component === component.id && binding.graph === graph)?.path
+        ? `.harnest/${payload.project.manifest.bindings.find((binding) => binding.kind === kind && binding.component === component.id && binding.graph === graph)!.path}`
+        : "");
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, t("project.loadFailed"), t));
+    }
+  }, [component.id, graph, kind, root, t]);
+  useEffect(() => { void load(); }, [load]);
+  if (!kind || !available) return null;
+  const bind = async (path: string) => {
+    setBusy(true);
+    try {
+      await requestJson("/api/project", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "bind", kind, component: component.id, ...(graph ? { graph } : {}), ...(path ? { path } : {}) }),
+      });
+      setSelected(path);
+      setError("");
+      await onChanged();
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, t("project.bindFailed"), t));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="field" data-config-path="projectBinding"><label htmlFor={`project-binding-${component.id}`}>{t("project.sourceBinding")}</label><select id={`project-binding-${component.id}`} value={selected} disabled={locked || busy} onChange={(event) => void bind(event.target.value)}><option value="">{t("project.inlineSource")}</option>{files.map((path) => <option key={path} value={path}>{path.replace(root, "")}</option>)}</select><span className="field-help">{t("project.sourceBindingHelp")}</span>{error && <span className="field-error" role="status">{error}</span>}</div>;
+}
 
 const optionalText = (value: string) => value === "" ? undefined : value;
 const fieldId = (prefix: string, path: string) => `${prefix}-${path.replace(/[^A-Za-z0-9_-]/g, "-")}`;
@@ -185,7 +248,7 @@ const connectionKindsFor = (
 
 const advancedField = (component: HarnessComponent, field: InspectorField) => {
   if (component.type === "model") return ["adapter", "baseUrl", "inputCostPerMillion", "outputCostPerMillion"].includes(field.path);
-  if (component.type === "agent") return ["timeoutMs", "maxToolCalls", "toolTimeoutMs", "maxTokens", "maxCostUsd", "allowTools", "denyTools", "toolError"].includes(field.path);
+  if (component.type === "agent") return ["timeoutMs", "maxToolCalls", "toolTimeoutMs", "compactAtTokens", "maxTokens", "maxCostUsd", "allowTools", "denyTools", "toolError"].includes(field.path);
   if (component.type === "mcp-tool") return ["transport", "protocol", "command", "args", "url", "headers", "timeoutMs"].includes(field.path);
   if (component.type === "tool") return ["tool", "action", "source", "inputSchema", "outputSchema"].includes(field.path);
   return field.control === "json" && (field.path === "schema" || field.path === "inputSchema" || field.path === "outputSchema");
@@ -255,6 +318,100 @@ function ConnectionField({
   );
 }
 
+function ToolCatalogField({
+  component,
+  tools,
+  locked,
+  onChange,
+}: {
+  component: HarnessComponent;
+  tools: readonly ToolCatalogItem[];
+  locked: boolean;
+  onChange: (component: HarnessComponent) => void;
+}) {
+  const { t } = useI18n();
+  const config = component.config as Record<string, unknown>;
+  const selected = typeof config.tool === "string" ? config.tool : "";
+  const categories = [...new Set(tools.filter(({ installed }) => installed).map(({ category }) => category))].sort();
+  const selectTool = (tool: ToolCatalogItem) => {
+    const preserved = { ...config };
+    for (const key of ["tool", "label", "description", "risk", "source", "action", "connectionId", "inputSchema", "outputSchema"]) {
+      delete preserved[key];
+    }
+    onChange({
+      ...component,
+      config: {
+        ...preserved,
+        tool: tool.id,
+        label: tool.label,
+        description: tool.description,
+        risk: tool.risk ?? "external",
+        source: tool.source ?? "custom",
+        ...(tool.action ? { action: tool.action } : {}),
+        ...(tool.connectionId ? { connectionId: tool.connectionId } : {}),
+        ...(tool.inputSchema ? { inputSchema: tool.inputSchema } : {}),
+        ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+      },
+    } as HarnessComponent);
+  };
+  const quick = ["builtin.web-search", "builtin.code-runner", "builtin.shell"]
+    .flatMap((id) => tools.find((tool) => tool.installed && tool.id === id) ?? []);
+  return <div className="field" data-config-path="tool">
+    <label htmlFor={`tool-catalog-${component.id}`}>{t("inspector.toolChoice")}</label>
+    {quick.length > 0 && <div className="connection-kind-grid" aria-label={t("inspector.toolQuickChoices")}>
+      {quick.map((tool) => <button type="button" key={tool.id} className={`connection-kind ${selected === tool.id ? "is-active" : ""}`} aria-pressed={selected === tool.id} disabled={locked} onClick={() => selectTool(tool)}><strong>{tool.label}</strong><span>{tool.description}</span></button>)}
+    </div>}
+    <select id={`tool-catalog-${component.id}`} required disabled={locked} value={selected} onChange={(event) => {
+      const tool = tools.find(({ id }) => id === event.target.value);
+      if (!tool) return;
+      selectTool(tool);
+    }}>
+      <option value="">{t("inspector.toolChoicePlaceholder")}</option>
+      {categories.map((category) => <optgroup key={category} label={category}>{tools.filter((tool) => tool.installed && tool.category === category).map((tool) => <option key={tool.id} value={tool.id}>{tool.label}</option>)}</optgroup>)}
+    </select>
+    <span className="field-help">{t("inspector.toolChoiceHelp")}</span>
+  </div>;
+}
+
+function ComponentPolicyFields({
+  component,
+  locked,
+  onChange,
+}: {
+  component: HarnessComponent;
+  locked: boolean;
+  onChange: (component: HarnessComponent) => void;
+}) {
+  const { t } = useI18n();
+  const record = component as HarnessComponent & { policy?: Record<string, unknown> };
+  const policy = record.policy ?? {};
+  const retry = policy.retry && typeof policy.retry === "object" && !Array.isArray(policy.retry)
+    ? policy.retry as Record<string, unknown> : {};
+  const update = (next: Record<string, unknown>) => {
+    const candidate = { ...component } as HarnessComponent & { policy?: Record<string, unknown> };
+    if (Object.keys(next).length) candidate.policy = next; else delete candidate.policy;
+    onChange(candidate as HarnessComponent);
+  };
+  const patch = (key: string, value: unknown) => {
+    const next = { ...policy };
+    if (value === undefined) delete next[key]; else next[key] = value;
+    update(next);
+  };
+  const patchRetry = (key: string, value: unknown) => {
+    const next = { ...retry };
+    if (value === undefined) delete next[key]; else next[key] = value;
+    if (Object.keys(next).length && typeof next.maxAttempts !== "number") next.maxAttempts = 3;
+    patch("retry", Object.keys(next).length ? next : undefined);
+  };
+  const value = (input: string) => input === "" ? undefined : Number(input);
+  return <details className="advanced-panel"><summary>{t("inspector.executionPolicy")}</summary><div className="field-grid">
+    <div className="field" data-config-path="policy.timeoutMs"><label htmlFor={`policy-timeout-${component.id}`}>{t("inspector.policy.timeout")}</label><input id={`policy-timeout-${component.id}`} type="number" min={1} max={600000} disabled={locked} value={typeof policy.timeoutMs === "number" ? policy.timeoutMs : ""} onChange={(event) => patch("timeoutMs", value(event.target.value))} /></div>
+    <div className="field" data-config-path="policy.retry.maxAttempts"><label htmlFor={`policy-attempts-${component.id}`}>{t("inspector.policy.maxAttempts")}</label><input id={`policy-attempts-${component.id}`} type="number" min={1} max={10} disabled={locked} value={typeof retry.maxAttempts === "number" ? retry.maxAttempts : ""} onChange={(event) => patchRetry("maxAttempts", value(event.target.value))} /></div>
+    <div className="field" data-config-path="policy.retry.backoffMs"><label htmlFor={`policy-backoff-${component.id}`}>{t("inspector.policy.backoff")}</label><input id={`policy-backoff-${component.id}`} type="number" min={0} max={60000} disabled={locked} value={typeof retry.backoffMs === "number" ? retry.backoffMs : ""} onChange={(event) => patchRetry("backoffMs", value(event.target.value))} /></div>
+    <div className="field" data-config-path="policy.retry.maxBackoffMs"><label htmlFor={`policy-max-backoff-${component.id}`}>{t("inspector.policy.maxBackoff")}</label><input id={`policy-max-backoff-${component.id}`} type="number" min={0} max={60000} disabled={locked} value={typeof retry.maxBackoffMs === "number" ? retry.maxBackoffMs : ""} onChange={(event) => patchRetry("maxBackoffMs", value(event.target.value))} /></div>
+  </div></details>;
+}
+
 function EdgeInspector({
   edge,
   locked,
@@ -321,6 +478,10 @@ export function Inspector({
   onOpenConnections,
   focusPath,
   focusVersion = 0,
+  specVersion,
+  projectGraph,
+  projectLocked = false,
+  onProjectChanged,
 }: {
   node?: HarnessNode;
   edge?: HarnessEdge;
@@ -339,6 +500,10 @@ export function Inspector({
   onOpenConnections?: (kind?: ConnectionKind) => void;
   focusPath?: string;
   focusVersion?: number;
+  specVersion: HarnessSpec["version"];
+  projectGraph?: string;
+  projectLocked?: boolean;
+  onProjectChanged?: () => void | Promise<void>;
 }) {
   const { t } = useI18n();
   const inspectorRef = useRef<HTMLDivElement>(null);
@@ -376,7 +541,8 @@ export function Inspector({
     ? [config.subgraph, config.ref, config.name].find((value): value is string => typeof value === "string" && Boolean(value))
     : undefined;
   const hasConnectionField = connectionKindsFor(component, tools).length > 0;
-  const editableFields = manifest.inspector.filter((field) => field.path !== "connectionId" && field.path !== "apiKey");
+  const editableFields = manifest.inspector.filter((field) => field.path !== "connectionId" && field.path !== "fallbackConnectionId" && field.path !== "apiKey"
+    && !(component.type === "tool" && field.path === "tool"));
   const primaryFields = editableFields.filter((field) => !advancedField(component, field));
   const advancedFields = editableFields.filter((field) => advancedField(component, field));
   const lastRun = node.data.lastRun;
@@ -393,12 +559,15 @@ export function Inspector({
         <Tabs.Panel value="settings" className="inspector-tab-panel">
           <fieldset disabled={locked} className="inspector-fieldset">
             <div className="field-grid">
+              {component.type === "tool" && <ToolCatalogField component={component} tools={tools ?? []} locked={locked} onChange={onChange} />}
               {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
+              {onProjectChanged && <ProjectBindingField component={component} graph={projectGraph} locked={locked || projectLocked} onChanged={onProjectChanged} />}
               {component.type === "model" && typeof config.apiKey === "string" && config.apiKey.length > 0 && <div className="field-help is-error">{t("inspector.legacySecret")}</div>}
               {primaryFields.length
                 ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
                 : <div className="field-help">{t("inspector.noConfig")}</div>}
               {advancedFields.length > 0 && <details className="advanced-panel"><summary>{t("inspector.advanced")}</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
+              {specVersion === "0.2" && <ComponentPolicyFields component={component} locked={locked} onChange={onChange} />}
             </div>
           </fieldset>
           <div className="inspector-actions is-split">

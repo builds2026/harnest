@@ -75,10 +75,10 @@ npm run harnest -- serve harnest.yaml -- --port 8787 --allow-modules
 npm run harnest -- mcp serve harnest.yaml -- --allow-modules
 ```
 
-두 server는 같은 `@harnest/sdk` load/invoke/stream 경로를 사용한다. HTTP request body는 `{ "input": ... }`이고 `/stream`은 NDJSON이다. MCP Tool input은 `{ "message": "..." }` 또는 `{ "input": ... }`이다.
+두 server는 같은 `@harnestai/sdk` load/invoke/stream 경로를 사용한다. HTTP request body는 `{ "input": ... }`이고 `/stream`은 NDJSON이다. MCP Tool input은 `{ "message": "..." }` 또는 `{ "input": ... }`이다.
 
 ```ts
-import { Harnest } from "@harnest/sdk";
+import { Harnest } from "@harnestai/sdk";
 
 const harness = await Harnest.load("./harnest.yaml", { allowModuleExecution: true });
 try {
@@ -136,4 +136,4 @@ npm test
 npm run build
 ```
 
-Production Studio만 직접 실행하려면 먼저 `npm run build --workspace @harnest/studio` 후 `frontend` 디렉터리에서 `npx next start --hostname 127.0.0.1 --port 3000`을 사용하고 `HARNEST_FILE` 등 capability 환경 변수를 명시한다. 일반 사용에는 CLI의 `studio` 명령이 더 안전하다.
+Production Studio만 직접 실행하려면 먼저 `npm run build --workspace @harnestai/studio` 후 `frontend` 디렉터리에서 `npx next start --hostname 127.0.0.1 --port 3000`을 사용하고 `HARNEST_FILE` 등 capability 환경 변수를 명시한다. 일반 사용에는 CLI의 `studio` 명령이 더 안전하다.

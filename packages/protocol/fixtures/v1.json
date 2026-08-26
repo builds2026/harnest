@@ -1,0 +1,82 @@
+{
+  "idempotencyKey": "retry/client:request-1",
+  "createRun": {
+    "input": { "message": "Summarize the selected context" },
+    "resumeRunId": "run-previous",
+    "context": {
+      "contextRef": "ctx_opaque_capability",
+      "revisions": { "conversation": "conv-r4", "memory": 12, "pkm": "pkm-r8" },
+      "attachments": [
+        {
+          "ref": "file_external_1",
+          "name": "brief.pdf",
+          "mimeType": "application/pdf",
+          "size": 4096,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "snapshotResponse": {
+    "snapshot": { "runId": "run-1", "status": "paused" },
+    "active": false
+  },
+  "event": {
+    "protocolVersion": "1.0",
+    "eventId": "event-7",
+    "runId": "run-1",
+    "sequence": 7,
+    "time": "2026-08-25T00:00:00.000Z",
+    "type": "interaction.requested",
+    "data": {
+      "id": "approval-1",
+      "runId": "run-1",
+      "nodeId": "agent",
+      "kind": "permission",
+      "requester": { "kind": "tool", "id": "builtin.shell" },
+      "title": "Allow shell?",
+      "message": "Allow this command?",
+      "blocking": "run",
+      "schema": { "type": "object" },
+      "data": { "command": "pwd" },
+      "checkpoint": { "revision": 3, "sequence": 7, "digest": "c29tZS1jaGVja3BvaW50" },
+      "createdAt": "2026-08-25T00:00:00.000Z"
+    }
+  },
+  "command": {
+    "commandId": "command-1",
+    "type": "interaction.response",
+    "response": {
+      "interactionId": "approval-1",
+      "checkpointDigest": "c29tZS1jaGVja3BvaW50",
+      "action": "submit",
+      "permission": "allow_once"
+    }
+  },
+  "interaction": {
+    "id": "approval-1",
+    "runId": "run-1",
+    "nodeId": "agent",
+    "taskId": "task-1",
+    "agentId": "agent-1",
+    "kind": "select",
+    "requester": { "kind": "agent", "id": "agent-1" },
+    "title": "Choose a region",
+    "message": "Select one region",
+    "blocking": "task",
+    "schema": { "type": "string", "enum": ["apac", "emea"] },
+    "checkpoint": { "revision": 3, "sequence": 7, "digest": "c29tZS1jaGVja3BvaW50" },
+    "createdAt": "2026-08-25T00:00:00.000Z"
+  },
+  "permission": {
+    "scope": {
+      "harnessId": "harness-1",
+      "toolId": "builtin.shell",
+      "connectionId": "runtime-main",
+      "capability": "process",
+      "resource": "pwd"
+    },
+    "effect": "allow_always",
+    "createdAt": "2026-08-25T00:00:00.000Z"
+  }
+}

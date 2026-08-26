@@ -1,4 +1,4 @@
-import { ComponentRegistry, type ComponentManifest } from "@harnest/core";
+import { ComponentRegistry, type ComponentManifest } from "@harnestai/core/browser";
 
 const COLORS = ["#5967a9", "#8a6191", "#2f7480", "#ae6c2f", "#46724f", "#9a5b55"] as const;
 const unsafeKeys = new Set(["__proto__", "prototype", "constructor"]);

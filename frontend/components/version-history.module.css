@@ -1,0 +1,22 @@
+.backdrop { position: fixed; inset: 0; z-index: 80; background: var(--overlay); }
+.viewport { position: fixed; inset: 0; z-index: 81; display: grid; place-items: center; padding: 24px; }
+.dialog { width: min(1040px, 96vw); height: min(760px, 90vh); overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface-raised); box-shadow: var(--shadow-lg); color: var(--text-primary); }
+.header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 20px 22px; border-bottom: 1px solid var(--line); }
+.header h2 { margin: 0 0 4px; font-size: 20px; }
+.header p { margin: 0; color: var(--text-secondary); }
+.header button { border: 0; background: transparent; color: inherit; font-size: 24px; cursor: pointer; }
+.error { margin: 12px 18px 0; padding: 10px 12px; border-radius: var(--radius-md); background: var(--danger-soft); color: var(--danger); }
+.body { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: calc(100% - 82px); }
+.list { overflow: auto; padding: 12px; border-right: 1px solid var(--line); }
+.list > button { width: 100%; display: grid; gap: 4px; margin-bottom: 8px; padding: 12px; border: 1px solid transparent; border-radius: var(--radius-md); background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.list > button:hover, .list > .selected { border-color: var(--accent); background: var(--accent-soft); }
+.list span, .list small, .preview small { color: var(--text-secondary); }
+.preview { min-width: 0; overflow: auto; padding: 18px; }
+.previewHeader { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.previewHeader > div { display: grid; gap: 4px; }
+.compare { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-muted); }
+.compare ul { max-height: 120px; overflow: auto; margin: 8px 0 0; padding-left: 20px; }
+.compare p { margin: 8px 0 0; color: var(--text-secondary); }
+.compare span { display: inline-block; margin: 8px 8px 0 0; color: var(--warning); }
+.preview pre { min-height: 320px; overflow: auto; padding: 14px; border-radius: var(--radius-md); background: var(--code-bg); color: var(--code-text); font-size: 12px; white-space: pre; }
+@media (max-width: 760px) { .viewport { padding: 0; } .dialog { width: 100vw; height: 100dvh; border-radius: 0; } .body { grid-template-columns: 1fr; grid-template-rows: 190px minmax(0, 1fr); } .list { border-right: 0; border-bottom: 1px solid var(--line); } }

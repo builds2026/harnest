@@ -4,7 +4,47 @@ export interface AdapterCapabilities {
   cancellation: boolean;
   /** Provider-native function/tool calling. Omitted by legacy adapters. */
   tools?: boolean;
+  /** Media kinds this Adapter can send as first-class model input. */
+  inputMedia?: readonly ("image" | "audio" | "video" | "pdf")[];
+  /** Provider prompt-cache modes supported by this Adapter. */
+  promptCaching?: readonly PromptCacheMode[];
 }
+
+export type PromptCacheMode = "automatic" | "explicit";
+export type PromptCacheStatus = "hit" | "write" | "miss" | "bypass" | "provider-managed";
+
+export interface PromptCacheRequest {
+  readonly mode: PromptCacheMode;
+  /** SHA-256 digest of the cacheable prefix and its non-secret execution scope. */
+  readonly key: string;
+  readonly prefixMessageCount: number;
+}
+
+export interface PromptCacheEntry {
+  readonly key: string;
+  readonly adapterId: string;
+  readonly model: string;
+  /** Opaque Provider resource name. Never contains prompt content or credentials. */
+  readonly resource: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly cachedInputTokens?: number;
+}
+
+export interface PromptCacheStore {
+  get(key: string): Promise<PromptCacheEntry | undefined>;
+  set(entry: PromptCacheEntry): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+export type ModelContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | {
+      readonly type: "media";
+      readonly mimeType: string;
+      readonly data: string;
+      readonly name?: string;
+    };
 
 export interface ModelToolCall {
   readonly id: string;
@@ -22,7 +62,7 @@ export interface ModelToolDefinition {
 
 export interface ModelMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  content: string | readonly ModelContentPart[];
   toolCalls?: readonly ModelToolCall[];
   toolCallId?: string;
   name?: string;
@@ -37,6 +77,7 @@ export interface ModelRequest {
   maxTokens?: number;
   responseSchema?: Readonly<Record<string, unknown>>;
   tools?: readonly ModelToolDefinition[];
+  promptCache?: PromptCacheRequest;
 }
 
 export interface AdapterContext {
@@ -44,12 +85,16 @@ export interface AdapterContext {
   resolveSecret(reference: string): string | undefined;
   /** Host-supplied outbound boundary. Node hosts use DNS validation and connection pinning. */
   fetch?(url: string | URL, init?: RequestInit): Promise<Response>;
+  /** Optional persistent registry for Provider-managed explicit cache resources. */
+  promptCache?: PromptCacheStore;
 }
 
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
 }
 
 export type FinishReason = "stop" | "length" | "tool" | "error" | "unknown";
@@ -58,6 +103,7 @@ export type ModelEvent =
   | { type: "text-delta"; text: string }
   | { type: "tool-call"; call: ModelToolCall }
   | { type: "usage"; usage: TokenUsage }
+  | { type: "cache"; status: PromptCacheStatus; mode: PromptCacheMode; cachedInputTokens?: number; cacheWriteInputTokens?: number; reason?: string }
   | { type: "finish"; reason: FinishReason; model?: string };
 
 export interface ModelAdapter {
@@ -115,6 +161,10 @@ export class AdapterRegistry {
     const capabilities = adapter.capabilities;
     if (!capabilities || typeof capabilities.streaming !== "boolean"
       || typeof capabilities.json !== "boolean" || typeof capabilities.cancellation !== "boolean"
+      || (capabilities.inputMedia !== undefined && (!Array.isArray(capabilities.inputMedia)
+        || capabilities.inputMedia.some((kind) => !["image", "audio", "video", "pdf"].includes(kind))))
+      || (capabilities.promptCaching !== undefined && (!Array.isArray(capabilities.promptCaching)
+        || capabilities.promptCaching.some((mode) => !["automatic", "explicit"].includes(mode))))
       || (adapter.requiredCredentials !== undefined
         && (!Array.isArray(adapter.requiredCredentials)
           || adapter.requiredCredentials.some((reference) => typeof reference !== "string")))

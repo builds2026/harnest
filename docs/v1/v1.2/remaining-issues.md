@@ -17,6 +17,6 @@
 
 ## 의도한 배포 경계
 
-- Studio host는 literal loopback 단일 사용자 개발 UI다. 원격 multi-user control plane으로 공개하지 않는다. 서비스 제품은 `@harnest/core` runtime을 자체 인증·tenant isolation 경계 안에 embed한다.
+- Studio host는 literal loopback 단일 사용자 개발 UI다. 원격 multi-user control plane으로 공개하지 않는다. 서비스 제품은 `@harnestai/core` runtime을 자체 인증·tenant isolation 경계 안에 embed한다.
 - 검토한 `runtime.modules` adapter/component 확장은 host process 권한을 가진다. 모델이 호출하는 stored TypeScript Tool과 Shell/Code/MCP stdio는 container로 격리되지만, host extension 자체를 untrusted plugin sandbox로 주장하지 않는다.
 - 외부 credential/resource가 필요한 Template은 staged commissioning 대상이다. 연결되지 않은 graph는 Validate/Run을 통과하지 않는다.

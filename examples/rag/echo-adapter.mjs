@@ -1,10 +1,11 @@
-/** @type {import('@harnest/core').ModelAdapter} */
+/** @type {import('@harnestai/core').ModelAdapter} */
 const adapter = {
   id: "rag-echo",
   capabilities: { streaming: true, json: false, cancellation: true },
   async *run(request, context) {
     context.signal.throwIfAborted();
-    const text = String(request.messages.at(-1)?.content ?? "");
+    const text = request.messages.map(({ content }) => typeof content === "string" ? content : content
+      .filter(({ type }) => type === "text").map(({ text }) => text).join("\n")).join("\n\n");
     yield { type: "text-delta", text };
     yield {
       type: "usage",

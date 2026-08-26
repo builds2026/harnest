@@ -14,6 +14,31 @@ afterEach(async () => {
 });
 
 describe("FilePlaygroundStore", () => {
+  it("compacts evicted conversation turns into a private typed checkpoint", async () => {
+    const project = await mkdtemp(join(tmpdir(), "harnest-playground-checkpoint-"));
+    roots.push(project);
+    const store = new FilePlaygroundStore(project);
+    const created = await store.create();
+    const now = new Date().toISOString();
+    await store.append(created.id, Array.from({ length: 202 }, (_, index) => ({
+      id: `message-${index}`,
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content: index === 0 ? "Immutable original objective" : `turn ${index}`,
+      createdAt: now,
+      ...(index === 1 ? { runId: "run_evidence", finishReason: "stop" } : {}),
+    })));
+    const session = await store.get(created.id);
+    expect(session.messages).toHaveLength(200);
+    expect("checkpoint" in session).toBe(false);
+    await expect(store.checkpoint(created.id)).resolves.toMatchObject({
+      originalRequest: "Immutable original objective",
+      decisions: ["turn 1"],
+      evidence: ["run:run_evidence"],
+      currentResult: "turn 1",
+      compactedMessages: 2,
+    });
+  });
+
   it("deduplicates uploads, stages only selected files, and indexes sandbox artifacts", async () => {
     const project = await mkdtemp(join(tmpdir(), "harnest-playground-"));
     roots.push(project);
@@ -36,8 +61,28 @@ describe("FilePlaygroundStore", () => {
     });
     expect(duplicate.id).toBe(first.id);
     expect(first.name).toBe("input.csv");
+    expect((await store.get(created.id)).activeFileIds).toContain(first.id);
 
-    const workspace = await store.prepareWorkspace(created.id, [first.id]);
+    await store.setActiveFiles(created.id, [first.id]);
+    await store.append(created.id, [{
+      id: "message-1",
+      role: "user",
+      content: "Analyze this file",
+      createdAt: new Date().toISOString(),
+      fileIds: [first.id],
+    }, {
+      id: "message-2",
+      role: "assistant",
+      content: "I can read it",
+      createdAt: new Date().toISOString(),
+    }, {
+      id: "message-3",
+      role: "user",
+      content: "Read it again",
+      createdAt: new Date().toISOString(),
+    }]);
+    expect((await store.get(created.id)).activeFileIds).toEqual([first.id]);
+    const workspace = await store.prepareWorkspace(created.id);
     expect(workspace.files.map(({ id }) => id)).toEqual([first.id]);
     expect(await readFile(join(workspace.inputDirectory, `${first.id}.csv`), "utf8")).toBe("value\n42\n");
     await mkdir(join(workspace.outputDirectory, "reports"));
@@ -54,6 +99,11 @@ describe("FilePlaygroundStore", () => {
     await store.removeFile(created.id, unused.id);
     expect((await store.files(created.id)).some(({ id }) => id === unused.id)).toBe(false);
     await store.cleanupWorkspace(created.id, workspace.workspaceId);
+
+    const nextWorkspace = await store.prepareWorkspace(created.id);
+    expect(nextWorkspace.files.map(({ id }) => id)).toEqual([first.id]);
+    expect(await readFile(join(nextWorkspace.inputDirectory, `${first.id}.csv`), "utf8")).toBe("value\n42\n");
+    await store.cleanupWorkspace(created.id, nextWorkspace.workspaceId);
     await store.delete(created.id);
     expect(await store.list()).toEqual([]);
   });

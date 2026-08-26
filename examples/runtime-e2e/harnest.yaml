@@ -1,0 +1,53 @@
+version: "0.2"
+components:
+  - id: arguments
+    type: memory
+    config:
+      key: runtime-e2e-arguments
+      operation: read
+      initial: { city: Seoul }
+  - id: cityTool
+    type: mcp-tool
+    config:
+      transport: http
+      protocol: "2026-07-28"
+      url: http://127.0.0.1:3299/mcp
+      tool: lookup-city
+      timeoutMs: 10000
+  - id: model
+    type: model
+    config: { adapter: runtime-e2e, model: deterministic-multimodal }
+  - id: prompt
+    type: prompt
+    config:
+      template: "Verify the connected Tool result and report selected media: {{input}}"
+  - id: agent
+    type: agent
+    config:
+      multimodal: true
+  - id: output
+    type: output
+    config: { format: text }
+connections:
+  - from: { component: arguments, port: memory }
+    to: { component: cityTool, port: arguments }
+  - from: { component: cityTool, port: result }
+    to: { component: agent, port: toolResults }
+  - from: { component: model, port: model }
+    to: { component: agent, port: model }
+  - from: { component: prompt, port: prompt }
+    to: { component: agent, port: prompt }
+  - from: { component: agent, port: response }
+    to: { component: output, port: value }
+entrypoint: output
+runtime:
+  timeoutMs: 30000
+  adapters: [./runtime-adapter.mjs]
+studio:
+  positions:
+    arguments: { x: 40, y: 60 }
+    cityTool: { x: 320, y: 60 }
+    model: { x: 40, y: 280 }
+    prompt: { x: 40, y: 440 }
+    agent: { x: 620, y: 230 }
+    output: { x: 920, y: 230 }

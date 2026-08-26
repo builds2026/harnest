@@ -17,11 +17,13 @@ import {
   type Diagnostic,
   type GraphBody,
   type HarnessSpec,
+  type AgentTemplateSpec,
   type PredicateSpec,
   type RetryPolicy,
   type ValidationResult,
 } from "./spec.js";
-import type { ToolRegistry } from "./tool.js";
+import type { TeamRuntimeDefinition } from "./orchestration.js";
+import { requiredToolCapability, type ToolRegistry } from "./tool.js";
 
 export type { ComponentPortDefinition, PortDefinition } from "./component.js";
 
@@ -80,6 +82,24 @@ function unpricedModelsInSubgraph(
       .flatMap((component) => typeof component.config.subgraph === "string"
         ? unpricedModelsInSubgraph(component.config.subgraph, subgraphs, visited)
         : []),
+  ];
+}
+
+function toolComponentsInSubgraph(
+  name: string,
+  subgraphs: Readonly<Record<string, GraphBody>>,
+  visited = new Set<string>(),
+): Array<{ component: ComponentSpec; path: string }> {
+  if (visited.has(name)) return [];
+  visited.add(name);
+  const body = subgraphs[name];
+  if (!body) return [];
+  return [
+    ...body.components.flatMap((component, index) => ["tool", "local-tool", "mcp-tool"].includes(component.type)
+      ? [{ component, path: `$.subgraphs.${name}.components[${index}]` }] : []),
+    ...body.components.filter((component) => component.type === "subgraph" || component.type === "loop")
+      .flatMap((component) => typeof component.config.subgraph === "string"
+        ? toolComponentsInSubgraph(component.config.subgraph, subgraphs, visited) : []),
   ];
 }
 
@@ -146,7 +166,7 @@ function graphLayers(body: GraphBody): string[][] {
 }
 
 function normalizeBody(spec: HarnessSpec): GraphBody {
-  if (spec.version === "0.2") return {
+  if (spec.version !== "0.1") return {
     components: spec.components,
     connections: spec.connections,
     entrypoint: spec.entrypoint,
@@ -163,31 +183,54 @@ function normalizeBody(spec: HarnessSpec): GraphBody {
 }
 
 export interface NormalizedHarnessSpec extends GraphBody {
-  readonly sourceVersion: "0.1" | "0.2";
+  readonly sourceVersion: HarnessSpec["version"];
   readonly subgraphs: Readonly<Record<string, GraphBody>>;
+  readonly agentTemplates: Readonly<Record<string, AgentTemplateSpec>>;
+  readonly teams: Readonly<Record<string, TeamRuntimeDefinition>>;
   readonly runtime: {
     readonly timeoutMs: number;
     readonly adapters: readonly string[];
     readonly modules: readonly string[];
     readonly retry: RetryPolicy;
     readonly budget?: { readonly maxTokens?: number; readonly maxCostUsd?: number };
+    readonly context: {
+      readonly cacheMode: "automatic" | "explicit";
+      readonly overflow: "compact" | "error";
+    };
   };
 }
 
 export function normalizeSpec(spec: HarnessSpec): NormalizedHarnessSpec {
   const body = normalizeBody(spec);
   const runtime = spec.runtime;
-  const advancedRuntime = spec.version === "0.2" ? spec.runtime : undefined;
+  const advancedRuntime = spec.version === "0.1" ? undefined : spec.runtime;
   const budget = advancedRuntime?.budget;
+  const templates = spec.version === "0.3" ? spec.agentTemplates ?? {} : {};
+  const teams = spec.version === "0.3" ? spec.teams ?? {} : {};
   return {
     ...body,
     sourceVersion: spec.version,
-    subgraphs: spec.version === "0.2" ? spec.subgraphs ?? {} : {},
+    subgraphs: spec.version === "0.1" ? {} : spec.subgraphs ?? {},
+    agentTemplates: templates,
+    teams: Object.fromEntries(Object.entries(teams).map(([name, team]) => [name, {
+      ...team,
+      limits: {
+        maxInstances: team.limits?.maxInstances ?? 8,
+        maxDepth: team.limits?.maxDepth ?? 2,
+        maxParallel: team.limits?.maxParallel ?? 4,
+        maxMessages: team.limits?.maxMessages ?? 64,
+        maxPlanRevisions: team.limits?.maxPlanRevisions ?? 16,
+      },
+    }])),
     runtime: {
       timeoutMs: runtime?.timeoutMs ?? 30_000,
       adapters: runtime?.adapters ?? [],
       modules: advancedRuntime?.modules ?? [],
       retry: advancedRuntime?.retry ?? { maxAttempts: 1, backoffMs: 0 },
+      context: {
+        cacheMode: advancedRuntime?.context?.cacheMode ?? "automatic",
+        overflow: advancedRuntime?.context?.overflow ?? "compact",
+      },
       ...(budget ? {
         budget: {
           ...(budget.maxTokens === undefined ? {} : { maxTokens: budget.maxTokens }),
@@ -384,6 +427,7 @@ function validateGraphBody(
 
     if (component.type === "model") {
       const adapter = component.config.adapter;
+      const hasConnection = typeof component.config.connectionId === "string" && component.config.connectionId.length > 0;
       if (typeof adapter === "string" && options.registry && !options.registry.has(adapter)) diagnostics.push(diagnostic(
         "ADAPTER_NOT_REGISTERED",
         `${componentPath}.config.adapter`,
@@ -392,7 +436,7 @@ function validateGraphBody(
         "Install and list its module under runtime.adapters, or register it through the SDK",
       ));
       const reference = component.config.apiKey;
-      if (reference !== undefined) {
+      if (!hasConnection && reference !== undefined) {
         if (typeof reference !== "string" || !/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(reference)) diagnostics.push(diagnostic(
           "SECRET_LITERAL",
           `${componentPath}.config.apiKey`,
@@ -406,7 +450,7 @@ function validateGraphBody(
           component.id,
         ));
       }
-      if (reference === undefined && typeof adapter === "string" && options.env && options.registry?.has(adapter)) {
+      if (!hasConnection && reference === undefined && typeof adapter === "string" && options.env && options.registry?.has(adapter)) {
         for (const required of options.registry.get(adapter).requiredCredentials ?? []) {
           if (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(required) && !options.env[required.slice(4)]) diagnostics.push(diagnostic(
             "ENV_MISSING",
@@ -686,6 +730,70 @@ export function validateSpec(candidate: unknown, options: ValidationOptions = {}
   }
   diagnostics.push(...validateSubgraphReferences(normalized.subgraphs));
 
+  if (spec.version === "0.3") {
+    const templates = spec.agentTemplates ?? {};
+    for (const [name, template] of Object.entries(templates)) {
+      if ("subgraph" in template.runner && !normalized.subgraphs[template.runner.subgraph]) diagnostics.push(diagnostic(
+        "AGENT_TEMPLATE_SUBGRAPH_MISSING",
+        `$.agentTemplates.${name}.runner.subgraph`,
+        `Agent template '${name}' references missing Subgraph '${template.runner.subgraph}'`,
+      ));
+      if (template.capabilities && new Set(template.capabilities).size !== template.capabilities.length) diagnostics.push(diagnostic(
+        "AGENT_TEMPLATE_CAPABILITY_DUPLICATE",
+        `$.agentTemplates.${name}.capabilities`,
+        `Agent template '${name}' contains duplicate capabilities`,
+      ));
+      if ("subgraph" in template.runner) for (const { component, path } of toolComponentsInSubgraph(
+        template.runner.subgraph,
+        normalized.subgraphs,
+      )) {
+        const toolId = typeof component.config.tool === "string" ? component.config.tool : "";
+        const registered = toolId && options.tools?.has(toolId) ? options.tools.get(toolId) : undefined;
+        const required = requiredToolCapability(registered ?? {
+          id: toolId,
+          risk: component.config.risk === "destructive" ? "destructive"
+            : component.type === "local-tool" && component.config.risk === "write" ? "write" : "external",
+          ...(component.type === "mcp-tool" || component.config.source === "mcp" ? { source: "mcp" as const } : {}),
+        });
+        if (required && !template.capabilities?.includes(required)) diagnostics.push(diagnostic(
+          "AGENT_TEMPLATE_CAPABILITY_REQUIRED",
+          `$.agentTemplates.${name}.capabilities`,
+          `Agent template '${name}' requires capability '${required}' for Tool '${toolId || component.id}' at ${path}`,
+          component.id,
+          `Add '${required}' to this Agent template or remove the Tool from its Subgraph`,
+        ));
+      }
+    }
+    for (const [name, team] of Object.entries(spec.teams ?? {})) {
+      if (!templates[team.orchestrator]) diagnostics.push(diagnostic(
+        "TEAM_ORCHESTRATOR_MISSING",
+        `$.teams.${name}.orchestrator`,
+        `Team '${name}' references missing orchestrator template '${team.orchestrator}'`,
+      ));
+      const duplicateMembers = team.members.filter((member, index) => team.members.indexOf(member) !== index);
+      if (duplicateMembers.length) diagnostics.push(diagnostic(
+        "TEAM_MEMBER_DUPLICATE",
+        `$.teams.${name}.members`,
+        `Team '${name}' repeats member '${duplicateMembers[0]}'`,
+      ));
+      for (const [index, member] of team.members.entries()) if (!templates[member]) diagnostics.push(diagnostic(
+        "TEAM_MEMBER_MISSING",
+        `$.teams.${name}.members[${index}]`,
+        `Team '${name}' references missing Agent template '${member}'`,
+      ));
+    }
+    for (const [graphPath, body] of [["$", normalized] as const,
+      ...Object.entries(normalized.subgraphs).map(([name, graph]) => [`$.subgraphs.${name}`, graph] as const)]) {
+      for (const [index, component] of body.components.entries()) if (component.type === "team"
+        && (typeof component.config.team !== "string" || !normalized.teams[component.config.team])) diagnostics.push(diagnostic(
+          "TEAM_NOT_FOUND",
+          `${graphPath}.components[${index}].config.team`,
+          `Team '${String(component.config.team ?? "")}' does not exist`,
+          component.id,
+        ));
+    }
+  }
+
   if (normalized.runtime.retry.maxBackoffMs !== undefined && normalized.runtime.retry.backoffMs !== undefined
     && normalized.runtime.retry.maxBackoffMs < normalized.runtime.retry.backoffMs) diagnostics.push(diagnostic(
       "RETRY_BACKOFF_INVALID", "$.runtime.retry.maxBackoffMs", "maxBackoffMs must be at least backoffMs",
@@ -786,8 +894,10 @@ export interface RuntimeGraphPlan {
 
 export interface RuntimePlan extends RuntimeGraphPlan {
   readonly version: "0.2";
-  readonly sourceVersion: "0.1" | "0.2";
+  readonly sourceVersion: HarnessSpec["version"];
   readonly subgraphs: Readonly<Record<string, RuntimeGraphPlan>>;
+  readonly agentTemplates: Readonly<Record<string, AgentTemplateSpec>>;
+  readonly teams: Readonly<Record<string, TeamRuntimeDefinition>>;
   readonly runtime: NormalizedHarnessSpec["runtime"];
 }
 
@@ -849,6 +959,8 @@ export function compileSpec(candidate: unknown, options: ValidationOptions = {})
       sourceVersion: normalized.sourceVersion,
       ...compileBody(normalized),
       subgraphs: Object.fromEntries(Object.entries(normalized.subgraphs).map(([name, body]) => [name, compileBody(body)])),
+      agentTemplates: normalized.agentTemplates,
+      teams: normalized.teams,
       runtime: normalized.runtime,
     },
     diagnostics: validation.diagnostics,

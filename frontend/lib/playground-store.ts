@@ -16,7 +16,7 @@ import {
   stat,
 } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { filePreview, type PlaygroundFile, type PlaygroundMessage, type PlaygroundSession, type PlaygroundSessionSummary } from "./playground";
+import { filePreview, type PlaygroundConversationCheckpoint, type PlaygroundFile, type PlaygroundMessage, type PlaygroundSession, type PlaygroundSessionSummary } from "./playground";
 
 const SESSION_ID = /^[a-f0-9-]{36}$/;
 const FILE_ID = /^(?:file|artifact)_[a-z0-9_-]{8,80}$/;
@@ -27,18 +27,46 @@ const MAX_MESSAGES = 200;
 const MAX_METADATA_BYTES = 4 * 1_048_576;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
+const compactConversation = (
+  previous: PlaygroundConversationCheckpoint | undefined,
+  messages: readonly PlaygroundMessage[],
+): PlaygroundConversationCheckpoint | undefined => {
+  if (!messages.length) return previous;
+  const firstUser = messages.find(({ role, content }) => role === "user" && content.trim());
+  const assistants = messages.filter(({ role, content }) => role === "assistant" && content.trim());
+  const lastAssistant = assistants.at(-1);
+  const decisions = [...(previous?.decisions ?? []), ...assistants.map(({ content }) => boundedText(content.replace(/\s+/gu, " ").trim(), 1_024))].slice(-16);
+  const evidence = [...new Set([
+    ...(previous?.evidence ?? []),
+    ...messages.flatMap(({ runId, fileIds }) => [...(runId ? [`run:${runId}`] : []), ...(fileIds ?? []).map((id) => `file:${id}`)]),
+  ])].slice(-64);
+  return {
+    ...(previous?.originalRequest ? { originalRequest: previous.originalRequest }
+      : firstUser ? { originalRequest: boundedText(firstUser.content, 16_384) } : {}),
+    decisions,
+    evidence,
+    ...(lastAssistant ? { currentResult: boundedText(lastAssistant.content, 16_384) } : previous?.currentResult ? { currentResult: previous.currentResult } : {}),
+    ...(lastAssistant?.runId ? { validation: { lastRunId: lastAssistant.runId, finishReason: lastAssistant.finishReason ?? "unknown" } }
+      : previous?.validation ? { validation: previous.validation } : {}),
+    remainingWork: previous?.remainingWork ?? [],
+    compactedMessages: (previous?.compactedMessages ?? 0) + messages.length,
+  };
+};
+
 interface StoredFile extends PlaygroundFile {
   readonly storedPath: string;
   readonly sha256: string;
 }
 
 interface StoredSession extends PlaygroundSession {
-  readonly version: 1;
+  readonly version: 2;
   readonly files: readonly StoredFile[];
+  readonly activeFileIds: readonly string[];
+  readonly checkpoint?: PlaygroundConversationCheckpoint;
 }
 
-const publicFile = ({ storedPath: _storedPath, sha256: _sha256, ...file }: StoredFile): PlaygroundFile => file;
-const publicSession = ({ files: _files, version: _version, ...session }: StoredSession): PlaygroundSession => session;
+const publicFile = ({ storedPath: _storedPath, ...file }: StoredFile): PlaygroundFile => file;
+const publicSession = ({ files: _files, version: _version, checkpoint: _checkpoint, ...session }: StoredSession): PlaygroundSession => session;
 
 const locks = new Map<string, Promise<unknown>>();
 
@@ -132,8 +160,11 @@ export class FilePlaygroundStore {
     if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_METADATA_BYTES) {
       throw new Error("Playground session metadata is invalid");
     }
-    const parsed = JSON.parse(await readFile(file, "utf8")) as StoredSession;
-    if (parsed.version !== 1 || parsed.id !== id || !Array.isArray(parsed.messages) || !Array.isArray(parsed.files)) {
+    const parsed = JSON.parse(await readFile(file, "utf8")) as Omit<StoredSession, "version" | "activeFileIds"> & {
+      version: number;
+      activeFileIds?: unknown;
+    };
+    if ((parsed.version !== 1 && parsed.version !== 2) || parsed.id !== id || !Array.isArray(parsed.messages) || !Array.isArray(parsed.files)) {
       throw new Error("Playground session metadata is invalid");
     }
     const expiresAt = Date.parse(parsed.expiresAt);
@@ -142,7 +173,15 @@ export class FilePlaygroundStore {
       await rm(directory, { recursive: true, force: true });
       throw new Error("Playground session expired");
     }
-    return parsed;
+    const knownFiles = new Set(parsed.files.map(({ id: fileId }) => fileId));
+    const previousSelection: readonly string[] = parsed.version === 2 && Array.isArray(parsed.activeFileIds)
+      ? parsed.activeFileIds.filter((fileId): fileId is string => typeof fileId === "string")
+      : [...parsed.messages].reverse().find((message) => message.role === "user" && message.fileIds !== undefined)?.fileIds ?? [];
+    return {
+      ...parsed,
+      version: 2,
+      activeFileIds: [...new Set(previousSelection)].filter((fileId) => FILE_ID.test(fileId) && knownFiles.has(fileId)).slice(0, 32),
+    };
   }
 
   async #write(session: StoredSession) {
@@ -171,7 +210,7 @@ export class FilePlaygroundStore {
       createDirectory(join(directory, "artifacts"), directory),
     ]);
     const session: StoredSession = {
-      version: 1,
+      version: 2,
       id,
       title: "New conversation",
       createdAt: now.toISOString(),
@@ -179,6 +218,7 @@ export class FilePlaygroundStore {
       expiresAt: new Date(now.getTime() + RETENTION_MS).toISOString(),
       messages: [],
       files: [],
+      activeFileIds: [],
     };
     await this.#write(session);
     return publicSession(session);
@@ -186,6 +226,10 @@ export class FilePlaygroundStore {
 
   async get(id: string): Promise<PlaygroundSession> {
     return publicSession(await this.#read(id));
+  }
+
+  async checkpoint(id: string): Promise<PlaygroundConversationCheckpoint | undefined> {
+    return structuredClone((await this.#read(id)).checkpoint);
   }
 
   async list(): Promise<PlaygroundSessionSummary[]> {
@@ -228,7 +272,10 @@ export class FilePlaygroundStore {
         content: boundedText(message.content, 512 * 1_024),
         fileIds: message.fileIds?.filter((fileId) => FILE_ID.test(fileId)).slice(0, 32),
       }));
-      const all = [...current.messages, ...additions].slice(-MAX_MESSAGES);
+      const combined = [...current.messages, ...additions];
+      const removed = combined.slice(0, Math.max(0, combined.length - MAX_MESSAGES));
+      const all = combined.slice(-MAX_MESSAGES);
+      const selected = [...additions].reverse().find((message) => message.role === "user" && message.fileIds !== undefined)?.fileIds;
       const firstUser = all.find((message) => message.role === "user" && message.content.trim());
       const next: StoredSession = {
         ...current,
@@ -237,6 +284,10 @@ export class FilePlaygroundStore {
         updatedAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + RETENTION_MS).toISOString(),
         messages: all,
+        checkpoint: compactConversation(current.checkpoint, removed),
+        activeFileIds: selected === undefined
+          ? current.activeFileIds
+          : [...new Set(selected)].filter((fileId) => current.files.some(({ id: candidate }) => candidate === fileId)),
       };
       await this.#write(next);
       return publicSession(next);
@@ -259,7 +310,16 @@ export class FilePlaygroundStore {
       }
       const sha256 = createHash("sha256").update(input.content).digest("hex");
       const duplicate = session.files.find((file) => file.source === "upload" && file.sha256 === sha256);
-      if (duplicate) return publicFile(duplicate);
+      if (duplicate) {
+        if (!session.activeFileIds.includes(duplicate.id)) {
+          await this.#write({
+            ...session,
+            updatedAt: new Date().toISOString(),
+            activeFileIds: [...session.activeFileIds, duplicate.id].slice(0, 32),
+          });
+        }
+        return publicFile(duplicate);
+      }
       const fileId = `file_${sha256.slice(0, 32)}`;
       const name = safeName(input.name);
       const mimeType = safeMime(input.mimeType);
@@ -293,6 +353,7 @@ export class FilePlaygroundStore {
         updatedAt: now,
         expiresAt: new Date(Date.now() + RETENTION_MS).toISOString(),
         files: [...session.files, file],
+        activeFileIds: [...new Set([...session.activeFileIds, file.id])].slice(0, 32),
       });
       return publicFile(file);
     });
@@ -329,13 +390,34 @@ export class FilePlaygroundStore {
         updatedAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + RETENTION_MS).toISOString(),
         files: session.files.filter(({ id }) => id !== fileId),
+        activeFileIds: session.activeFileIds.filter((id) => id !== fileId),
       });
       // Metadata is authoritative; a failed unlink leaves only an unreachable file cleaned with the session.
       await rm(stored.path, { force: false }).catch(() => undefined);
     });
   }
 
-  async prepareWorkspace(sessionId: string, fileIds: readonly string[]) {
+  async setActiveFiles(sessionId: string, fileIds: readonly string[]): Promise<PlaygroundSession> {
+    return withLock(sessionId, async () => {
+      const session = await this.#read(sessionId);
+      const selected = [...new Set(fileIds)].slice(0, 32);
+      if (selected.some((fileId) => !session.files.some(({ id }) => id === fileId))) {
+        throw new Error("One or more Playground files were not found in this session");
+      }
+      const next = {
+        ...session,
+        updatedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + RETENTION_MS).toISOString(),
+        activeFileIds: selected,
+      };
+      await this.#write(next);
+      return publicSession(next);
+    });
+  }
+
+  async prepareWorkspace(sessionId: string, fileIds?: readonly string[]) {
+    const session = await this.#read(sessionId);
+    const selectedFileIds = fileIds ?? session.activeFileIds;
     const directory = await this.#sessionDirectory(sessionId);
     const workspaces = await verifiedDirectory(join(directory, "workspaces"), directory);
     const artifacts = await verifiedDirectory(join(directory, "artifacts"), directory);
@@ -346,7 +428,7 @@ export class FilePlaygroundStore {
     await chmod(inputDirectory, 0o755).catch(() => undefined);
     await chmod(outputDirectory, 0o777).catch(() => undefined);
     const selected: PlaygroundFile[] = [];
-    for (const fileId of [...new Set(fileIds)].slice(0, 32)) {
+    for (const fileId of [...new Set(selectedFileIds)].slice(0, 32)) {
       const stored = await this.#storedFile(sessionId, fileId);
       const targetName = `${stored.file.id}${extension(stored.file.name)}`;
       const target = join(inputDirectory, targetName);

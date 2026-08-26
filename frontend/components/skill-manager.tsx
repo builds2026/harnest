@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { Dialog } from "@base-ui/react/dialog";
 import { apiErrorMessage, requestJson } from "@/lib/api-client";
 import { useI18n } from "./i18n-provider";
 
-type SkillSourceKind = "local" | "git" | "package";
+type SkillSourceKind = "editor" | "upload" | "git" | "package";
 type InstalledSkill = {
   id: string;
   label: string;
@@ -20,10 +20,14 @@ export function SkillManager({ open, onClose, onChanged }: {
   onChanged: () => void | Promise<void>;
 }) {
   const { t } = useI18n();
-  const [kind, setKind] = useState<SkillSourceKind>("local");
+  const [kind, setKind] = useState<SkillSourceKind>("editor");
   const [scope, setScope] = useState<"project" | "user">("project");
   const [namespace, setNamespace] = useState<"harnest" | "agents">("harnest");
-  const [directory, setDirectory] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [instructions, setInstructions] = useState("# Instructions\n\n");
+  const [uploadedDocument, setUploadedDocument] = useState("");
+  const [uploadedName, setUploadedName] = useState("");
   const [repository, setRepository] = useState("");
   const [packageName, setPackageName] = useState("");
   const [version, setVersion] = useState("");
@@ -71,23 +75,53 @@ export function SkillManager({ open, onClose, onChanged }: {
     setBusy(true);
     setMessage("");
     try {
-      const source = kind === "local" ? { kind, directory }
-        : kind === "git" ? { kind, repository }
-          : { kind, package: packageName, ...(version ? { version } : {}) };
+      const direct = kind === "editor" || kind === "upload";
+      const document = kind === "editor"
+        ? `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n${instructions}`
+        : uploadedDocument;
+      const source = kind === "git" ? { kind, repository }
+        : kind === "package" ? { kind, package: packageName, ...(version ? { version } : {}) }
+          : undefined;
       const payload = await requestJson<{ skill: { label: string; scriptsPresent: boolean }; source: string }>("/api/skills", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source, scope, namespace, approved: kind !== "local" }),
+        body: JSON.stringify(direct
+          ? { action: "create", document, source: kind, scope, namespace }
+          : { source, scope, namespace, approved: true }),
       }, { timeoutMs: 120_000 });
       await onChanged();
       const skills = await loadInstalled();
       setMessage(`${t("skills.installed", { name: payload.skill.label, source: payload.source })}${payload.skill.scriptsPresent ? t("skills.installedReview") : ""}`);
       const installedSkill = skills.find((skill) => skill.id === payload.skill.label);
       if (installedSkill?.scriptsPresent) await review(installedSkill);
+      if (direct) {
+        setName("");
+        setDescription("");
+        setInstructions("# Instructions\n\n");
+        setUploadedDocument("");
+        setUploadedName("");
+      }
     } catch (error) {
       setMessage(apiErrorMessage(error, t("skills.installFailed"), t));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const uploadSkill = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.size === 0 || file.size > 524_288) {
+      setMessage(t("skills.uploadTooLarge"));
+      return;
+    }
+    try {
+      setUploadedDocument(await file.text());
+      setUploadedName(file.name);
+      setMessage("");
+    } catch {
+      setMessage(t("skills.uploadFailed"));
     }
   };
 
@@ -130,15 +164,16 @@ export function SkillManager({ open, onClose, onChanged }: {
       <form className="connection-form" onSubmit={submit}>
         <h3>{t("skills.add")}</h3>
         <div className="field-grid">
-          <div className="field"><label htmlFor="skill-source-kind">{t("skills.source")}</label><select id="skill-source-kind" value={kind} onChange={(event) => setKind(event.target.value as SkillSourceKind)}><option value="local">{t("skills.source.local")}</option><option value="git">{t("skills.source.git")}</option><option value="package">{t("skills.source.package")}</option></select></div>
+          <div className="field"><label htmlFor="skill-source-kind">{t("skills.source")}</label><select id="skill-source-kind" value={kind} onChange={(event) => setKind(event.target.value as SkillSourceKind)}><option value="editor">{t("skills.source.editor")}</option><option value="upload">{t("skills.source.upload")}</option><option value="git">{t("skills.source.git")}</option><option value="package">{t("skills.source.package")}</option></select></div>
           <div className="field"><label htmlFor="skill-scope">{t("skills.scope")}</label><select id="skill-scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="project">{t("connections.form.scope.project")}</option><option value="user">{t("connections.form.scope.user")}</option></select></div>
           <div className="field"><label htmlFor="skill-namespace">{t("skills.namespace")}</label><select id="skill-namespace" value={namespace} onChange={(event) => setNamespace(event.target.value as typeof namespace)}><option value="harnest">{t("skills.namespace.harnest")}</option><option value="agents">{t("skills.namespace.agents")}</option></select></div>
-          {kind === "local" && <div className="field"><label htmlFor="skill-directory">{t("skills.folder")}</label><input ref={first} id="skill-directory" required placeholder="C:\\path\\to\\skill-name" value={directory} onChange={(event) => setDirectory(event.target.value)} /><span className="field-help">{t("skills.folderHelp")}</span></div>}
+          {kind === "editor" && <><div className="field"><label htmlFor="skill-name">{t("skills.name")}</label><input ref={first} id="skill-name" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="release-review" value={name} onChange={(event) => setName(event.target.value)} /><span className="field-help">{t("skills.nameHelp")}</span></div><div className="field"><label htmlFor="skill-description">{t("skills.description")}</label><input id="skill-description" required maxLength={1024} value={description} onChange={(event) => setDescription(event.target.value)} /></div><div className="field field-span"><label htmlFor="skill-instructions">{t("skills.instructions")}</label><textarea id="skill-instructions" required rows={12} value={instructions} onChange={(event) => setInstructions(event.target.value)} /><span className="field-help">{t("skills.instructionsHelp")}</span></div></>}
+          {kind === "upload" && <div className="field field-span"><label htmlFor="skill-upload">{t("skills.upload")}</label><input ref={first} id="skill-upload" type="file" accept=".md,text/markdown,text/plain" required={!uploadedDocument} onChange={(event) => void uploadSkill(event)} /><span className="field-help">{uploadedName ? t("skills.uploadSelected", { name: uploadedName }) : t("skills.uploadHelp")}</span>{uploadedDocument && <details className="source-review"><summary>{t("skills.previewDocument")}</summary><pre>{uploadedDocument.slice(0, 16_384)}</pre></details>}</div>}
           {kind === "git" && <div className="field"><label htmlFor="skill-repository">{t("skills.repository")}</label><input ref={first} id="skill-repository" type="url" required placeholder="https://github.com/owner/skill" value={repository} onChange={(event) => setRepository(event.target.value)} /><span className="field-help">{t("skills.repositoryHelp")}</span></div>}
           {kind === "package" && <><div className="field"><label htmlFor="skill-package">{t("skills.package")}</label><input ref={first} id="skill-package" required placeholder="@scope/skill" value={packageName} onChange={(event) => setPackageName(event.target.value)} /></div><div className="field"><label htmlFor="skill-version">{t("skills.version")} <span className="optional">{t("skills.optional")}</span></label><input id="skill-version" placeholder="latest" value={version} onChange={(event) => setVersion(event.target.value)} /><span className="field-help">{t("skills.versionHelp")}</span></div></>}
-          {kind !== "local" && <div className="source-review"><span>{t("skills.safeInstall")}</span><p>{t("skills.safeInstallHelp")}</p></div>}
+          {(kind === "git" || kind === "package") && <div className="source-review"><span>{t("skills.safeInstall")}</span><p>{t("skills.safeInstallHelp")}</p></div>}
         </div>
-        <div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{t("common.cancel")}</button><button className="button button-primary" disabled={busy}>{busy ? t("skills.installing") : t("skills.install")}</button></div>
+        <div className="sheet-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{t("common.cancel")}</button><button className="button button-primary" disabled={busy || (kind === "upload" && !uploadedDocument)}>{busy ? t("skills.installing") : t(kind === "editor" || kind === "upload" ? "skills.create" : "skills.install")}</button></div>
       </form>
     </Dialog.Popup>
       </Dialog.Viewport>

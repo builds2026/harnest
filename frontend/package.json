@@ -1,34 +1,61 @@
 {
-  "name": "@harnest/studio",
-  "version": "0.1.0",
+  "name": "@harnestai/studio",
+  "version": "0.2.0-beta.1",
   "type": "module",
-  "files": ["app", "components", "lib", "next-env.d.ts", "next.config.mjs", "tsconfig.json"],
-  "exports": { "./package.json": "./package.json" },
+  "files": [
+    "app",
+    "components",
+    "i18n",
+    "lib",
+    "scripts",
+    "workers",
+    "next-env.d.ts",
+    "next.config.mjs",
+    "proxy.ts",
+    "tsconfig.json",
+    "!**/*.test.*"
+  ],
+  "exports": {
+    "./package.json": "./package.json"
+  },
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "node scripts/build.mjs",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "e2e": "playwright test",
+    "e2e:runtime": "playwright test --config playwright.runtime.config.ts",
     "e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
-    "@harnest/adapter-anthropic": "0.1.0",
-    "@harnest/adapter-gemini": "0.1.0",
-    "@harnest/adapter-local": "0.1.0",
-    "@harnest/adapter-openai": "0.1.0",
-    "@harnest/core": "0.1.0",
-    "@xyflow/react": "^12.11.3",
-    "next": "^16.3.1",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
-  },
-  "devDependencies": {
-    "@playwright/test": "^1.62.1",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
+    "@harnestai/adapter-gemini": "0.2.0-beta.1",
+    "@harnestai/adapter-local": "0.2.0-beta.1",
+    "@harnestai/adapter-openai": "0.2.0-beta.1",
+    "@harnestai/core": "0.2.0-beta.1",
+    "@harnestai/protocol": "0.2.0-beta.1",
+    "@harnestai/sdk": "0.2.0-beta.1",
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@xyflow/react": "^12.11.3",
+    "elkjs": "^0.11.0",
+    "next": "16.3.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "typescript": "^6.0.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/builds2026/harnest.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

@@ -31,6 +31,8 @@ import {
   StreamableHTTPClientTransport,
   UnauthorizedError,
   type AuthorizationServerMetadata,
+  type ElicitRequestParams,
+  type ElicitResult,
   type FetchLike,
   type OAuthClientInformationContext,
   type OAuthClientMetadata,
@@ -127,11 +129,19 @@ type WrappedKeyFile = {
   readonly version: typeof FILE_VERSION;
   readonly protection: "macos-keychain" | "linux-secret-service";
   readonly keyId: string;
+} | {
+  readonly version: typeof FILE_VERSION;
+  readonly protection: "local-file";
+  readonly key: string;
 };
 
 export interface ConnectionManagerOptions {
   readonly userDataDirectory?: string;
   readonly now?: () => Date;
+  /** 32-byte host-managed vault key for headless environments without an OS credential service. */
+  readonly credentialKey?: Uint8Array;
+  /** Allows an owner-only local key when Studio has no OS credential service. */
+  readonly allowLocalCredentialKey?: boolean;
 }
 
 export interface ConnectionTestOptions {
@@ -140,7 +150,11 @@ export interface ConnectionTestOptions {
   readonly allowProcessCommands?: readonly string[];
   readonly allowNetworkHosts?: true | readonly string[];
   readonly probe?: (profile: ConnectionProfile) => string | void | Promise<string | void>;
+  /** Per-run MCP elicitation handler. Supplying it makes the connection interactive. */
+  readonly elicitationHandler?: McpElicitationHandler;
 }
+
+export type McpElicitationHandler = (params: ElicitRequestParams) => Promise<ElicitResult>;
 
 export interface McpConnectionHandle {
   readonly client: Client;
@@ -352,6 +366,24 @@ export function credentialBackendCommand(
   );
 }
 
+/** Reads an optional base64-encoded 32-byte vault key supplied by a headless host. */
+export function credentialKeyFromEnvironment(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): Buffer | undefined {
+  const encoded = environment.HARNEST_CREDENTIAL_KEY?.trim();
+  if (!encoded) return undefined;
+  if (!/^[A-Za-z0-9+/]{43}=$/u.test(encoded)) throw new ConnectionError(
+    "CREDENTIAL_STORE_FAILED",
+    "HARNEST_CREDENTIAL_KEY must be a base64-encoded 32-byte key",
+  );
+  const key = Buffer.from(encoded, "base64");
+  if (key.byteLength !== 32) throw new ConnectionError(
+    "CREDENTIAL_STORE_FAILED",
+    "HARNEST_CREDENTIAL_KEY must be a base64-encoded 32-byte key",
+  );
+  return key;
+}
+
 async function runCredentialBackend(
   action: "store" | "lookup",
   keyId: string,
@@ -428,13 +460,20 @@ class CredentialVault {
   readonly #keyPath: string;
   readonly #lockPath: string;
   readonly #keyId: string;
+  readonly #hostKey: Buffer | undefined;
+  readonly #allowLocalKey: boolean;
   #key: Buffer | undefined;
 
-  constructor(directory: string) {
+  constructor(directory: string, hostKey?: Uint8Array, allowLocalKey = false) {
     this.#vaultPath = join(directory, "credentials.vault");
     this.#keyPath = join(directory, process.platform === "win32" ? "credentials.key.dpapi" : "credentials.key.os");
     this.#lockPath = join(directory, "credentials.lock");
     this.#keyId = createHash("sha256").update(resolve(directory)).digest("hex").slice(0, 32);
+    if (hostKey !== undefined && hostKey.byteLength !== 32) {
+      throw new ConnectionError("CREDENTIAL_STORE_FAILED", "Host credential key must contain exactly 32 bytes");
+    }
+    this.#hostKey = hostKey ? Buffer.from(hostKey) : undefined;
+    this.#allowLocalKey = allowLocalKey;
   }
 
   async read(binding: string): Promise<VaultEntry | undefined> {
@@ -458,6 +497,10 @@ class CredentialVault {
 
   async #dataKey(): Promise<Buffer> {
     if (this.#key) return this.#key;
+    if (this.#hostKey) {
+      this.#key = Buffer.from(this.#hostKey);
+      return this.#key;
+    }
     const candidate = await readJson(this.#keyPath, 16_384);
     if (candidate !== undefined) {
       if (!isRecord(candidate) || candidate.version !== FILE_VERSION) {
@@ -476,6 +519,12 @@ class CredentialVault {
           "CREDENTIAL_BACKEND_UNAVAILABLE", `This credential vault is protected by ${candidate.protection}`,
         );
         key = await runCredentialBackend("lookup", this.#keyId);
+      } else if (candidate.protection === "local-file" && typeof candidate.key === "string") {
+        const info = await stat(this.#keyPath);
+        if (process.platform !== "win32" && (info.mode & 0o077) !== 0) throw new ConnectionError(
+          "CREDENTIAL_STORE_FAILED", "The local credential key must be readable only by its owner",
+        );
+        key = credentialKeyFromEnvironment({ HARNEST_CREDENTIAL_KEY: candidate.key })!;
       } else throw new ConnectionError("CREDENTIAL_STORE_FAILED", "The wrapped credential key file is invalid");
       if (key.length !== 32) throw new ConnectionError("CREDENTIAL_STORE_FAILED", "The OS credential store returned an invalid credential key");
       this.#key = key;
@@ -490,13 +539,23 @@ class CredentialVault {
         wrappedKey: wrapped.toString("base64"),
       } satisfies WrappedKeyFile);
     } else {
-      const backend = credentialBackendCommand(process.platform, "store", this.#keyId);
-      await runCredentialBackend("store", this.#keyId, key);
-      await atomicJson(this.#keyPath, {
-        version: FILE_VERSION,
-        protection: backend.protection,
-        keyId: this.#keyId,
-      } satisfies WrappedKeyFile);
+      try {
+        const backend = credentialBackendCommand(process.platform, "store", this.#keyId);
+        await runCredentialBackend("store", this.#keyId, key);
+        await atomicJson(this.#keyPath, {
+          version: FILE_VERSION,
+          protection: backend.protection,
+          keyId: this.#keyId,
+        } satisfies WrappedKeyFile);
+      } catch (cause) {
+        if (!this.#allowLocalKey || !(cause instanceof ConnectionError)
+          || !["CREDENTIAL_BACKEND_UNAVAILABLE", "CREDENTIAL_STORE_FAILED"].includes(cause.code)) throw cause;
+        await atomicJson(this.#keyPath, {
+          version: FILE_VERSION,
+          protection: "local-file",
+          key: key.toString("base64"),
+        } satisfies WrappedKeyFile);
+      }
     }
     this.#key = key;
     return key;
@@ -709,7 +768,9 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
   if (input.kind === "provider") {
     assertConfigKeys(input.config, [
       "adapter", "model", "baseUrl", "temperature", "maxTokens",
-      "inputCostPerMillion", "outputCostPerMillion", "timeoutMs",
+      "inputCostPerMillion", "outputCostPerMillion", "cachedInputCostPerMillion",
+      "cacheWriteCostPerMillion", "cacheStorageCostPerMillionHour", "contextWindowTokens",
+      "cacheDialect", "timeoutMs",
     ], input.id);
     validatePublicConfig(input.config);
     if (typeof input.config.adapter !== "string" || !input.config.adapter
@@ -717,6 +778,22 @@ function validateProfileInput(input: ConnectionCreateInput | (ConnectionUpdateIn
       throw new ConnectionError("CONNECTION_INVALID", "Provider Connections require adapter and model ids", input.id);
     }
     if (input.config.baseUrl !== undefined) secureEndpoint(input.config.baseUrl, "Provider", input.id);
+    if (input.config.contextWindowTokens !== undefined
+      && (!Number.isInteger(input.config.contextWindowTokens) || (input.config.contextWindowTokens as number) < 1)) {
+      throw new ConnectionError("CONNECTION_INVALID", "Provider contextWindowTokens must be a positive integer", input.id);
+    }
+    if (input.config.cacheDialect !== undefined && !["auto", "native", "none"].includes(String(input.config.cacheDialect))) {
+      throw new ConnectionError("CONNECTION_INVALID", "Provider cacheDialect must be auto, native, or none", input.id);
+    }
+    for (const field of [
+      "inputCostPerMillion", "outputCostPerMillion", "cachedInputCostPerMillion",
+      "cacheWriteCostPerMillion", "cacheStorageCostPerMillionHour",
+    ]) {
+      const value = input.config[field];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+        throw new ConnectionError("CONNECTION_INVALID", `Provider ${field} must be a non-negative number`, input.id);
+      }
+    }
     validateTimeout(input.config.timeoutMs, input.id);
     return;
   }
@@ -1047,7 +1124,7 @@ export async function detectContainerEngine(): Promise<string> {
 
 export interface ContainerMount {
   readonly source: string;
-  readonly target: "/mnt/data" | "/mnt/output";
+  readonly target: "/mnt/data" | "/mnt/output" | "/workspace" | "/workspace/node_modules";
   readonly readOnly: boolean;
 }
 
@@ -1067,15 +1144,17 @@ export function containerRunArguments(
   const pids = typeof profile.config.pids === "number" ? profile.config.pids : 64;
   for (const mount of mounts) {
     if (!isAbsolute(mount.source) || mount.source.includes("\0") || mount.source.includes(",")
-      || (mount.target !== "/mnt/data" && mount.target !== "/mnt/output")) throw new ConnectionError(
+      || !["/mnt/data", "/mnt/output", "/workspace", "/workspace/node_modules"].includes(mount.target)) throw new ConnectionError(
       "CONNECTION_INVALID", "Sandbox mount is invalid", profile.id,
     );
   }
+  const hasProjectWorkspace = mounts.some(({ target }) => target === "/workspace");
   return [
     "run", "--rm", "--interactive", "--name", name, "--pull", "never", "--network", "none", "--read-only",
     "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", String(pids),
     "--memory", `${memoryMb}m`, "--cpus", String(cpus), "--stop-timeout", "1",
-    "--tmpfs", "/workspace:rw,nosuid,nodev,size=64m", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+    ...(hasProjectWorkspace ? [] : ["--tmpfs", "/workspace:rw,nosuid,nodev,size=64m"]),
+    "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
     "--workdir", "/workspace", "--user", "65534:65534",
     ...mounts.flatMap((mount) => [
       "--mount",
@@ -1151,7 +1230,11 @@ export class ConnectionManager implements ConnectionCatalog {
     this.#projectFile = join(absolute, ".harnest", "connections.json");
     const userDirectory = resolve(/* turbopackIgnore: true */ options.userDataDirectory ?? defaultUserDataDirectory());
     this.#userFile = join(userDirectory, "connections.json");
-    this.#vault = new CredentialVault(userDirectory);
+    this.#vault = new CredentialVault(
+      userDirectory,
+      options.credentialKey ?? credentialKeyFromEnvironment(),
+      options.allowLocalCredentialKey,
+    );
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -2617,6 +2700,10 @@ export async function openMcpConnection(
     {
       versionNegotiation: protocolMode(profile.config, transportType),
       listMaxPages: 16,
+      ...(options.elicitationHandler ? {
+        capabilities: { elicitation: { form: {}, url: {} } },
+        inputRequired: { autoFulfill: true },
+      } : {}),
       ...(onToolsChanged ? {
         listChanged: {
           tools: {
@@ -2628,6 +2715,10 @@ export async function openMcpConnection(
         },
       } : {}),
     },
+  );
+  if (options.elicitationHandler) client.setRequestHandler(
+    "elicitation/create",
+    ({ params }) => options.elicitationHandler!(params),
   );
   try {
     const requestOptions = {

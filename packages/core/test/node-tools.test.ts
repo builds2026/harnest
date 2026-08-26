@@ -544,7 +544,11 @@ describe("built-in tool definitions", () => {
     const root = await project();
     try {
       await mkdir(join(root, "data"));
+      await mkdir(join(root, ".harnest"));
+      await mkdir(join(root, ".harnest", "context"));
       await writeFile(join(root, "data", "note.txt"), "hello", "utf8");
+      await writeFile(join(root, ".harnest", "context", "guide.md"), "portable context", "utf8");
+      await writeFile(join(root, ".env"), "SECRET=hidden", "utf8");
       const webSearch = vi.fn(async ({ query }) => ({ query, results: [{ content: "x".repeat(3_000) }] }));
       const webScrape = vi.fn(async () => ({ content: "x".repeat(20_000) }));
       const store = new NodeToolStore({
@@ -578,6 +582,10 @@ describe("built-in tool definitions", () => {
         .resolves.toEqual({ content: "x".repeat(12_000), truncated: true });
       await expect(file.execute({ operation: "read", path: "data/note.txt" }, context))
         .resolves.toBe("hello");
+      await expect(file.execute({ operation: "read", path: ".harnest/context/guide.md" }, context))
+        .resolves.toBe("portable context");
+      await expect(file.execute({ operation: "read", path: ".env" }, context))
+        .rejects.toMatchObject({ code: "TOOL_CAPABILITY_DENIED" });
       await expect(file.execute({ operation: "read", path: "../outside.txt" }, context))
         .rejects.toMatchObject({ code: "TOOL_CAPABILITY_DENIED" });
     } finally {

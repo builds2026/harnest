@@ -1,4 +1,4 @@
-import type { HarnessSpec, TokenUsage } from "@harnest/core";
+import type { HarnessSpec, TokenUsage } from "@harnestai/core";
 
 export type PlaygroundMessageRole = "user" | "assistant";
 
@@ -21,6 +21,18 @@ export interface PlaygroundSession {
   readonly updatedAt: string;
   readonly expiresAt: string;
   readonly messages: readonly PlaygroundMessage[];
+  /** Durable files reused by later messages until the user changes the selection. */
+  readonly activeFileIds?: readonly string[];
+}
+
+export interface PlaygroundConversationCheckpoint {
+  readonly originalRequest?: string;
+  readonly decisions: readonly string[];
+  readonly evidence: readonly string[];
+  readonly currentResult?: string;
+  readonly validation?: Readonly<Record<string, unknown>>;
+  readonly remainingWork: readonly string[];
+  readonly compactedMessages: number;
 }
 
 export interface PlaygroundSessionSummary extends Omit<PlaygroundSession, "messages"> {
@@ -33,6 +45,7 @@ export interface PlaygroundFile {
   readonly name: string;
   readonly mimeType: string;
   readonly size: number;
+  readonly sha256?: string;
   readonly source: "upload" | "artifact" | "sandbox";
   readonly createdAt: string;
   readonly sandboxPath?: string;
@@ -63,6 +76,8 @@ export interface PlaygroundCapabilities {
   readonly plugins: readonly PlaygroundPlugin[];
   readonly attachments: {
     readonly enabled: boolean;
+    /** The graph can pass supported media directly to a multimodal Agent model. */
+    readonly directModelInput: boolean;
     readonly maxFiles: number;
     readonly maxFileBytes: number;
     readonly accepted: string;
@@ -75,7 +90,7 @@ export interface PlaygroundOverrides {
   readonly model?: Pick<PlaygroundModelOption, "componentKey" | "connectionId">;
 }
 
-const graphBodies = (spec: Extract<HarnessSpec, { version: "0.2" }>) => [
+const graphBodies = (spec: Exclude<HarnessSpec, { version: "0.1" }>) => [
   { key: "root", body: spec },
   ...Object.entries(spec.subgraphs ?? {}).map(([name, body]) => ({ key: `subgraph:${name}`, body })),
 ];
@@ -88,6 +103,7 @@ export function playgroundCapabilities(spec: HarnessSpec): PlaygroundCapabilitie
     plugins: [],
     attachments: {
       enabled: false,
+      directModelInput: false,
       maxFiles: 32,
       maxFileBytes: 64 * 1_048_576,
       accepted: "image/*,video/*,audio/*,.pdf,.csv,.tsv,.json,.txt,.md,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip",
@@ -141,15 +157,20 @@ export function playgroundCapabilities(spec: HarnessSpec): PlaygroundCapabilitie
     ];
   });
   const codeRunner = plugins.some((plugin) => plugin.id === "builtin.code-runner");
+  const directModelInput = components.some(({ component }) => component.type === "agent"
+    && component.config.multimodal !== false);
   return {
     models,
     plugins,
     attachments: {
-      enabled: codeRunner,
+      enabled: codeRunner || directModelInput,
+      directModelInput,
       maxFiles: 32,
       maxFileBytes: 64 * 1_048_576,
       accepted: "image/*,video/*,audio/*,.pdf,.csv,.tsv,.json,.txt,.md,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip",
-      ...(!codeRunner ? { reason: "Attach a Code Runner to this harness to work with files." } : {}),
+      ...(!codeRunner && !directModelInput
+        ? { reason: "Enable multimodal input on an Agent or attach a Code Runner to work with files." }
+        : {}),
     },
   };
 }

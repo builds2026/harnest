@@ -28,4 +28,4 @@ connections:
 entrypoint: output
 runtime:
   timeoutMs: 30000
-  adapters: ["@harnest/adapter-openai"]
+  adapters: ["@harnestai/adapter-openai"]

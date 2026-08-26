@@ -115,7 +115,7 @@ export function missingConnectionSetup(
   components: readonly { type: string; config: Readonly<Record<string, unknown>> }[],
   connections: readonly ConnectionSummary[],
   tools: readonly { id: string; connectionKinds?: readonly ConnectionKind[] }[],
-): { id: string; kind: ConnectionKind } | undefined {
+): { id?: string; kind: ConnectionKind } | undefined {
   for (const component of components) {
     const tool = component.type === "tool" ? tools.find((item) => item.id === component.config.tool) : undefined;
     const kind: ConnectionKind | undefined = component.type === "model" ? "provider"
@@ -127,6 +127,7 @@ export function missingConnectionSetup(
     const ids = component.type === "model"
       ? [component.config.connectionId, component.config.fallbackConnectionId]
       : [component.config.connectionId];
+    if (kind && (typeof ids[0] !== "string" || !ids[0])) return { kind };
     for (const value of ids) {
       if (typeof value !== "string" || !value) continue;
       const saved = connections.find((connection) => connection.id === value);

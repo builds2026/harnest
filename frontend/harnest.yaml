@@ -1,0 +1,588 @@
+components:
+  - id: routing_model
+    type: model
+    config:
+      adapter: gemini
+      model: gemini-3.5-flash-lite
+      connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      fallbackConnectionId: connection_5ee47671c7b845d9b31e3a5b7c8d0b75
+      cacheDialect: auto
+  - id: routing_prompt
+    type: prompt
+    config:
+      template: "{{input}}"
+  - id: classify
+    type: classifier
+    config:
+      routes:
+        - direct
+        - research
+        - engineering
+      fallback: engineering
+      minConfidence: 0.65
+  - id: direct
+    type: subgraph
+    config:
+      subgraph: direct_agent
+  - id: research_team
+    type: team
+    config:
+      team: engineering
+  - id: engineering_team
+    type: team
+    config:
+      team: engineering
+  - id: result
+    type: join
+    config:
+      mode: concat
+      separator: |+
+
+  - id: output
+    type: output
+    config:
+      format: text
+connections:
+  - id: routing_model
+    from:
+      component: routing_model
+      port: model
+    to:
+      component: classify
+      port: model
+  - id: routing_prompt
+    from:
+      component: routing_prompt
+      port: prompt
+    to:
+      component: classify
+      port: prompt
+  - id: direct_route
+    from:
+      component: classify
+      port: decision
+    to:
+      component: direct
+      port: value
+    condition:
+      path: /route
+      op: equals
+      value: direct
+    select: /value
+  - id: research_route
+    from:
+      component: classify
+      port: decision
+    to:
+      component: research_team
+      port: value
+    condition:
+      path: /route
+      op: equals
+      value: research
+    select: /value
+  - id: engineering_route
+    from:
+      component: classify
+      port: decision
+    to:
+      component: engineering_team
+      port: value
+    condition:
+      path: /route
+      op: equals
+      value: engineering
+    select: /value
+  - id: direct_result
+    from:
+      component: direct
+      port: value
+    to:
+      component: result
+      port: values
+  - id: research_result
+    from:
+      component: research_team
+      port: value
+    to:
+      component: result
+      port: values
+  - id: engineering_result
+    from:
+      component: engineering_team
+      port: value
+    to:
+      component: result
+      port: values
+  - id: final_output
+    from:
+      component: result
+      port: value
+    to:
+      component: output
+      port: value
+entrypoint: output
+version: "0.3"
+subgraphs:
+  direct_agent:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            Answer the original request directly and concisely. The request is in value.
+
+            {{input}}
+      - id: agent
+        type: agent
+        config:
+          maxTurns: 10
+          maxToolCalls: 32
+          toolError: model
+      - id: output
+        type: output
+        config:
+          format: text
+    connections:
+      - id: model
+        from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - id: prompt
+        from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - id: output
+        from:
+          component: agent
+          port: response
+        to:
+          component: output
+          port: value
+    entrypoint: output
+  chief_agent:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            You are the Team orchestrator. For phase=plan, create a minimal dependency-aware task list using researcher, coder, and reviewer. For phase=synthesize, return only the verified final answer.
+
+            {{input}}
+      - id: agent
+        type: agent
+        config:
+          maxTurns: 10
+          maxToolCalls: 32
+          toolError: model
+      - id: output
+        type: output
+        config:
+          format: json
+          schema:
+            type: object
+            properties:
+              status:
+                enum:
+                  - direct
+                  - tasks
+                  - complete
+              finalAnswer: {}
+              tasks:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    goal:
+                      type: string
+                    agent:
+                      type: string
+                    dependsOn:
+                      type: array
+                      items:
+                        type: string
+                  required:
+                    - id
+                    - goal
+                    - agent
+    connections:
+      - id: model
+        from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - id: prompt
+        from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - id: output
+        from:
+          component: agent
+          port: response
+        to:
+          component: output
+          port: value
+    entrypoint: output
+  research_agent:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            Gather current evidence with Web Search. Send concise findings to the Team and report a sourced result.
+
+            {{input}}
+      - id: tool
+        type: tool
+        config:
+          tool: builtin.web-search
+          source: builtin
+          risk: external
+          connectionId: connection_4441a04975f54922ae89ca636560fc3f
+      - id: agent
+        type: agent
+        config:
+          maxTurns: 10
+          maxToolCalls: 32
+          toolError: model
+      - id: output
+        type: output
+        config:
+          format: text
+    connections:
+      - id: model
+        from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - id: prompt
+        from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - id: tool
+        from:
+          component: tool
+          port: tool
+        to:
+          component: agent
+          port: tools
+      - id: output
+        from:
+          component: agent
+          port: response
+        to:
+          component: output
+          port: value
+    entrypoint: output
+  coding_agent:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            Use the isolated Code Runner only when execution materially verifies the task. Report artifacts and concise results.
+
+            {{input}}
+      - id: tool
+        type: tool
+        config:
+          tool: builtin.code-runner
+          source: builtin
+          risk: destructive
+          connectionId: connection_ecb61c73be3b44f095479ecf2c6ac411
+      - id: agent
+        type: agent
+        config:
+          maxTurns: 10
+          maxToolCalls: 32
+          toolError: model
+      - id: output
+        type: output
+        config:
+          format: text
+    connections:
+      - id: model
+        from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - id: prompt
+        from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - id: tool
+        from:
+          component: tool
+          port: tool
+        to:
+          component: agent
+          port: tools
+      - id: output
+        from:
+          component: agent
+          port: response
+        to:
+          component: output
+          port: value
+    entrypoint: output
+  review_agent:
+    components:
+      - id: model
+        type: model
+        config:
+          adapter: gemini
+          model: gemini-2.5-flash
+          connectionId: connection_988cc68f59e24468aefff30d3e4f3d20
+      - id: prompt
+        type: prompt
+        config:
+          template: |-
+            Review completed work for correctness, missing evidence, and unmet requirements. Propose a plan update when necessary.
+
+            {{input}}
+      - id: agent
+        type: agent
+        config:
+          maxTurns: 10
+          maxToolCalls: 32
+          toolError: model
+      - id: output
+        type: output
+        config:
+          format: text
+    connections:
+      - id: model
+        from:
+          component: model
+          port: model
+        to:
+          component: agent
+          port: model
+      - id: prompt
+        from:
+          component: prompt
+          port: prompt
+        to:
+          component: agent
+          port: prompt
+      - id: output
+        from:
+          component: agent
+          port: response
+        to:
+          component: output
+          port: value
+    entrypoint: output
+agentTemplates:
+  chief:
+    description: Plans, delegates, accepts bounded revisions, and synthesizes the user answer
+    runner:
+      subgraph: chief_agent
+  researcher:
+    description: Finds and cites current external evidence
+    capabilities:
+      - network
+    runner:
+      subgraph: research_agent
+  coder:
+    description: Runs isolated code and produces artifacts
+    capabilities:
+      - process
+      - workspace-write
+    runner:
+      subgraph: coding_agent
+  reviewer:
+    description: Checks evidence and goal completion
+    runner:
+      subgraph: review_agent
+teams:
+  engineering:
+    orchestrator: chief
+    members:
+      - researcher
+      - coder
+      - reviewer
+    limits:
+      maxInstances: 8
+      maxDepth: 2
+      maxParallel: 4
+      maxMessages: 64
+      maxPlanRevisions: 16
+runtime:
+  timeoutMs: 600000
+  budget:
+    maxTokens: 1000000
+studio:
+  positions:
+    routing_model:
+      x: 60
+      y: 40
+    routing_prompt:
+      x: 60
+      y: 220
+    classify:
+      x: 348.38325171624416
+      y: 233.42707568033208
+    direct:
+      x: 740
+      y: 20
+    research_team:
+      x: 740
+      y: 190
+    engineering_team:
+      x: 740
+      y: 360
+    result:
+      x: 1090
+      y: 190
+    output:
+      x: 1400
+      y: 190
+  pinned:
+    - classify
+  viewport:
+    x: -359.6658557951051
+    y: -40.79003389299052
+    zoom: 0.7718309352520414
+  direction: RIGHT
+  subgraphs:
+    direct_agent:
+      positions:
+        model:
+          x: 40
+          y: 30
+        prompt:
+          x: 40
+          y: 210
+        agent:
+          x: 390
+          y: 130
+        output:
+          x: 720
+          y: 130
+      viewport:
+        x: 110.23275862068965
+        y: -43.366379310344826
+        zoom: 0.9191810344827587
+      direction: RIGHT
+    chief_agent:
+      positions:
+        model:
+          x: 40
+          y: 30
+        prompt:
+          x: 40
+          y: 210
+        agent:
+          x: 390
+          y: 130
+        output:
+          x: 720
+          y: 130
+      viewport:
+        x: 69.23275862068965
+        y: 116.63362068965517
+        zoom: 0.9191810344827587
+      direction: RIGHT
+    research_agent:
+      positions:
+        model:
+          x: 40
+          y: 30
+        prompt:
+          x: 40
+          y: 210
+        tool:
+          x: 40
+          y: 390
+        agent:
+          x: 390
+          y: 130
+        output:
+          x: 720
+          y: 130
+      direction: RIGHT
+    coding_agent:
+      positions:
+        model:
+          x: 40
+          y: 30
+        prompt:
+          x: 40
+          y: 210
+        tool:
+          x: 48.00738902518043
+          y: 382.5411051558925
+        agent:
+          x: 390
+          y: 130
+        output:
+          x: 720
+          y: 130
+      viewport:
+        x: 109.34686431246666
+        y: 64.69614398750117
+        zoom: 0.734656392022357
+      direction: RIGHT
+    review_agent:
+      positions:
+        model:
+          x: 40
+          y: 30
+        prompt:
+          x: 40
+          y: 210
+        agent:
+          x: 390
+          y: 130
+        output:
+          x: 720
+          y: 130
+      direction: RIGHT

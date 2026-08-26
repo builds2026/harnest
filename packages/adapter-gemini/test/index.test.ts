@@ -1,4 +1,4 @@
-import type { AdapterContext, ModelEvent, ModelRequest } from "@harnest/core";
+import type { AdapterContext, ModelEvent, ModelRequest, PromptCacheEntry } from "@harnestai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createGeminiAdapter } from "../src/index.js";
@@ -11,6 +11,27 @@ async function collect(iterable: AsyncIterable<ModelEvent>): Promise<ModelEvent[
 
 describe("Gemini adapter", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("maps first-class image and PDF input parts", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response('data: {"candidates":[{"finishReason":"STOP"}]}\n\n');
+    }));
+    await collect(createGeminiAdapter().run({
+      model: "gemini-test",
+      messages: [{ role: "user", content: [
+        { type: "text", text: "Inspect these" },
+        { type: "media", mimeType: "image/png", data: "aW1hZ2U=" },
+        { type: "media", mimeType: "application/pdf", data: "cGRm" },
+      ] }],
+    }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
+    expect(body).toMatchObject({ contents: [{ parts: [
+      { text: "Inspect these" },
+      { inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } },
+      { inlineData: { mimeType: "application/pdf", data: "cGRm" } },
+    ] }] });
+  });
 
   it("maps streamGenerateContent SSE and supports URL/version overrides", async () => {
     let receivedUrl = "";
@@ -35,7 +56,11 @@ describe("Gemini adapter", () => {
         { role: "user", content: "Hello" },
         { role: "assistant", content: "Previous" },
       ],
-      responseSchema: { type: "object" },
+      responseSchema: {
+        type: "object",
+        properties: { value: { type: "object", additionalProperties: { type: "string" } } },
+        additionalProperties: false,
+      },
     };
     const context: AdapterContext = {
       signal: new AbortController().signal,
@@ -61,7 +86,7 @@ describe("Gemini adapter", () => {
       ],
       generationConfig: {
         responseMimeType: "application/json",
-        responseSchema: { type: "object" },
+        responseSchema: { type: "object", properties: { value: { type: "object" } } },
       },
     });
   });
@@ -96,6 +121,7 @@ describe("Gemini adapter", () => {
           additionalProperties: false,
         },
       }],
+      responseSchema: { type: "object", properties: { result: { type: "string" } } },
     }, { signal: new AbortController().signal, resolveSecret: () => "secret" }));
 
     expect(events).toEqual([
@@ -123,6 +149,7 @@ describe("Gemini adapter", () => {
         { role: "user", parts: [{ functionResponse: { id: "old", name: "sum", response: { output: "1" } } }] },
       ],
     });
+    expect(body).not.toHaveProperty("generationConfig.responseMimeType");
   });
 
   it("keeps fallback function-call IDs unique across requests", async () => {
@@ -140,6 +167,62 @@ describe("Gemini adapter", () => {
       { type: "tool-call", call: { id: "gemini-1-0:0:sum", name: "sum", input: {} } },
       { type: "tool-call", call: { id: "gemini-2-0:0:sum", name: "sum", input: {} } },
     ]);
+  });
+
+  it("creates and reuses explicit cachedContents while mapping cached token usage", async () => {
+    const entries = new Map<string, PromptCacheEntry>();
+    const bodies: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push({ url, body });
+      if (url.endsWith("/v1beta/cachedContents")) return Response.json({
+        name: "cachedContents/cache_123",
+        expireTime: new Date(Date.now() + 3_600_000).toISOString(),
+        usageMetadata: { totalTokenCount: 100 },
+      });
+      return new Response([
+        'data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":110,"cachedContentTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":115}}',
+        "",
+      ].join("\n\n"));
+    }));
+    const request: ModelRequest = {
+      model: "gemini-test",
+      messages: [
+        { role: "system", content: "Stable system" },
+        { role: "user", content: "Stable document" },
+        { role: "user", content: "Question" },
+      ],
+      promptCache: { mode: "explicit", key: "a".repeat(64), prefixMessageCount: 2 },
+    };
+    const context: AdapterContext = {
+      signal: new AbortController().signal,
+      resolveSecret: () => "secret",
+      promptCache: {
+        get: async (key) => entries.get(key),
+        set: async (entry) => { entries.set(entry.key, entry); },
+        delete: async (key) => { entries.delete(key); },
+      },
+    };
+
+    const first = await collect(createGeminiAdapter().run(request, context));
+    const second = await collect(createGeminiAdapter().run(request, context));
+
+    expect(first).toEqual(expect.arrayContaining([
+      { type: "cache", status: "write", mode: "explicit", cacheWriteInputTokens: 100 },
+      { type: "usage", usage: { inputTokens: 210, outputTokens: 5, totalTokens: 215, cachedInputTokens: 100, cacheWriteInputTokens: 100 } },
+    ]));
+    expect(second).toEqual(expect.arrayContaining([
+      { type: "cache", status: "hit", mode: "explicit", cachedInputTokens: 100 },
+      { type: "usage", usage: { inputTokens: 110, outputTokens: 5, totalTokens: 115, cachedInputTokens: 100 } },
+    ]));
+    expect(bodies.filter(({ url }) => url.endsWith("/v1beta/cachedContents"))).toHaveLength(1);
+    expect(bodies.filter(({ body }) => body.cachedContent === "cachedContents/cache_123")).toHaveLength(2);
+    expect(bodies.find(({ url }) => url.endsWith("/v1beta/cachedContents"))?.body).toMatchObject({
+      systemInstruction: { parts: [{ text: "Stable system" }] },
+      contents: [{ role: "user", parts: [{ text: "Stable document" }] }],
+      ttl: "3600s",
+    });
   });
 
   it("rejects oversized function-call arguments", async () => {

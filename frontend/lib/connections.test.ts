@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { connectionOperationForAction } from "./connections";
+import { connectionOperationForAction, missingConnectionSetup, type ConnectionSummary } from "./connections";
+
+const provider: ConnectionSummary = {
+  id: "gemini", name: "Gemini", kind: "provider", scope: "project", status: "connected",
+  config: {}, credentialFields: [], credentialPresence: {},
+};
+
+describe("missingConnectionSetup", () => {
+  it("reports an unbound component even when a compatible connection exists", () => {
+    expect(missingConnectionSetup([{ type: "model", config: {} }], [provider], []))
+      .toEqual({ kind: "provider" });
+  });
+
+  it("accepts a bound compatible component", () => {
+    expect(missingConnectionSetup([{ type: "model", config: { connectionId: "gemini" } }], [provider], []))
+      .toBeUndefined();
+  });
+});
 
 describe("connection operation feedback", () => {
   it("maps server actions to stable transient phases", () => {

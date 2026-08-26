@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import {
   DiagnosticError,
   HarnessRuntime,
   validateSpec,
   type RunEvent,
-} from "@harnest/core";
-import { loadSpecFile } from "@harnest/core/node";
+} from "@harnestai/core";
+import { acquireRunExecutionLease, loadSpecFile, releaseRunExecutionLease } from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "../../../../lib/api-server";
-import { approvalBroker } from "../../../../lib/approval-broker";
+import { runRegistry } from "../../../../lib/run-registry";
 import { applyPlaygroundOverrides, playgroundCapabilities, type PlaygroundFile, type PlaygroundModelOption } from "../../../../lib/playground";
 import { playgroundStore } from "../../../../lib/playground-store";
 import { diagnosticResponse, harnessFile, hasErrors, runtimeOptionsFor, runtimeResourcesFor } from "../../../../lib/server";
@@ -52,6 +53,8 @@ export async function POST(request: Request) {
     readonly files: PlaygroundFile[];
   } | undefined;
   let activeSessionId: string | undefined;
+  let leasedRunId: string | undefined;
+  let leaseTransferred = false;
   const store = playgroundStore(harnessFile());
   try {
     assertSameOrigin(request);
@@ -63,7 +66,12 @@ export async function POST(request: Request) {
     const sessionId = text(input.sessionId, "Session id", 64);
     activeSessionId = sessionId;
     const message = text(input.message, "Message", 65_536);
-    const fileIds = stringList(input.fileIds, "File selection", 32);
+    const resumeRunId = input.resumeRunId === undefined ? undefined : text(input.resumeRunId, "Resume run id", 128);
+    if (resumeRunId && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(resumeRunId)) {
+      throw new ApiRequestError("PLAYGROUND_INPUT_INVALID", "Resume run id is invalid");
+    }
+    const requestedFileIds = stringList(input.fileIds, "File selection", 32);
+    const hasFileSelection = Object.hasOwn(input, "fileIds");
     const disabledPluginKeys = stringList(input.disabledPluginKeys, "Plugin selection", 128);
     const model = modelSelection(input.model);
     const loaded = await loadSpecFile(harnessFile());
@@ -71,16 +79,18 @@ export async function POST(request: Request) {
     const capabilities = playgroundCapabilities(loaded.spec);
     const enabledCodeRunner = capabilities.plugins.some((plugin) => plugin.id === "builtin.code-runner"
       && !disabledPluginKeys.includes(plugin.componentKey));
-    if (fileIds.length && !enabledCodeRunner) throw new ApiRequestError(
+    const session = await store.get(sessionId);
+    const conversationCheckpoint = await store.checkpoint(sessionId);
+    const fileIds = hasFileSelection ? requestedFileIds : [...(session.activeFileIds ?? [])];
+    if (fileIds.length && !enabledCodeRunner && !capabilities.attachments.directModelInput) throw new ApiRequestError(
       "PLAYGROUND_ATTACHMENTS_UNSUPPORTED",
-      "This harness must enable its Code Runner before files can be sent",
+      "This harness must enable multimodal Agent input or its Code Runner before files can be sent",
       422,
     );
-    const session = await store.get(sessionId);
+    await store.setActiveFiles(sessionId, fileIds);
     const candidate = applyPlaygroundOverrides(loaded.spec, { disabledPluginKeys, ...(model ? { model } : {}) });
-    if (enabledCodeRunner) workspace = await store.prepareWorkspace(sessionId, fileIds);
+    if (enabledCodeRunner || fileIds.length) workspace = await store.prepareWorkspace(sessionId, fileIds);
     resources = await runtimeResourcesFor(candidate, {
-      requestToolApproval: (approval, context) => approvalBroker.request(approval, context.signal),
       ...(workspace ? { sandboxWorkspace: {
         inputDirectory: workspace.inputDirectory,
         outputDirectory: workspace.outputDirectory,
@@ -106,24 +116,28 @@ export async function POST(request: Request) {
       createdAt: new Date().toISOString(),
       ...(fileIds.length ? { fileIds } : {}),
     };
-    await store.append(sessionId, [userMessage]);
+    if (!resumeRunId) await store.append(sessionId, [userMessage]);
     const runtimeInstance = new HarnessRuntime(candidate, resources.adapters, runtimeOptionsFor(resources));
-    const iterator = runtimeInstance.stream(message, {
-      signal: request.signal,
+    const resumeSnapshot = resumeRunId ? await resources.runs.readSnapshot(resumeRunId) : undefined;
+    if (resumeRunId && !resumeSnapshot) throw new ApiRequestError("RUN_SNAPSHOT_NOT_FOUND", "Run snapshot was not found", 404);
+    const executionRunId = resumeRunId ?? randomUUID();
+    await acquireRunExecutionLease(dirname(harnessFile()), executionRunId);
+    leasedRunId = executionRunId;
+    const runOptions = {
       session: {
+        id: sessionId,
         messages: session.messages.map(({ role, content }) => ({ role, content })),
+        ...(conversationCheckpoint ? { checkpoint: conversationCheckpoint } : {}),
         attachments: workspace?.files ?? [],
         ...(workspace ? { sandboxOutputPath: "/mnt/output" } : {}),
-        maxHistoryMessages: 20,
-        maxHistoryBytes: 65_536,
       },
-    })[Symbol.asyncIterator]();
-    const encoder = new TextEncoder();
-    let terminal = false;
+    };
+    const handle = resumeSnapshot
+      ? runtimeInstance.resume(message, resumeSnapshot, runOptions)
+      : runtimeInstance.start(message, runOptions, executionRunId);
     let finalized = false;
     let runId: string | undefined;
-    let pendingNext: Promise<IteratorResult<RunEvent>> | undefined;
-    const runWorkspace = workspace;
+    const runWorkspace = enabledCodeRunner ? workspace : undefined;
     const finalize = async (event?: RunEvent): Promise<PlaygroundFile[]> => {
       if (finalized) return [];
       finalized = true;
@@ -140,6 +154,7 @@ export async function POST(request: Request) {
             usage: event.usage,
             costUsd: event.costUsd,
             finishReason: event.finishReason,
+            ...(files.length ? { fileIds: files.map(({ id }) => id) } : {}),
           }]);
         } else if (event?.type === "error") {
           await store.append(sessionId, [{
@@ -156,6 +171,42 @@ export async function POST(request: Request) {
       }
       return files;
     };
+    let resolveFinalization!: (files: PlaygroundFile[]) => void;
+    const finalization = new Promise<PlaygroundFile[]>((resolve) => { resolveFinalization = resolve; });
+    runRegistry.add(handle, async () => {
+      try {
+        const result = await handle.result();
+        resolveFinalization(await finalize({
+          type: "run-end",
+          runId: result.runId,
+          timestamp: new Date().toISOString(),
+          output: result.output,
+          state: result.state,
+          usage: result.usage,
+          costUsd: result.costUsd,
+          iterations: result.iterations,
+          durationMs: result.durationMs,
+          finishReason: result.finishReason,
+          artifacts: result.artifacts,
+        }));
+      } catch (error) {
+        resolveFinalization(await finalize({
+          type: "error",
+          runId: handle.runId,
+          timestamp: new Date().toISOString(),
+          code: error && typeof error === "object" && "code" in error ? String(error.code) : "PLAYGROUND_RUN_FAILED",
+          message: error instanceof Error ? error.message : "Playground run failed",
+          retryable: false,
+        }));
+      } finally {
+        await releaseRunExecutionLease(dirname(harnessFile()), handle.runId);
+      }
+    });
+    leaseTransferred = true;
+    const iterator = (runRegistry.stream(handle.runId, 0, [], request.signal) as unknown as AsyncIterable<RunEvent>)[Symbol.asyncIterator]();
+    const encoder = new TextEncoder();
+    let terminal = false;
+    let pendingNext: Promise<IteratorResult<RunEvent>> | undefined;
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         if (terminal) { controller.close(); return; }
@@ -198,7 +249,7 @@ export async function POST(request: Request) {
           if (event.type === "run-start") runId = event.runId;
           controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
           if (event.type === "run-end" || event.type === "error") {
-            const files = await finalize(event);
+            const files = await finalization;
             if (files.length) controller.enqueue(encoder.encode(`${JSON.stringify({
               type: "playground-files",
               timestamp: new Date().toISOString(),
@@ -224,14 +275,6 @@ export async function POST(request: Request) {
       },
       async cancel() {
         await iterator.return?.();
-        await finalize({
-          type: "error",
-          runId: runId ?? `playground_${randomUUID()}`,
-          timestamp: new Date().toISOString(),
-          code: "PLAYGROUND_CANCELLED",
-          message: "Run cancelled",
-          retryable: false,
-        });
       },
     });
     return new Response(stream, {
@@ -242,6 +285,7 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    if (leasedRunId && !leaseTransferred) await releaseRunExecutionLease(dirname(harnessFile()), leasedRunId).catch(() => undefined);
     if (workspace && activeSessionId) await store.cleanupWorkspace(activeSessionId, workspace.workspaceId).catch(() => undefined);
     await resources?.services.close();
     return apiErrorResponse(error instanceof ApiRequestError ? error : new ApiRequestError(

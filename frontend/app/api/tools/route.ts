@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { StoredToolManifest } from "@harnest/core/node";
+import type { StoredToolManifest } from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
 import { EMPTY_SPEC } from "@/lib/default-spec";
 import { runtimeResourcesFor } from "@/lib/server";

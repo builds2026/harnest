@@ -16,6 +16,7 @@ export interface ApiErrorResponse {
 }
 
 export function classifyApiError(code: string, status: number): Required<Pick<ApiErrorDetails, "category" | "recoverable" | "action">> {
+  if (/^CREDENTIAL_(?:BACKEND_UNAVAILABLE|STORE_FAILED)$/.test(code)) return { category: "server", recoverable: true, action: "open-settings" };
   if (/AUTH|CREDENTIAL|TOKEN|OAUTH/.test(code) || status === 401) return { category: "auth", recoverable: true, action: "reauth" };
   if (/SCOPE|PERMISSION|APPROVAL|HOST|ORIGIN/.test(code) || status === 403) return { category: "permission", recoverable: true, action: "open-settings" };
   if (/TIMEOUT/.test(code) || status === 408 || status === 504) return { category: "timeout", recoverable: true, action: "retry" };

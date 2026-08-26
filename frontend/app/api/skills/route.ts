@@ -7,7 +7,7 @@ import {
   skillInstallSourceKey,
   type SkillCatalogEntry,
   type SkillInstallSource,
-} from "@harnest/core/node";
+} from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
 import { harnessFile } from "@/lib/server";
 
@@ -55,7 +55,7 @@ export async function GET(request?: Request) {
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
-    const body = record(await readJsonBody(request, 65_536), "Skill install");
+    const body = record(await readJsonBody(request, 600_000), "Skill install");
     if (body.action === "approve-scripts") {
       if (typeof body.skill !== "string" || !Array.isArray(body.scripts) || body.scripts.length > 128) {
         throw new ApiRequestError("SKILL_SCRIPT_APPROVAL_INVALID", "Skill script approval is invalid");
@@ -70,6 +70,27 @@ export async function POST(request: Request) {
         approved.push(await skillStore.approveScript(body.skill, script.path, script.sha256));
       }
       return Response.json({ scripts: approved });
+    }
+    if (body.action === "create") {
+      if (typeof body.document !== "string" || Buffer.byteLength(body.document, "utf8") > 524_288
+        || (body.source !== undefined && body.source !== "editor" && body.source !== "upload")) {
+        throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill document is invalid");
+      }
+      if (body.scope !== undefined && body.scope !== "project" && body.scope !== "user") {
+        throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill scope must be project or user");
+      }
+      if (body.namespace !== undefined && body.namespace !== "agents" && body.namespace !== "harnest") {
+        throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill namespace is invalid");
+      }
+      const skill = await store().create(body.document, {
+        ...(typeof body.scope === "string" ? { scope: body.scope as "project" | "user" } : {}),
+        ...(typeof body.namespace === "string" ? { namespace: body.namespace as "agents" | "harnest" } : {}),
+        ...(typeof body.source === "string" ? { source: body.source as "editor" | "upload" } : {}),
+      });
+      return Response.json({
+        skill: safeSkill(skill),
+        source: body.source === "upload" ? "SKILL.md upload" : "Studio editor",
+      }, { status: 201 });
     }
     if (body.scope !== "project" && body.scope !== "user") {
       throw new ApiRequestError("SKILL_INSTALL_INVALID", "Skill scope must be project or user");

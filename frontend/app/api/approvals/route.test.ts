@@ -45,4 +45,49 @@ describe("Studio approval API", () => {
     await pending;
     expect(response.status).toBe(200);
   });
+
+  it("returns an always decision for the exact pending Tool call", async () => {
+    const controller = new AbortController();
+    const pending = approvalBroker.request({
+      runId: "run-always",
+      nodeId: "agent",
+      callId: "call-always",
+      turn: 1,
+      tool: {
+        id: "builtin.shell",
+        label: "Shell",
+        description: "Run a command",
+        inputSchema: { type: "object" },
+        risk: "destructive",
+        connectionId: "runtime_a",
+      },
+      input: { command: "node" },
+    }, controller.signal);
+    const headers = {
+      host: "127.0.0.1:3000",
+      origin: "http://127.0.0.1:3000",
+      "content-type": "application/json",
+    };
+    const inspected = await POST(new Request("http://127.0.0.1:3000/api/approvals", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "inspect", runId: "run-always", nodeId: "agent", callId: "call-always", turn: 1 }),
+    }));
+    const view = await inspected.json() as { approval: { inputDigest: string; connectionId: string } };
+    expect(view.approval.connectionId).toBe("runtime_a");
+    const decided = await POST(new Request("http://127.0.0.1:3000/api/approvals", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        runId: "run-always",
+        nodeId: "agent",
+        callId: "call-always",
+        turn: 1,
+        inputDigest: view.approval.inputDigest,
+        decision: "always",
+      }),
+    }));
+    expect(decided.status).toBe(200);
+    await expect(pending).resolves.toMatchObject({ approved: true, mode: "allow_always" });
+  });
 });

@@ -52,7 +52,11 @@ const server = createServer(async (incoming, outgoing) => {
   }
 });
 
-server.listen(0, "127.0.0.1", () => {
+const requestedPort = Number(process.env.PORT ?? "0");
+if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
+  throw new Error("PORT must be an integer from 0 to 65535");
+}
+server.listen(requestedPort, "127.0.0.1", () => {
   const address = server.address();
   if (address && typeof address === "object") process.stdout.write(`PORT ${address.port}\n`);
 });

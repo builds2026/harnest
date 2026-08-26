@@ -1,11 +1,14 @@
-import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnestai/core";
 import type {
   AdapterContext,
   ModelAdapter,
   ModelEvent,
+  ModelContentPart,
+  ModelMessage,
   ModelRequest,
+  PromptCacheEntry,
   TokenUsage,
-} from "@harnest/core";
+} from "@harnestai/core";
 
 const DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/";
 const DEFAULT_API_KEY = "env:GEMINI_API_KEY";
@@ -25,9 +28,23 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+const textContent = (content: string | readonly ModelContentPart[]): string => typeof content === "string"
+  ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+
+const contentParts = (content: string | readonly ModelContentPart[]): unknown[] => typeof content === "string"
+  ? (content ? [{ text: content }] : [])
+  : content.map((part) => part.type === "text"
+    ? { text: part.text }
+    : { inlineData: { mimeType: part.mimeType, data: part.data } });
+
 function endpoint(baseUrl: string, version: string, model: string): URL {
   const modelId = model.startsWith("models/") ? model.slice("models/".length) : model;
   const path = `${version}/models/${encodeURIComponent(modelId)}:streamGenerateContent?alt=sse`;
+  return new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
+}
+
+function cacheEndpoint(baseUrl: string, version: string, resource?: string): URL {
+  const path = resource ? `${version}/${resource}` : `${version}/cachedContents`;
   return new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
 }
 
@@ -56,6 +73,8 @@ function usage(value: unknown): TokenUsage | undefined {
     typeof metadata.candidatesTokenCount === "number" ? metadata.candidatesTokenCount : undefined;
   const totalTokens =
     typeof metadata.totalTokenCount === "number" ? metadata.totalTokenCount : undefined;
+  const cachedInputTokens =
+    typeof metadata.cachedContentTokenCount === "number" ? metadata.cachedContentTokenCount : undefined;
   if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) {
     return undefined;
   }
@@ -63,6 +82,7 @@ function usage(value: unknown): TokenUsage | undefined {
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
   };
 }
 
@@ -106,9 +126,10 @@ async function throwHttpError(response: Response, adapterId: string): Promise<ne
   } catch {
     // Keep the normalized HTTP fallback.
   }
+  const contextOverflow = /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message);
   throw new AdapterError(message, {
     adapterId,
-    code,
+    code: contextOverflow ? "context_overflow" : code,
     status: response.status,
     retryable: response.status === 429 || response.status >= 500,
     ...(requestId === undefined ? {} : { requestId }),
@@ -123,8 +144,8 @@ function requireBody(response: Response, adapterId: string): ReadableStream<Uint
   });
 }
 
-function providerContents(request: ModelRequest): unknown[] {
-  return request.messages
+function providerContents(messages: readonly ModelMessage[]): unknown[] {
+  return messages
     .filter((message) => message.role !== "system")
     .map((message) => {
       if (message.role === "tool") return {
@@ -133,14 +154,14 @@ function providerContents(request: ModelRequest): unknown[] {
           functionResponse: {
             ...(message.toolCallId ? { id: message.toolCallId } : {}),
             name: message.name,
-            response: { output: message.content },
+            response: { output: textContent(message.content) },
           },
         }],
       };
       return {
         role: message.role === "assistant" ? "model" : "user",
         parts: [
-          ...(message.content ? [{ text: message.content }] : []),
+          ...contentParts(message.content),
           ...(message.role === "assistant" ? (message.toolCalls ?? []).map((call) => {
             const metadata = asRecord(call.providerMetadata);
             return {
@@ -185,54 +206,157 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
+    capabilities: {
+      streaming: true,
+      json: true,
+      cancellation: true,
+      tools: true,
+      inputMedia: ["image", "audio", "video", "pdf"],
+      promptCaching: ["automatic", "explicit"],
+    },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const requestId = requestSequence += 1;
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
-      const system = request.messages
+      const baseUrl = request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL;
+      const apiVersion = options.apiVersion ?? "v1beta";
+      const providerFetch = context.fetch ?? fetch;
+      const headers = {
+        "content-type": "application/json",
+        ...(apiKey === undefined ? {} : { "x-goog-api-key": apiKey }),
+      };
+      const systemFor = (messages: readonly ModelMessage[]) => messages
         .filter((message) => message.role === "system")
-        .map((message) => message.content)
+        .map((message) => textContent(message.content))
         .join("\n\n");
-      const contents = providerContents(request);
+      const providerTools = request.tools?.length ? [{ functionDeclarations: request.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parametersJsonSchema: geminiToolSchema(tool.inputSchema),
+      })) }] : undefined;
       const generationConfig = {
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
         ...(request.maxTokens === undefined ? {} : { maxOutputTokens: request.maxTokens }),
-        ...(request.responseSchema === undefined
+        ...(request.responseSchema === undefined || providerTools
           ? {}
-          : { responseMimeType: "application/json", responseSchema: request.responseSchema }),
+          : { responseMimeType: "application/json", responseSchema: geminiToolSchema(request.responseSchema) }),
       };
-      const body = {
-        contents,
-        ...(request.tools?.length ? {
-          tools: [{ functionDeclarations: request.tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description,
-            parametersJsonSchema: geminiToolSchema(tool.inputSchema),
-          })) }],
-        } : {}),
-        ...(system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } }),
+      const regularBody = () => {
+        const system = systemFor(request.messages);
+        return {
+          contents: providerContents(request.messages),
+          ...(providerTools ? { tools: providerTools } : {}),
+          ...(system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } }),
+          ...(Object.keys(generationConfig).length === 0 ? {} : { generationConfig }),
+        };
+      };
+      const send = (body: unknown) => providerFetch(endpoint(baseUrl, apiVersion, request.model), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: context.signal,
+      });
+
+      let explicitEntry: PromptCacheEntry | undefined;
+      let cacheWriteInputTokens: number | undefined;
+      if (request.promptCache?.mode === "explicit") {
+        if (!context.promptCache) {
+          yield { type: "cache", status: "bypass", mode: "explicit", reason: "The host has no prompt cache registry" };
+        } else {
+          const stored = await context.promptCache.get(request.promptCache.key);
+          if (stored?.adapterId === id && stored.model === request.model) {
+            explicitEntry = stored;
+            yield {
+              type: "cache",
+              status: "hit",
+              mode: "explicit",
+              ...(stored.cachedInputTokens === undefined ? {} : { cachedInputTokens: stored.cachedInputTokens }),
+            };
+          } else {
+            const prefix = request.messages.slice(0, request.promptCache.prefixMessageCount);
+            const cacheSystem = systemFor(prefix);
+            const cacheBody = {
+              model: request.model.startsWith("models/") ? request.model : `models/${request.model}`,
+              ...(providerContents(prefix).length ? { contents: providerContents(prefix) } : {}),
+              ...(providerTools ? { tools: providerTools } : {}),
+              ...(cacheSystem ? { systemInstruction: { parts: [{ text: cacheSystem }] } } : {}),
+              ttl: "3600s",
+            };
+            let cacheResponse: Response;
+            try {
+              cacheResponse = await providerFetch(cacheEndpoint(baseUrl, apiVersion), {
+                method: "POST",
+                headers,
+                body: JSON.stringify(cacheBody),
+                signal: context.signal,
+              });
+            } catch (cause) {
+              throw new AdapterError("Gemini explicit cache could not reach the provider", {
+                adapterId: id,
+                code: "network_error",
+                retryable: true,
+                cause,
+              });
+            }
+            if (!cacheResponse.ok) {
+              let cacheError: AdapterError | undefined;
+              try { await throwHttpError(cacheResponse, id); } catch (cause) {
+                cacheError = cause instanceof AdapterError ? cause : new AdapterError("Gemini cache creation failed", {
+                  adapterId: id,
+                  code: "provider_error",
+                  cause,
+                });
+              }
+              if (!cacheError) throw new AdapterError("Gemini cache creation failed", {
+                adapterId: id,
+                code: "provider_error",
+              });
+              if (cacheError.code === "context_overflow" || cacheError.retryable) throw cacheError;
+              yield { type: "cache", status: "bypass", mode: "explicit", reason: cacheError.message };
+            } else {
+              let created: Record<string, unknown> | undefined;
+              try { created = asRecord(JSON.parse(await readBoundedResponseText(cacheResponse)) as unknown); } catch { /* handled below */ }
+              const resource = typeof created?.name === "string" && /^cachedContents\/[A-Za-z0-9._-]+$/u.test(created.name)
+                ? created.name : undefined;
+              const expiresAt = typeof created?.expireTime === "string" && Number.isFinite(Date.parse(created.expireTime))
+                ? created.expireTime : new Date(Date.now() + 3_600_000).toISOString();
+              const cacheUsage = asRecord(created?.usageMetadata);
+              cacheWriteInputTokens = typeof cacheUsage?.totalTokenCount === "number"
+                ? cacheUsage.totalTokenCount : undefined;
+              if (!resource) throw new AdapterError("Gemini returned an invalid explicit cache resource", {
+                adapterId: id,
+                code: "invalid_response",
+              });
+              explicitEntry = {
+                key: request.promptCache.key,
+                adapterId: id,
+                model: request.model,
+                resource,
+                createdAt: new Date().toISOString(),
+                expiresAt,
+                ...(cacheWriteInputTokens === undefined ? {} : { cachedInputTokens: cacheWriteInputTokens }),
+              };
+              await context.promptCache.set(explicitEntry);
+              yield {
+                type: "cache",
+                status: "write",
+                mode: "explicit",
+                ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+              };
+            }
+          }
+        }
+      }
+
+      const explicitBody = explicitEntry && request.promptCache ? {
+        cachedContent: explicitEntry.resource,
+        contents: providerContents(request.messages.slice(request.promptCache.prefixMessageCount)),
         ...(Object.keys(generationConfig).length === 0 ? {} : { generationConfig }),
-      };
+      } : undefined;
 
       let response: Response;
       try {
-        response = await (context.fetch ?? fetch)(
-          endpoint(
-            request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL,
-            options.apiVersion ?? "v1beta",
-            request.model,
-          ),
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              ...(apiKey === undefined ? {} : { "x-goog-api-key": apiKey }),
-            },
-            body: JSON.stringify(body),
-            signal: context.signal,
-          },
-        );
+        response = await send(explicitBody ?? regularBody());
       } catch (cause) {
         throw new AdapterError("Gemini request could not reach the provider", {
           adapterId: id,
@@ -240,6 +364,18 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
           retryable: true,
           cause,
         });
+      }
+      if (response.status === 404 && explicitEntry && request.promptCache && context.promptCache) {
+        await context.promptCache.delete(request.promptCache.key);
+        yield { type: "cache", status: "bypass", mode: "explicit", reason: "The Provider cache expired; this request used the full prompt" };
+        try { response = await send(regularBody()); } catch (cause) {
+          throw new AdapterError("Gemini request could not reach the provider", {
+            adapterId: id,
+            code: "network_error",
+            retryable: true,
+            cause,
+          });
+        }
       }
       if (!response.ok) await throwHttpError(response, id);
 
@@ -260,9 +396,11 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
         const root = asRecord(payload);
         if (root?.error !== undefined) {
           const details = errorDetails(root);
-          throw new AdapterError(details.message ?? "Gemini stream failed", {
+          const message = details.message ?? "Gemini stream failed";
+          throw new AdapterError(message, {
             adapterId: id,
-            code: details.code ?? "provider_error",
+            code: /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message)
+              ? "context_overflow" : details.code ?? "provider_error",
           });
         }
 
@@ -299,7 +437,20 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ModelAd
         finalUsage = usage(root?.usageMetadata) ?? finalUsage;
       }
 
+      if (cacheWriteInputTokens !== undefined) finalUsage = {
+        ...(finalUsage ?? {}),
+        inputTokens: (finalUsage?.inputTokens ?? 0) + cacheWriteInputTokens,
+        totalTokens: (finalUsage?.totalTokens
+          ?? (finalUsage?.inputTokens ?? 0) + (finalUsage?.outputTokens ?? 0)) + cacheWriteInputTokens,
+        cacheWriteInputTokens,
+      };
       if (finalUsage) yield { type: "usage", usage: finalUsage };
+      if (request.promptCache?.mode === "automatic") yield {
+        type: "cache",
+        status: (finalUsage?.cachedInputTokens ?? 0) > 0 ? "hit" : "miss",
+        mode: "automatic",
+        ...(finalUsage?.cachedInputTokens === undefined ? {} : { cachedInputTokens: finalUsage.cachedInputTokens }),
+      };
       if (!reason) throw new AdapterError("Gemini stream ended without a finish reason", {
         adapterId: id,
         code: "invalid_stream",

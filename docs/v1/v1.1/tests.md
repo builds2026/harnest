@@ -10,7 +10,7 @@
 | `npm run typecheck` | PASS, 전체 package build graph + Studio `tsc --noEmit` |
 | `npm test` | PASS, 11 source test files / 59 tests |
 | `npm run build` | PASS, package build + Next.js 16.3.1 production build |
-| `npm pack --workspace @harnest/studio --dry-run` | PASS, 25 files, 33.3 kB package |
+| `npm pack --workspace @harnestai/studio --dry-run` | PASS, 25 files, 33.3 kB package |
 
 Production build는 `/`, `/api/spec`, `/api/validate`, `/api/run`, `/api/test`, `/api/runs`를 생성했다.
 

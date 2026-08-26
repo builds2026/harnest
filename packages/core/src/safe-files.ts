@@ -8,6 +8,25 @@ const inside = (root: string, target: string): boolean => {
   return path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path);
 };
 
+const PORTABLE_HARNEST_PATHS = new Set([
+  "project.json", "studio.json", "prompts", "skills", "context", "schemas", "tests", "tools", "config",
+]);
+const SAFE_DOT_FILES = new Set([".editorconfig", ".env.example", ".gitignore"]);
+
+export function isSensitiveWorkspacePath(root: string, target: string): boolean {
+  const segments = relative(root, target).split(sep).filter(Boolean);
+  if (!segments.length || !inside(root, target)) return true;
+  if (segments[0] === ".harnest") {
+    if (!PORTABLE_HARNEST_PATHS.has(segments[1] ?? "")) return true;
+    if (segments.slice(2).some((segment) => segment.startsWith(".") && segment !== ".harnest-provenance.json")) return true;
+  } else if (segments.some((segment) => segment.startsWith(".") && !SAFE_DOT_FILES.has(segment))) {
+    return true;
+  }
+  return segments.some((segment) =>
+    /^(?:credentials?|secrets?|service[-_]?account|firebase[-_]?adminsdk|id_(?:dsa|ecdsa|ed25519|rsa))(?:[._-]|$)/i.test(segment)
+    || /\.(?:jks|key|keystore|p12|pfx|pem)$/i.test(segment));
+}
+
 const sameFile = (left: Stats, right: Stats): boolean =>
   left.ino !== 0 && left.ino === right.ino && (process.platform === "win32" || left.dev === right.dev);
 

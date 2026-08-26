@@ -6,7 +6,7 @@
 
 - Studio는 React Flow controlled graph를 사용하고 HarnessSpec을 유일한 의미 원본으로 유지한다. Palette drag/drop은 브라우저 기본 HTML Drag and Drop API를 쓴다.
 - YAML 편집 중 문법 오류가 나도 마지막 정상 graph를 보존하고, parse 성공 시에만 전체 Spec을 교체한다.
-- Next.js App Router Route Handler를 로컬 BFF로 사용한다. 저장·검증·실행은 모두 `@harnest/core`를 호출하며 실행 스트림은 NDJSON `ReadableStream`으로 전달한다.
+- Next.js App Router Route Handler를 로컬 BFF로 사용한다. 저장·검증·실행은 모두 `@harnestai/core`를 호출하며 실행 스트림은 NDJSON `ReadableStream`으로 전달한다.
 - Core는 단일 `AsyncIterable` 실행 경로만 제공한다. `invoke`는 같은 스트림을 수집하므로 streaming/non-streaming 로직이 갈라지지 않는다.
 - Provider SDK를 Core에 넣지 않는다. OpenAI-compatible, Anthropic, Gemini, Ollama Adapter는 별도 패키지이고, Spec에 명시한 모듈만 동적 로드한다.
 - MCP는 이번 단계에서 사용하지 않는 의존성을 추가하지 않고 Core/CLI의 프로그래밍 API를 재사용할 확장점만 둔다.

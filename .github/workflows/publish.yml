@@ -1,0 +1,355 @@
+name: Publish SDKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: npm dist-tag and version stability
+        required: true
+        type: choice
+        options: [next, latest]
+        default: next
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify-channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release channel and versions
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          paths = [*[f"packages/{root}/package.json" for root in ["protocol", "core", "adapter-anthropic", "adapter-gemini", "adapter-local", "adapter-openai", "sdk"]], "frontend/package.json", "packages/cli/package.json"]
+          manifests = [json.loads(Path(path).read_text()) for path in paths]
+          versions = {manifest["name"]: manifest["version"] for manifest in manifests}
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f"npm package versions differ: {', '.join(versions.values())}")
+
+          npm_version = next(iter(versions.values()))
+          match = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-beta\.(\d+))?", npm_version)
+          if not match:
+              raise SystemExit(f"unsupported npm release version: {npm_version}")
+          expected_python = match[1] + (f"b{match[2]}" if match[2] else "")
+          python_version = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]["version"]
+          if python_version != expected_python:
+              raise SystemExit(f"npm {npm_version} requires Python {expected_python}, found {python_version}")
+
+          prerelease = match[2] is not None
+          if (os.environ["CHANNEL"] == "next") != prerelease:
+              raise SystemExit(f"channel {os.environ['CHANNEL']} does not match npm {npm_version} / Python {python_version}")
+
+          for manifest in manifests:
+              for section in ("dependencies", "optionalDependencies", "peerDependencies"):
+                  for name, dependency_version in manifest.get(section, {}).items():
+                      if name in versions and dependency_version != versions[name]:
+                          raise SystemExit(f"{manifest['name']} has {name}@{dependency_version}; expected {versions[name]}")
+          print(f"verified {npm_version} / {python_version} on {os.environ['CHANNEL']}")
+          PY
+
+  verify-npm:
+    needs: verify-channel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install --global npm@latest
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Verify packed npm packages in a clean project
+        run: |
+          packs="$RUNNER_TEMP/harnest-npm-packs"
+          clean="$RUNNER_TEMP/harnest-npm-clean"
+          mkdir -p "$packs" "$clean"
+          for package in protocol core adapter-anthropic adapter-gemini adapter-local adapter-openai sdk studio cli; do
+            npm pack --workspace "@harnestai/$package" --pack-destination "$packs"
+          done
+          for archive in "$packs"/*.tgz; do
+            if tar -tzf "$archive" | grep -Eq '^package/test/|(^|/)(tests|e2e|\.next)(/|$)|\.test\.[^/]+$|\.tsbuildinfo$'; then
+              echo "Unexpected build/test files in $archive" >&2
+              exit 1
+            fi
+          done
+          cd "$clean"
+          npm init -y >/dev/null
+          npm install "$packs"/*.tgz
+          HARNEST_FIXTURE="$GITHUB_WORKSPACE/packages/protocol/fixtures/v1.json" node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          import {
+            CreateRunRequestSchema, IdempotencyKeySchema, InteractionRequestSchema,
+            PermissionScopeSchema, RunCommandSchema, WireEnvelopeSchema,
+          } from "@harnestai/protocol";
+
+          const fixture = JSON.parse(await readFile(process.env.HARNEST_FIXTURE, "utf8"));
+          IdempotencyKeySchema.parse(fixture.idempotencyKey);
+          CreateRunRequestSchema.parse(fixture.createRun);
+          WireEnvelopeSchema.parse(fixture.event);
+          InteractionRequestSchema.parse(fixture.interaction);
+          RunCommandSchema.parse(fixture.command);
+          PermissionScopeSchema.parse(fixture.permission.scope);
+          await Promise.all([
+            import("@harnestai/core"), import("@harnestai/core/browser"), import("@harnestai/core/node"),
+            import("@harnestai/adapter-anthropic"), import("@harnestai/adapter-gemini"),
+            import("@harnestai/adapter-local"), import("@harnestai/adapter-openai"),
+            import("@harnestai/sdk"), import("@harnestai/sdk/node"),
+          ]);
+          JSON.parse(await readFile("node_modules/@harnestai/studio/package.json", "utf8"));
+          NODE
+          ./node_modules/.bin/harnest --help >/dev/null
+          ./node_modules/.bin/harnest studio "$GITHUB_WORKSPACE/harnest.yaml" --port 48764 >"$RUNNER_TEMP/harnest-studio.log" 2>&1 &
+          studio_pid=$!
+          trap 'kill "$studio_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 200); do
+            node -e 'fetch("http://127.0.0.1:48764/v1/capabilities").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' && break
+            sleep 0.1
+          done
+          node -e 'fetch("http://127.0.0.1:48764/v1/capabilities").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))'
+          kill -TERM "$studio_pid"
+          wait "$studio_pid"
+          trap - EXIT
+          node node_modules/@harnestai/protocol/fixtures/runtime-server.mjs 48765 >"$RUNNER_TEMP/harnest-runtime-fixture.log" 2>&1 &
+          fixture_pid=$!
+          trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 100); do
+            node -e 'fetch("http://127.0.0.1:48765/state").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' && break
+            sleep 0.05
+          done
+          node --input-type=module <<'NODE'
+          import { HarnestClient } from "@harnestai/sdk";
+
+          const client = new HarnestClient("http://127.0.0.1:48765");
+          const created = await client.create("release check", { idempotencyKey: "release/ts-1" });
+          let interaction;
+          for await (const event of client.events(created.runId)) {
+            if (event.type === "interaction.requested") { interaction = event; break; }
+          }
+          if (!interaction) throw new Error("TypeScript client missed the Interaction event");
+          const snapshot = await client.snapshotState(created.runId);
+          if (!snapshot.active || snapshot.snapshot.status !== "paused") throw new Error("TypeScript snapshot did not preserve pause");
+          await client.respond(created.runId, {
+            interactionId: interaction.data.id,
+            checkpointDigest: interaction.data.checkpoint.digest,
+            action: "submit",
+            permission: "allow_once",
+          });
+          const result = await client.wait(created.runId, { after: interaction.sequence });
+          if (result.output !== "release fixture complete") throw new Error("TypeScript wait did not return the terminal result");
+          await client.cancel(created.runId);
+          const state = await fetch("http://127.0.0.1:48765/state").then((response) => response.json());
+          if (!state.cancelled || state.commands[0]?.type !== "interaction.response"
+            || state.cursors[1]?.after !== interaction.sequence
+            || state.cursors[1]?.lastEventId !== String(interaction.sequence)) {
+            throw new Error("TypeScript reconnect, command, or cancel behavior differed");
+          }
+          NODE
+          kill "$fixture_pid"
+          wait "$fixture_pid"
+          trap - EXIT
+          cd "$GITHUB_WORKSPACE"
+          CLEAN_PROJECT="$clean" BROWSER_BUNDLE="$RUNNER_TEMP/harnest-sdk-browser.mjs" node --input-type=module <<'NODE'
+          import { build } from "esbuild";
+          await build({
+            stdin: { contents: 'import { HarnestClient } from "@harnestai/sdk"; import * as CoreBrowser from "@harnestai/core/browser"; globalThis.HarnestClient = HarnestClient; globalThis.HarnestCore = CoreBrowser;', resolveDir: process.env.CLEAN_PROJECT },
+            bundle: true,
+            platform: "browser",
+            format: "esm",
+            outfile: process.env.BROWSER_BUNDLE,
+          });
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/harnest-npm-packs/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-python:
+    needs: verify-channel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --project python --extra test pytest -q
+      - run: uv build --project python
+      - name: Verify Python artifacts and clean install
+        run: |
+          python - <<'PY'
+          import tarfile
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          version = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]["version"]
+          wheel = Path(f"python/dist/harnestai-{version}-py3-none-any.whl")
+          sdist = Path(f"python/dist/harnestai-{version}.tar.gz")
+          if not wheel.is_file() or not sdist.is_file():
+              raise SystemExit(f"missing Python artifacts for {version}")
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_files = set(archive.namelist())
+          wheel_prefix = f"harnestai-{version}.dist-info/"
+          expected_wheel = {
+              "harnestai/__init__.py", "harnestai/client.py", "harnestai/models.py", "harnestai/sse.py",
+              wheel_prefix + "licenses/LICENSE", wheel_prefix + "METADATA", wheel_prefix + "RECORD", wheel_prefix + "WHEEL",
+          }
+          if wheel_files != expected_wheel:
+              raise SystemExit(f"unexpected wheel contents: {sorted(wheel_files ^ expected_wheel)}")
+          with tarfile.open(sdist) as archive:
+              sdist_files = set(archive.getnames())
+          sdist_prefix = f"harnestai-{version}/"
+          expected_sdist = {
+              sdist_prefix + "LICENSE", sdist_prefix + "README.md", sdist_prefix + "pyproject.toml", sdist_prefix + "PKG-INFO",
+              *{sdist_prefix + f"src/harnestai/{name}" for name in ("__init__.py", "client.py", "models.py", "sse.py")},
+          }
+          if sdist_files != expected_sdist:
+              raise SystemExit(f"unexpected sdist contents: {sorted(sdist_files ^ expected_sdist)}")
+          print(f"verified wheel and sdist allowlists for {version}")
+          PY
+          uv venv "$RUNNER_TEMP/harnest-wheel"
+          uv pip install --python "$RUNNER_TEMP/harnest-wheel/bin/python" python/dist/*.whl
+          HARNEST_FIXTURE="$PWD/packages/protocol/fixtures/v1.json" "$RUNNER_TEMP/harnest-wheel/bin/python" - <<'PY'
+          import json
+          import os
+          import tomllib
+          from importlib.metadata import version
+          from pathlib import Path
+
+          from pydantic import TypeAdapter
+          from harnestai import CreateRunRequest, IdempotencyKey, InteractionRequest, InteractionResponse, PermissionScope, WireEnvelope
+
+          fixture = json.loads(Path(os.environ["HARNEST_FIXTURE"]).read_text())
+          expected_version = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]["version"]
+          assert version("harnestai") == expected_version
+          assert TypeAdapter(IdempotencyKey).validate_python(fixture["idempotencyKey"]) == fixture["idempotencyKey"]
+          assert CreateRunRequest.model_validate(fixture["createRun"]).to_dict() == fixture["createRun"]
+          assert WireEnvelope.model_validate(fixture["event"]).to_dict() == fixture["event"]
+          assert InteractionRequest.model_validate(fixture["interaction"]).to_dict() == fixture["interaction"]
+          assert InteractionResponse.model_validate(fixture["command"]["response"]).to_dict() == fixture["command"]["response"]
+          assert PermissionScope.model_validate(fixture["permission"]["scope"]).to_dict() == fixture["permission"]["scope"]
+          print("verified clean Python wheel import and protocol fixture")
+          PY
+          node packages/protocol/fixtures/runtime-server.mjs 48765 >"$RUNNER_TEMP/harnest-runtime-fixture.log" 2>&1 &
+          fixture_pid=$!
+          trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 100); do
+            "$RUNNER_TEMP/harnest-wheel/bin/python" -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:48765/state")' && break
+            sleep 0.05
+          done
+          "$RUNNER_TEMP/harnest-wheel/bin/python" - <<'PY'
+          import asyncio
+          import json
+          import urllib.request
+
+          from harnestai import AsyncHarnestClient, HarnestClient
+
+          base = "http://127.0.0.1:48765"
+
+          def state():
+              return json.load(urllib.request.urlopen(base + "/state"))
+
+          def reset():
+              urllib.request.urlopen(urllib.request.Request(base + "/reset", data=b"{}", method="POST")).read()
+
+          with HarnestClient(base) as client:
+              created = client.create("release check", idempotency_key="release/python-sync-1")
+              interaction = next(event for event in client.events(created.run_id) if event.type == "interaction.requested")
+              assert client.snapshot_state(created.run_id).active is True
+              client.respond(created.run_id, {
+                  "interactionId": interaction.data["id"],
+                  "checkpointDigest": interaction.data["checkpoint"]["digest"],
+                  "action": "submit",
+                  "permission": "allow_once",
+              })
+              assert client.wait(created.run_id, after=interaction.sequence)["output"] == "release fixture complete"
+              client.cancel(created.run_id)
+          sync_state = state()
+          assert sync_state["cancelled"] and sync_state["commands"][0]["type"] == "interaction.response"
+          assert sync_state["cursors"][1] == {"after": 1, "lastEventId": "1"}
+
+          reset()
+
+          async def verify_async():
+              async with AsyncHarnestClient(base) as client:
+                  created = await client.create("release check", idempotency_key="release/python-async-1")
+                  interaction = None
+                  async for event in client.events(created.run_id):
+                      if event.type == "interaction.requested":
+                          interaction = event
+                          break
+                  assert interaction is not None
+                  await client.respond(created.run_id, {
+                      "interactionId": interaction.data["id"],
+                      "checkpointDigest": interaction.data["checkpoint"]["digest"],
+                      "action": "submit",
+                      "permission": "allow_once",
+                  })
+                  assert (await client.wait(created.run_id, after=interaction.sequence))["output"] == "release fixture complete"
+                  await client.cancel(created.run_id)
+
+          asyncio.run(verify_async())
+          async_state = state()
+          assert async_state["cancelled"] and async_state["commands"][0]["type"] == "interaction.response"
+          assert async_state["cursors"][1] == {"after": 1, "lastEventId": "1"}
+          PY
+          kill "$fixture_pid"
+          wait "$fixture_pid"
+          trap - EXIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: python/dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-npm:
+    needs: [verify-npm, verify-python]
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@latest
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: packages
+      - name: Publish verified npm packages
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          for package in protocol core adapter-anthropic adapter-gemini adapter-local adapter-openai sdk studio cli; do
+            archive=(packages/harnestai-$package-*.tgz)
+            test "${#archive[@]}" -eq 1 && test -f "${archive[0]}"
+            npm publish "${archive[0]}" --access public --provenance --tag "$CHANNEL"
+          done
+
+  publish-python:
+    needs: [verify-npm, verify-python]
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-packages
+          path: python/dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist/

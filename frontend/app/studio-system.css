@@ -119,6 +119,40 @@ button:active:not(:disabled) {
   background: var(--accent);
 }
 
+.surface-tabs a {
+  position: relative;
+  display: grid;
+  min-width: 88px;
+  place-items: center;
+  padding: 0 14px;
+  color: var(--header-muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.surface-tabs a::after {
+  position: absolute;
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: transparent;
+  content: "";
+}
+
+.surface-tabs a:hover,
+.surface-tabs a.is-active {
+  color: var(--header-text);
+  background: var(--header-surface);
+}
+
+.surface-tabs a.is-active::after {
+  background: var(--accent);
+}
+
 .continuity-step {
   color: var(--header-muted);
 }
@@ -147,6 +181,17 @@ button:active:not(:disabled) {
   border-radius: var(--radius-sm);
   color: var(--header-muted);
   background: var(--header-surface);
+  text-decoration: none;
+}
+
+.settings-trigger.is-active {
+  border-color: var(--accent);
+  color: var(--header-text);
+}
+
+.studio-shell.is-runs {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 56px minmax(0, 1fr);
 }
 
 .settings-trigger:hover {
@@ -348,16 +393,107 @@ button:active:not(:disabled) {
   color: var(--text-primary);
   background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
   box-shadow: var(--shadow-sm);
+  max-width: calc(100% - 28px);
+  flex-wrap: wrap;
 }
 
 .catalog-toggle,
-.canvas-history button {
+.canvas-history button,
+.canvas-layout-tools button {
   height: 29px;
   border-color: var(--border);
   border-radius: var(--radius-xs);
   color: var(--text-primary);
   background: var(--surface-raised);
   font-size: 11px;
+}
+
+.canvas-layout-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding-left: 5px;
+  border-left: 1px solid var(--border);
+}
+
+.canvas-mode {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface-muted);
+}
+
+.canvas-mode button {
+  min-height: 25px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.canvas-mode button.is-active {
+  color: var(--text-primary);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-xs);
+}
+
+.canvas-layout-tools button {
+  min-width: 29px;
+  padding: 0 8px;
+}
+
+.canvas-layout-tools button.is-active,
+.canvas-layout-tools button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.canvas-layout-tools select {
+  max-width: 132px;
+  height: 29px;
+  border-color: var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface-raised);
+}
+
+.canvas-panel.is-placing {
+  cursor: crosshair;
+}
+
+.canvas-panel.is-placing::after {
+  position: absolute;
+  z-index: 7;
+  inset: 10px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 64%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  pointer-events: none;
+  content: "";
+}
+
+.canvas-drag-ghost {
+  position: fixed;
+  z-index: 1000;
+  translate: 14px 14px;
+  padding: 8px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
+  box-shadow: var(--shadow-md);
+  font-size: 12px;
+  font-weight: 650;
+  pointer-events: none;
+}
+
+.canvas-panel.is-auto-layouting .react-flow__node {
+  transition: transform 300ms cubic-bezier(.2, .8, .2, 1);
 }
 
 .catalog-toggle {
@@ -377,6 +513,54 @@ button:active:not(:disabled) {
 
 .react-flow__edge-path {
   stroke: var(--text-tertiary);
+  stroke-width: 1.5;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.h-edge.is-condition {
+  stroke: var(--warning);
+  stroke-dasharray: 5 4;
+}
+
+.h-edge.is-task {
+  stroke: var(--accent);
+}
+
+.h-edge.is-handoff {
+  stroke: var(--success);
+  stroke-width: 2;
+}
+
+.h-edge.is-message {
+  stroke: var(--info);
+  stroke-dasharray: 3 5;
+}
+
+.h-edge.is-running {
+  stroke-width: 2.5;
+  stroke-dasharray: 7 5;
+  animation: h-edge-flow 700ms linear infinite;
+}
+
+@keyframes h-edge-flow {
+  to { stroke-dashoffset: -12; }
+}
+
+.h-edge-label {
+  position: absolute;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  box-shadow: var(--shadow-xs);
+  font-size: 9px;
+  line-height: 1.4;
+  pointer-events: all;
 }
 
 .react-flow__edge-text {
@@ -395,11 +579,12 @@ button:active:not(:disabled) {
 }
 
 .h-node {
+  width: 248px;
   border-color: var(--border-strong);
-  border-radius: var(--radius-md);
+  border-radius: 12px;
   color: var(--text-primary);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-sm);
+  background: color-mix(in srgb, var(--surface-raised) 96%, var(--node-color) 4%);
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--text-primary) 9%, transparent);
 }
 
 .react-flow__node.selected .h-node {
@@ -419,7 +604,131 @@ button:active:not(:disabled) {
 
 .node-header,
 :root[data-theme="dark"] .node-header {
-  background: var(--surface-muted);
+  min-height: 50px;
+  padding: 8px 10px;
+  background: linear-gradient(110deg, color-mix(in srgb, var(--node-color) 9%, var(--surface-raised)), var(--surface-raised) 66%);
+}
+
+.node-header::before {
+  width: 4px;
+  border-radius: 4px 0 0 4px;
+}
+
+.node-glyph {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--node-color) 10%, var(--surface-raised));
+}
+
+.node-pinned {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.h-node.is-waiting {
+  border-color: var(--warning);
+}
+
+.h-node.is-cancelled {
+  opacity: .62;
+}
+
+.node-state.is-waiting {
+  background: var(--warning);
+}
+
+.node-state.is-cancelled {
+  background: var(--text-tertiary);
+}
+
+.live-activity {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.live-activity section {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.live-activity label,
+.live-feed h3,
+.live-run-identity span {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.live-activity textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.live-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.live-run-identity code {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.live-metrics {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.live-metrics span {
+  display: grid;
+  gap: 2px;
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.live-metrics strong {
+  color: var(--text-primary);
+  font-size: 18px;
+}
+
+.live-result {
+  border-color: color-mix(in srgb, var(--success) 38%, var(--line));
+  background: color-mix(in srgb, var(--success) 7%, var(--surface-raised));
+}
+
+.live-result.is-error {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-raised));
+}
+
+.live-result h3 { margin: 0 0 8px; }
+.live-result pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.55; }
+
+.live-feed article {
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+}
+
+.live-feed article span {
+  color: var(--text-tertiary);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.live-feed article p {
+  margin: 4px 0 0;
+  color: var(--text-primary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .node-label {
@@ -833,6 +1142,7 @@ button:active:not(:disabled) {
 
 .connection-card:hover,
 .connection-kind:hover,
+.connection-kind.is-active,
 .picker-item:hover {
   border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
   background: var(--surface-hover);
@@ -1435,6 +1745,13 @@ button:active:not(:disabled) {
     flex: 1 1 auto;
     padding-inline: 5px;
     font-size: 11px;
+  }
+
+  .surface-tabs a {
+    min-width: 0;
+    flex: 1 1 auto;
+    padding-inline: 6px;
+    font-size: 10px;
   }
 
   .settings-viewport {

@@ -1,4 +1,4 @@
-import type { HarnessSpec } from "@harnest/core";
+import type { HarnessSpec } from "@harnestai/core";
 import { describe, expect, it } from "vitest";
 import {
   hostCapabilityDiagnosticsFor,

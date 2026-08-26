@@ -1,6 +1,6 @@
 import { dirname } from "node:path";
-import { type ConnectionProfile, type ConnectionTool, type HarnessSpec, type ToolManifest } from "@harnest/core";
-import { ConnectionManager, NodeSkillStore, loadSpecFile, mcpToolApprovalId } from "@harnest/core/node";
+import { type ConnectionProfile, type ConnectionTool, type HarnessSpec, type ToolManifest } from "@harnestai/core";
+import { ConnectionManager, NodeSkillStore, loadSpecFile, mcpToolApprovalId } from "@harnestai/core/node";
 import { CONNECTION_TYPE_CATALOG, TEMPLATE_CATALOG, type SkillCatalogItem, type StudioCatalogPayload, type ToolCatalogItem } from "@/lib/studio-catalog";
 import { apiErrorResponse } from "@/lib/api-server";
 import { fileExists, harnessFile, runtimeResourcesFor } from "@/lib/server";

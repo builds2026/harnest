@@ -1,5 +1,6 @@
 import "server-only";
-import { hasLiteralStudioHost, isLiteralLoopbackHostname } from "./studio-host";
+import { timingSafeEqual } from "node:crypto";
+import { hasLiteralStudioHost, isAllowedStudioHostname } from "./studio-host";
 import { classifyApiError, type ApiErrorDetails } from "./api";
 
 export class ApiRequestError extends Error {
@@ -25,13 +26,20 @@ const errorResponse = (
 }, { status });
 
 export function assertSameOrigin(request: Request): void {
+  const apiToken = process.env.HARNEST_API_TOKEN;
+  const authorization = request.headers.get("authorization");
+  if (apiToken && authorization?.startsWith("Bearer ")) {
+    const supplied = Buffer.from(authorization.slice(7));
+    const expected = Buffer.from(apiToken);
+    if (supplied.byteLength === expected.byteLength && timingSafeEqual(supplied, expected)) return;
+  }
   const url = new URL(request.url);
   const host = request.headers.get("host");
   const origin = request.headers.get("origin");
   if (!host || !hasLiteralStudioHost(request)) {
     throw new ApiRequestError(
       "REQUEST_HOST_INVALID",
-      "Request host must be a literal loopback address matching this Studio",
+      "Request host must be an allowed Studio address matching this Studio",
       403,
     );
   }
@@ -42,7 +50,7 @@ export function assertSameOrigin(request: Request): void {
   } catch {
     throw new ApiRequestError("REQUEST_ORIGIN_INVALID", "Mutation request origin is invalid", 403);
   }
-  if (!isLiteralLoopbackHostname(originUrl.hostname)
+  if (!isAllowedStudioHostname(originUrl.hostname)
     || originUrl.host.toLocaleLowerCase() !== host.toLocaleLowerCase()
     || originUrl.protocol !== url.protocol) {
     throw new ApiRequestError("REQUEST_ORIGIN_INVALID", "Cross-origin mutation requests are not allowed", 403);

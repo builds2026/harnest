@@ -1,4 +1,4 @@
-import type { AdapterContext, ModelEvent, ModelRequest } from "@harnest/core";
+import type { AdapterContext, ModelEvent, ModelRequest } from "@harnestai/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOllamaAdapter } from "../src/index.js";
@@ -11,6 +11,22 @@ async function collect(iterable: AsyncIterable<ModelEvent>): Promise<ModelEvent[
 
 describe("Ollama adapter", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("maps image input to Ollama images", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response('{"model":"vision","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}\n');
+    }));
+    await collect(createOllamaAdapter().run({
+      model: "vision",
+      messages: [{ role: "user", content: [
+        { type: "text", text: "Describe" },
+        { type: "media", mimeType: "image/png", data: "aW1hZ2U=" },
+      ] }],
+    }, { signal: new AbortController().signal, resolveSecret: () => undefined }));
+    expect(body).toMatchObject({ messages: [{ content: "Describe", images: ["aW1hZ2U="] }] });
+  });
 
   it("maps native chat NDJSON, usage, options, and cancellation", async () => {
     const controller = new AbortController();

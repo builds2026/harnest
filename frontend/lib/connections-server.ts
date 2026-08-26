@@ -7,8 +7,8 @@ import {
   type ConnectionCreateInput,
   type ConnectionTool,
   type HarnessSpec,
-} from "@harnest/core";
-import { ConnectionManager, detectContainerEngine, loadSpecFile } from "@harnest/core/node";
+} from "@harnestai/core";
+import { ConnectionManager, detectContainerEngine, loadSpecFile } from "@harnestai/core/node";
 import { ApiRequestError } from "./api-server";
 import { EMPTY_SPEC } from "./default-spec";
 import {
@@ -188,7 +188,7 @@ export class StudioConnectionService {
   readonly #manager: ConnectionManager;
 
   constructor(projectDirectory: string) {
-    this.#manager = new ConnectionManager(projectDirectory);
+    this.#manager = new ConnectionManager(projectDirectory, { allowLocalCredentialKey: true });
   }
 
   async #testProvider(profile: ConnectionProfile): Promise<string> {

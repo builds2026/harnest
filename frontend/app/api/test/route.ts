@@ -1,5 +1,5 @@
-import { runHarnessTests, validateSpec } from "@harnest/core";
-import { loadSpecFile } from "@harnest/core/node";
+import { runHarnessTests, validateSpec } from "@harnestai/core";
+import { loadSpecFile } from "@harnestai/core/node";
 import {
   diagnosticResponse,
   harnessFile,

@@ -1,4 +1,4 @@
-import type { Diagnostic } from "@harnest/core";
+import type { Diagnostic } from "@harnestai/core";
 
 export type DiagnosticRecoveryAction = "focus-field" | "connect-service" | "open-runtime-settings";
 

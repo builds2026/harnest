@@ -1,11 +1,12 @@
-import { AdapterError, parseNdjson, readBoundedResponseText } from "@harnest/core";
+import { AdapterError, parseNdjson, readBoundedResponseText } from "@harnestai/core";
 import type {
   AdapterContext,
   ModelAdapter,
   ModelEvent,
   ModelRequest,
+  ModelContentPart,
   TokenUsage,
-} from "@harnest/core";
+} from "@harnestai/core";
 
 const DEFAULT_BASE_URL = "http://localhost:11434/";
 const DEFAULT_API_KEY = "env:OLLAMA_API_KEY";
@@ -17,6 +18,14 @@ export interface OllamaAdapterOptions {
   readonly baseUrl?: string;
   readonly apiKey?: string;
 }
+
+const localContent = (content: string | readonly ModelContentPart[]) => typeof content === "string"
+  ? { content }
+  : {
+      content: content.filter((part) => part.type === "text").map((part) => part.text).join("\n"),
+      images: content.filter((part): part is Extract<ModelContentPart, { type: "media" }> => part.type === "media" && part.mimeType.startsWith("image/"))
+        .map((part) => part.data),
+    };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
@@ -90,9 +99,10 @@ async function throwHttpError(response: Response, adapterId: string): Promise<ne
   } catch {
     // Keep the normalized HTTP fallback.
   }
+  const contextOverflow = /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message);
   throw new AdapterError(message, {
     adapterId,
-    code: `http_${response.status}`,
+    code: contextOverflow ? "context_overflow" : `http_${response.status}`,
     status: response.status,
     retryable: response.status === 429 || response.status >= 500,
   });
@@ -110,13 +120,13 @@ function providerMessages(request: ModelRequest): unknown[] {
   return request.messages.map((message) => {
     if (message.role === "assistant" && message.toolCalls?.length) return {
       role: "assistant",
-      content: message.content,
+      ...localContent(message.content),
       tool_calls: message.toolCalls.map((call) => ({
         function: { name: call.name, arguments: call.input },
       })),
     };
-    if (message.role === "tool") return { role: "tool", content: message.content, tool_name: message.name };
-    return { role: message.role, content: message.content };
+    if (message.role === "tool") return { role: "tool", ...localContent(message.content), tool_name: message.name };
+    return { role: message.role, ...localContent(message.content) };
   });
 }
 
@@ -127,11 +137,24 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
+    capabilities: {
+      streaming: true,
+      json: true,
+      cancellation: true,
+      tools: true,
+      inputMedia: ["image"],
+      promptCaching: ["automatic"],
+    },
     requiredCredentials: options.apiKey?.startsWith("env:") ? [options.apiKey] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const requestId = requestSequence += 1;
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
+      if (request.promptCache) yield {
+        type: "cache",
+        status: "provider-managed",
+        mode: "automatic",
+        reason: "Ollama manages its KV cache without portable hit-token telemetry",
+      };
       const modelOptions = {
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
         ...(request.maxTokens === undefined ? {} : { num_predict: request.maxTokens }),
@@ -184,7 +207,11 @@ export function createOllamaAdapter(options: OllamaAdapterOptions = {}): ModelAd
         }
         const providerError = errorMessage(root);
         if (providerError) {
-          throw new AdapterError(providerError, { adapterId: id, code: "provider_error" });
+          throw new AdapterError(providerError, {
+            adapterId: id,
+            code: /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(providerError)
+              ? "context_overflow" : "provider_error",
+          });
         }
         if (typeof root.model === "string") model = root.model;
         const message = asRecord(root.message);

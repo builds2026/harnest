@@ -15,7 +15,7 @@ export async function POST(request: Request) {
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw new ApiRequestError("APPROVAL_INVALID", "Approval decision must be an object");
     }
-    const { action, runId, nodeId, callId, turn, approved, inputDigest } = body as Record<string, unknown>;
+    const { action, runId, nodeId, callId, turn, approved, decision, inputDigest } = body as Record<string, unknown>;
     if (typeof runId !== "string" || !RUN_ID.test(runId)
       || typeof nodeId !== "string" || !NODE_ID.test(nodeId)
       || typeof callId !== "string" || !CALL_ID.test(callId)
@@ -27,10 +27,15 @@ export async function POST(request: Request) {
       if (!approval) throw new ApiRequestError("APPROVAL_NOT_PENDING", "This approval is no longer pending", 409);
       return Response.json({ ok: true, approval });
     }
-    if (typeof approved !== "boolean" || typeof inputDigest !== "string" || !DIGEST.test(inputDigest)) {
+    const mode = decision === "allow_once" || decision === "allow_for_run" || decision === "allow_always" || decision === "deny"
+      ? decision
+      : decision === "once" ? "allow_once"
+        : decision === "always" ? "allow_always"
+          : typeof approved === "boolean" ? approved ? "allow_once" : "deny" : undefined;
+    if (!mode || typeof inputDigest !== "string" || !DIGEST.test(inputDigest)) {
       throw new ApiRequestError("APPROVAL_INVALID", "Approval decision or input digest is invalid");
     }
-    if (!approvalBroker.decide(runId, nodeId, turn as number, callId, inputDigest, approved)) {
+    if (!approvalBroker.decide(runId, nodeId, turn as number, callId, inputDigest, mode)) {
       throw new ApiRequestError("APPROVAL_NOT_PENDING", "This approval is no longer pending", 409);
     }
     return Response.json({ ok: true });

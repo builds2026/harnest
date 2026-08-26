@@ -51,6 +51,6 @@ Studio 기본 주소는 `http://127.0.0.1:3000`이다. 다른 포트는 `--port 
 - v0.1 실행 graph는 Model → Prompt → Agent → Output 네 built-in component로 제한된다. Context, Tool, MCP, RAG, Evaluator와 component executor registry는 다음 schema version에서 추가해야 한다.
 - 자동 retry, 영속 Trace/비용 store, 평가 실험 UI는 없다. 현재 retryable 오류는 정규화해 전달하며 timeout/cancel과 선언형 문자열 assertion까지만 제공한다.
 - YAML은 의미적으로 round-trip하지만 저장 시 주석, anchor와 원래 서식은 canonical YAML로 정규화된다.
-- `@harnest/studio`는 현재 monorepo의 private workspace app이며 `harnest studio`는 개발 서버를 실행한다. 독립 npm 배포 전에는 Studio package 배포/production launcher 구성이 필요하다.
+- `@harnestai/studio`는 현재 monorepo의 private workspace app이며 `harnest studio`는 개발 서버를 실행한다. 독립 npm 배포 전에는 Studio package 배포/production launcher 구성이 필요하다.
 
 조사 근거는 [research.md](./research.md)에 정리했다.

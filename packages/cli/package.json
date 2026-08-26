@@ -1,21 +1,44 @@
 {
-  "name": "@harnest/cli",
-  "version": "0.1.0",
+  "name": "@harnestai/cli",
+  "version": "0.2.0-beta.1",
   "type": "module",
-  "bin": { "harnest": "./dist/index.js" },
+  "bin": {
+    "harnest": "./dist/index.js"
+  },
   "main": "./dist/index.js",
-  "engines": { "node": ">=22.15.0" },
-  "files": ["dist"],
-  "scripts": { "build": "tsc -b" },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
   "dependencies": {
-    "@harnest/adapter-anthropic": "0.1.0",
-    "@harnest/adapter-gemini": "0.1.0",
-    "@harnest/adapter-local": "0.1.0",
-    "@harnest/adapter-openai": "0.1.0",
-    "@harnest/core": "0.1.0",
-    "@harnest/sdk": "0.1.0",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
+    "@harnestai/adapter-gemini": "0.2.0-beta.1",
+    "@harnestai/adapter-local": "0.2.0-beta.1",
+    "@harnestai/adapter-openai": "0.2.0-beta.1",
+    "@harnestai/core": "0.2.0-beta.1",
+    "@harnestai/protocol": "0.2.0-beta.1",
+    "@harnestai/sdk": "0.2.0-beta.1",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.4.3"
   },
-  "optionalDependencies": { "@harnest/studio": "0.1.0" }
+  "optionalDependencies": {
+    "@harnestai/studio": "0.2.0-beta.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/builds2026/harnest.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

@@ -1,0 +1,46 @@
+{
+  "name": "@harnestai/protocol",
+  "version": "0.2.0-beta.1",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./schema/wire.json": "./schema/wire.schema.json",
+    "./schema/command.json": "./schema/command.schema.json",
+    "./schema/create-run.json": "./schema/create-run.schema.json",
+    "./schema/idempotency-key.json": "./schema/idempotency-key.schema.json",
+    "./schema/interaction.json": "./schema/interaction.schema.json",
+    "./schema/permission.json": "./schema/permission.schema.json",
+    "./schema/snapshot-response.json": "./schema/snapshot-response.schema.json",
+    "./fixtures/v1.json": "./fixtures/v1.json",
+    "./fixtures/runtime-server.mjs": "./fixtures/runtime-server.mjs"
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "fixtures",
+    "schema"
+  ],
+  "scripts": {
+    "build": "tsc -b && node scripts/export-assets.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/builds2026/harnest.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

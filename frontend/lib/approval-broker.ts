@@ -1,7 +1,7 @@
 import "server-only";
 
 import { createHash } from "node:crypto";
-import type { ToolApprovalDecision, ToolApprovalRequest } from "@harnest/core";
+import type { PermissionDecision, ToolApprovalDecision, ToolApprovalRequest } from "@harnestai/core";
 
 export interface PendingApprovalView {
   readonly runId: string;
@@ -9,6 +9,7 @@ export interface PendingApprovalView {
   readonly callId: string;
   readonly turn: number;
   readonly tool: string;
+  readonly connectionId?: string;
   readonly risk: string;
   readonly input: unknown;
   readonly inputDigest: string;
@@ -65,6 +66,7 @@ class ApprovalBroker {
       callId: request.callId,
       turn: request.turn,
       tool: request.tool.id,
+      ...(request.tool.connectionId ? { connectionId: request.tool.connectionId } : {}),
       risk: request.tool.risk ?? "external",
       input: preview.value,
       inputDigest: `sha256:${createHash("sha256").update(serialized).digest("hex")}`,
@@ -87,13 +89,22 @@ class ApprovalBroker {
     return pending ? structuredClone(pending.view) : undefined;
   }
 
-  decide(runId: string, nodeId: string, turn: number, callId: string, inputDigest: string, approved: boolean): boolean {
+  decide(
+    runId: string,
+    nodeId: string,
+    turn: number,
+    callId: string,
+    inputDigest: string,
+    mode: PermissionDecision,
+  ): boolean {
     const key = approvalKey(runId, nodeId, turn, callId);
     const pending = this.#pending.get(key);
+    const approved = mode !== "deny";
     if (pending?.view.inputDigest !== inputDigest || (approved && pending.view.previewLimited)) return false;
     return this.#finish(key, {
       approved,
       source: "user",
+      mode,
       ...(!approved ? { reason: "Denied by the Studio operator" } : {}),
     });
   }

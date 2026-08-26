@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   AdapterRegistry,
   HarnessRuntime,
@@ -16,13 +16,21 @@ import {
 } from "../src/index.js";
 import {
   ConnectionManager,
+  FilePromptCacheStore,
   guardedFetch,
   mcpToolApprovalId,
   NodeRuntimeServices,
 } from "../src/node.js";
-import { containerRunArguments, credentialBackendCommand, pinnedLookup } from "../src/node-connections.js";
+import { containerRunArguments, credentialBackendCommand, credentialKeyFromEnvironment, pinnedLookup } from "../src/node-connections.js";
 
 const temporaryRoots: string[] = [];
+const originalCredentialKey = process.env.HARNEST_CREDENTIAL_KEY;
+process.env.HARNEST_CREDENTIAL_KEY = Buffer.alloc(32, 7).toString("base64");
+
+afterAll(() => {
+  if (originalCredentialKey === undefined) delete process.env.HARNEST_CREDENTIAL_KEY;
+  else process.env.HARNEST_CREDENTIAL_KEY = originalCredentialKey;
+});
 
 async function temporaryProject(): Promise<{ project: string; userData: string }> {
   const root = await mkdtemp(join(tmpdir(), "harnest-connection-test-"));
@@ -43,6 +51,38 @@ const context: ServiceExecutionContext = {
 afterEach(async () => {
   vi.unstubAllGlobals();
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe("prompt cache registry", () => {
+  it("persists only opaque handles with restrictive permissions and removes expired entries", async () => {
+    const { project } = await temporaryProject();
+    const store = new FilePromptCacheStore(project);
+    await store.set({
+      key: "a".repeat(64),
+      adapterId: "gemini",
+      model: "gemini-test",
+      resource: "cachedContents/cache_123",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      cachedInputTokens: 4_096,
+    });
+    const file = join(project, ".harnest", "runtime", "context-cache.json");
+    const raw = await readFile(file, "utf8");
+    expect(raw).not.toContain("raw prompt");
+    expect(raw).not.toContain("api-key");
+    if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
+    await store.set({
+      key: "b".repeat(64),
+      adapterId: "gemini",
+      model: "gemini-test",
+      resource: "cachedContents/cache_expired",
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    expect(await store.get("b".repeat(64))).toBeUndefined();
+    expect(await store.list()).toHaveLength(1);
+    expect(await store.clear()).toBe(1);
+  });
 });
 
 describe("container sandbox arguments", () => {
@@ -75,6 +115,30 @@ describe.sequential("ConnectionManager credential boundary", () => {
     expect(linux).toMatchObject({ protection: "linux-secret-service", args: expect.arrayContaining(["store"]) });
     expect([...mac.args, ...linux.args].some((argument) => /^[A-Za-z0-9+/]{43}=$/u.test(argument))).toBe(false);
     expect(() => credentialBackendCommand("freebsd", "store", id)).toThrow(/DPAPI.*Keychain.*Secret Service/);
+    expect(credentialKeyFromEnvironment({ HARNEST_CREDENTIAL_KEY: Buffer.alloc(32, 1).toString("base64") })).toHaveLength(32);
+    expect(() => credentialKeyFromEnvironment({ HARNEST_CREDENTIAL_KEY: "not-a-key" })).toThrow(/base64-encoded 32-byte/);
+  });
+
+  it("lets Studio persist an owner-only local key when Linux Secret Service is unavailable", async () => {
+    if (process.platform !== "linux") return;
+    const { project, userData } = await temporaryProject();
+    const saved = process.env.HARNEST_CREDENTIAL_KEY;
+    delete process.env.HARNEST_CREDENTIAL_KEY;
+    try {
+      const manager = new ConnectionManager(project, { userDataDirectory: userData, allowLocalCredentialKey: true });
+      await manager.create({
+        id: "studio_local_key",
+        scope: "project",
+        kind: "provider",
+        name: "Studio local key",
+        config: { adapter: "gemini", model: "fixture" },
+      }, { apiKey: "fixture-secret" });
+      expect(await manager.resolveCredential("studio_local_key", "apiKey")).toBe("fixture-secret");
+      expect((await stat(join(userData, "credentials.key.os"))).mode & 0o777).toBe(0o600);
+    } finally {
+      if (saved === undefined) delete process.env.HARNEST_CREDENTIAL_KEY;
+      else process.env.HARNEST_CREDENTIAL_KEY = saved;
+    }
   });
 
   it("rejects hostnames that resolve to private addresses before connecting", async () => {
@@ -311,6 +375,89 @@ child.on("exit", (code) => process.exit(code ?? 1))
     await services.close();
   });
 
+  it("runs against a secret-filtered workspace and applies approved edits", async () => {
+    const { project, userData } = await temporaryProject();
+    const engineDirectory = join(project, "workspace-engine");
+    const sourceDirectory = join(project, "src");
+    await Promise.all([mkdir(engineDirectory), mkdir(sourceDirectory)]);
+    await writeFile(join(sourceDirectory, "changed.txt"), "before", "utf8");
+    await writeFile(join(project, ".env"), "SECRET=must-not-be-mounted", "utf8");
+    const engine = join(engineDirectory, process.platform === "win32" ? "docker.exe" : "docker");
+    await copyFile(process.execPath, engine);
+    await writeFile(join(engineDirectory, "image"), `console.log("sha256:${"c".repeat(64)}")\n`, "utf8");
+    await writeFile(join(engineDirectory, "run"), `const { spawn } = require("node:child_process")
+const fs = require("node:fs")
+const mount = process.argv.find((value) => value.includes("target=/workspace") && !value.includes("node_modules"))
+const workspace = mount && /(?:^|,)source=([^,]+)/.exec(mount)?.[1]
+const outputMount = process.argv.find((value) => value.includes("target=/mnt/output"))
+const output = outputMount && /(?:^|,)source=([^,]+)/.exec(outputMount)?.[1]
+if (!workspace) process.exit(3)
+if (output) fs.writeFileSync(require("node:path").join(output, "report.json"), JSON.stringify({ ok: true }))
+const child = spawn(process.execPath, ["-"], { cwd: workspace, stdio: ["pipe", "inherit", "inherit"] })
+process.stdin.pipe(child.stdin)
+child.on("exit", (code) => process.exit(code ?? 1))
+`, "utf8");
+    await writeFile(join(engineDirectory, "rm"), "process.exit(0)\n", "utf8");
+    const manager = new ConnectionManager(project, { userDataDirectory: userData });
+    const connection = await manager.create({
+      id: "workspace_fixture",
+      scope: "project",
+      kind: "local-runtime",
+      name: "Workspace fixture",
+      config: {
+        sandbox: "container",
+        engine,
+        image: `fixture@sha256:${"c".repeat(64)}`,
+        runtime: "node",
+        network: "none",
+      },
+    });
+    await manager.test(connection.id);
+    await manager.approveProcess(connection.id);
+    const outputDirectory = join(project, ".harnest", "playground-output");
+    await mkdir(outputDirectory, { recursive: true });
+    const services = new NodeRuntimeServices(project, {
+      connectionManager: manager,
+      allowFileSystem: true,
+      sandboxWorkspace: { outputDirectory },
+    });
+    try {
+      await expect(services.executeTool({
+        id: "builtin.code-runner",
+        source: "builtin",
+        connectionId: connection.id,
+      }, {
+        runtime: "node",
+        code: `const fs = require("node:fs");
+if (fs.existsSync(".env")) throw new Error("secret leaked");
+fs.writeFileSync("src/changed.txt", "after");
+fs.writeFileSync("src/generated.txt", "new");
+console.log("workspace updated");`,
+      }, { ...context, runId: "workspace-run" })).resolves.toMatchObject({
+        value: { stdout: "workspace updated\n", exitCode: 0 },
+      });
+      await expect(readFile(join(sourceDirectory, "changed.txt"), "utf8")).resolves.toBe("after");
+      await expect(readFile(join(sourceDirectory, "generated.txt"), "utf8")).resolves.toBe("new");
+      await expect(readFile(join(project, ".env"), "utf8")).resolves.toBe("SECRET=must-not-be-mounted");
+      const artifacts = await services.listArtifacts("workspace-run");
+      expect(artifacts).toEqual([expect.objectContaining({
+        name: "report.json",
+        mimeType: "application/json",
+        status: "ready",
+        ref: expect.stringMatching(/^harnest-artifact:/),
+      })]);
+      const artifact = artifacts[0];
+      if (!artifact) throw new Error("fixture artifact is missing");
+      await services.releaseRun("workspace-run");
+      await expect(services.readArtifact("workspace-run", artifact.id)).resolves.toMatchObject({
+        content: Buffer.from('{"ok":true}'),
+      });
+    } finally {
+      await services.releaseRun("workspace-run");
+      await services.close();
+    }
+  }, 15_000);
+
   it("rejects unsafe JSON Schemas before persisting discovered MCP Tools", async () => {
     const { project, userData } = await temporaryProject();
     const manager = new ConnectionManager(project, { userDataDirectory: userData });
@@ -335,9 +482,11 @@ child.on("exit", (code) => process.exit(code ?? 1))
     await writeFile(join(project, "powershell.exe"), "untrusted project executable", "utf8");
     const previousDirectory = process.cwd();
     const previousPath = process.env.PATH;
+    const previousCredentialKey = process.env.HARNEST_CREDENTIAL_KEY;
     try {
       process.chdir(project);
       process.env.PATH = project;
+      delete process.env.HARNEST_CREDENTIAL_KEY;
       const manager = new ConnectionManager(project, { userDataDirectory: userData });
       await expect(manager.create({
         id: "trusted_dpapi",
@@ -350,6 +499,8 @@ child.on("exit", (code) => process.exit(code ?? 1))
       process.chdir(previousDirectory);
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+      if (previousCredentialKey === undefined) delete process.env.HARNEST_CREDENTIAL_KEY;
+      else process.env.HARNEST_CREDENTIAL_KEY = previousCredentialKey;
     }
   });
 
@@ -357,17 +508,6 @@ child.on("exit", (code) => process.exit(code ?? 1))
     const { project, userData } = await temporaryProject();
     const manager = new ConnectionManager(project, { userDataDirectory: userData });
     const secret = `fixture-secret-${Date.now()}`;
-
-    if (process.platform !== "win32") {
-      await expect(manager.create({
-        id: "provider_fixture",
-        scope: "project",
-        kind: "provider",
-        name: "Fixture Provider",
-        config: { adapter: "openai", model: "fixture-model" },
-      }, { apiKey: secret })).rejects.toMatchObject({ code: "CREDENTIAL_BACKEND_UNAVAILABLE" });
-      return;
-    }
 
     const created = await manager.create({
       id: "provider_fixture",
@@ -387,7 +527,11 @@ child.on("exit", (code) => process.exit(code ?? 1))
     const paths = manager.paths();
     expect(await readFile(paths.projectMetadata, "utf8")).not.toContain(secret);
     for (const file of paths.credentialFiles) {
-      expect(await readFile(file, "utf8")).not.toContain(secret);
+      const content = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return "";
+        throw error;
+      });
+      expect(content).not.toContain(secret);
     }
 
     const reopened = new ConnectionManager(project, { userDataDirectory: userData });
@@ -1010,6 +1154,54 @@ describe.sequential("saved MCP Connections", () => {
     await studioApproved.close();
   });
 
+  it("persists and revokes exact Harness, Tool, and Connection grants", async () => {
+    const { project } = await temporaryProject();
+    const tool: ToolBinding = {
+      id: "builtin.shell",
+      label: "Shell",
+      description: "Runs a command",
+      inputSchema: { type: "object" },
+      risk: "destructive",
+      connectionId: "runtime_a",
+    };
+    const request = {
+      runId: context.runId,
+      nodeId: context.nodeId,
+      callId: "call-persist",
+      turn: 1,
+      tool,
+      input: { command: "node" },
+    };
+    let prompts = 0;
+    const first = new NodeRuntimeServices(project, {
+      harnessId: join(project, "first.yaml"),
+      requestToolApproval: () => {
+        prompts += 1;
+        return { approved: true, source: "user", mode: "always" };
+      },
+    });
+    expect(await first.requestToolApproval(request, context)).toMatchObject({ approved: true, mode: "allow_always" });
+    expect(await first.listToolPermissions()).toEqual([
+      expect.objectContaining({ toolId: tool.id, connectionId: "runtime_a", capability: "process", resource: "node" }),
+    ]);
+    await first.close();
+
+    const reopened = new NodeRuntimeServices(project, { harnessId: join(project, "first.yaml") });
+    expect(await reopened.requestToolApproval(request, context)).toMatchObject({ approved: true, source: "policy", mode: "allow_always" });
+    expect(await reopened.requestToolApproval({ ...request, tool: { ...tool, connectionId: "runtime_b" } }, context))
+      .toMatchObject({ approved: false, mode: "deny" });
+    expect(await reopened.requestToolApproval({ ...request, input: { command: "python" } }, context))
+      .toMatchObject({ approved: false, mode: "deny" });
+    expect(await reopened.revokeToolPermission(tool.id, "runtime_a")).toBe(true);
+    expect(await reopened.requestToolApproval(request, context)).toMatchObject({ approved: false, mode: "deny" });
+    await reopened.close();
+
+    const otherHarness = new NodeRuntimeServices(project, { harnessId: join(project, "second.yaml") });
+    expect(await otherHarness.requestToolApproval(request, context)).toMatchObject({ approved: false, mode: "deny" });
+    await otherHarness.close();
+    expect(prompts).toBe(1);
+  });
+
   it("binds MCP preapproval to the saved Connection and exact discovered action", async () => {
     const { project, userData } = await temporaryProject();
     const manager = new ConnectionManager(project, { userDataDirectory: userData });
@@ -1067,6 +1259,7 @@ describe.sequential("saved MCP Connections", () => {
   it("requires a full stdio launch fingerprint and executes discovered Tools by Connection ID", async () => {
     const { project, userData } = await temporaryProject();
     const manager = new ConnectionManager(project, { userDataDirectory: userData });
+    const executable = process.execPath;
     if (process.platform !== "win32") {
       await manager.create({
         id: "stdio_fixture",
@@ -1075,7 +1268,7 @@ describe.sequential("saved MCP Connections", () => {
         name: "stdio Fixture",
         config: { transport: "stdio", command: executable, args: ["fixture.mjs"] },
       });
-      await expect(manager.approveProcess("stdio_fixture")).rejects.toMatchObject({ code: "CREDENTIAL_BACKEND_UNAVAILABLE" });
+      await expect(manager.approveProcess("stdio_fixture")).resolves.toMatch(/^[a-f0-9]{64}$/);
       return;
     }
 

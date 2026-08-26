@@ -5,7 +5,7 @@ import {
   diagnosticsFromZod,
   validateSpec,
   type HarnessSpec,
-} from "@harnest/core";
+} from "@harnestai/core";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "../../../lib/api-server";
 import { applyExperimentVariant, experimentQuality, type ExperimentVariant } from "../../../lib/experiments";
 import { hasErrors, runtimeOptionsFor, runtimeResourcesFor } from "../../../lib/server";

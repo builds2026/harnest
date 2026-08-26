@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { HarnessSpec } from "@harnest/core";
+import type { HarnessSpec } from "@harnestai/core";
 import { applyPlaygroundOverrides, filePreview, playgroundCapabilities } from "./playground";
 
 const spec = (): HarnessSpec => ({
@@ -33,6 +33,7 @@ describe("Playground harness projection", () => {
     const original = spec();
     const capabilities = playgroundCapabilities(original);
     expect(capabilities.attachments.enabled).toBe(true);
+    expect(capabilities.attachments.directModelInput).toBe(true);
     expect(capabilities.models.map(({ connectionId }) => connectionId)).toEqual(["gemini", "local"]);
     expect(capabilities.plugins.map(({ componentKey }) => componentKey)).toContain("subgraph:helper/runner");
 
@@ -61,5 +62,23 @@ describe("Playground harness projection", () => {
     expect(filePreview("image/png", "plot.png")).toBe("image");
     expect(filePreview("image/svg+xml", "unsafe.svg")).toBe("none");
     expect(filePreview("application/octet-stream", "report.csv")).toBe("text");
+  });
+
+  it("allows direct multimodal attachments without a Code Runner", () => {
+    const direct: HarnessSpec = {
+      version: "0.2",
+      components: [
+        { id: "model", type: "model", config: { connectionId: "gemini" } },
+        { id: "agent", type: "agent", config: { multimodal: true } },
+      ],
+      connections: [{ from: { component: "model", port: "model" }, to: { component: "agent", port: "model" } }],
+      entrypoint: "agent",
+    };
+    const capabilities = playgroundCapabilities(direct);
+    expect(capabilities.attachments).toMatchObject({ enabled: true, directModelInput: true });
+
+    if (direct.version !== "0.2") throw new Error("fixture version changed");
+    direct.components[1]!.config.multimodal = false;
+    expect(playgroundCapabilities(direct).attachments).toMatchObject({ enabled: false, directModelInput: false });
   });
 });

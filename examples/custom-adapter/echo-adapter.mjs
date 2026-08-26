@@ -1,4 +1,4 @@
-/** @type {import('@harnest/core').ModelAdapter} */
+/** @type {import('@harnestai/core').ModelAdapter} */
 const adapter = {
   id: "echo",
   capabilities: { streaming: true, json: false, cancellation: true },

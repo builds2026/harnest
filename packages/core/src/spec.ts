@@ -189,10 +189,7 @@ export const GraphBodySchema = z.object({
   entrypoint: ComponentIdSchema,
 }).strict();
 
-export const HarnessSpecV02Schema = GraphBodySchema.extend({
-  version: z.literal("0.2"),
-  subgraphs: z.record(ComponentIdSchema, GraphBodySchema).optional(),
-  runtime: z.object({
+const AdvancedRuntimeSchema = z.object({
     timeoutMs: z.number().int().positive().max(600_000).optional(),
     adapters: z.array(z.string().min(1)).optional(),
     modules: z.array(z.string().min(1)).optional(),
@@ -201,7 +198,29 @@ export const HarnessSpecV02Schema = GraphBodySchema.extend({
       maxTokens: z.number().int().positive().optional(),
       maxCostUsd: z.number().positive().optional(),
     }).strict().optional(),
-  }).strict().optional(),
+    context: z.object({
+      cacheMode: z.enum(["automatic", "explicit"]).optional(),
+      overflow: z.enum(["compact", "error"]).optional(),
+    }).strict().optional(),
+  }).strict();
+
+const StudioViewportSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  zoom: z.number().positive(),
+}).strict();
+
+const StudioGraphLayoutSchema = z.object({
+    positions: z.record(ComponentIdSchema, z.object({ x: z.number(), y: z.number() }).strict()),
+    pinned: z.array(ComponentIdSchema).optional(),
+    viewport: StudioViewportSchema.optional(),
+    direction: z.enum(["RIGHT", "DOWN"]).optional(),
+  }).strict();
+
+export const HarnessSpecV02Schema = GraphBodySchema.extend({
+  version: z.literal("0.2"),
+  subgraphs: z.record(ComponentIdSchema, GraphBodySchema).optional(),
+  runtime: AdvancedRuntimeSchema.optional(),
   tests: z.array(HarnessTestCaseV02Schema).optional(),
   studio: z.object({
     positions: z.record(ComponentIdSchema, z.object({ x: z.number(), y: z.number() }).strict()),
@@ -211,9 +230,47 @@ export const HarnessSpecV02Schema = GraphBodySchema.extend({
   }).strict().optional(),
 }).strict();
 
+export const AgentTemplateSchema = z.object({
+  description: z.string().min(1).max(2_000),
+  capabilities: z.array(z.string().min(1).max(128)).max(32).optional(),
+  runner: z.union([
+    z.object({ subgraph: ComponentIdSchema }).strict(),
+    z.object({
+      a2a: z.object({ connection: z.string().min(1).max(128) }).strict(),
+    }).strict(),
+  ]),
+}).strict();
+
+export const TeamLimitsSchema = z.object({
+  maxInstances: z.number().int().min(1).max(64).optional(),
+  maxDepth: z.number().int().min(1).max(8).optional(),
+  maxParallel: z.number().int().min(1).max(16).optional(),
+  maxMessages: z.number().int().min(1).max(1_000).optional(),
+  maxPlanRevisions: z.number().int().min(1).max(100).optional(),
+}).strict();
+
+export const TeamSchema = z.object({
+  orchestrator: ComponentIdSchema,
+  members: z.array(ComponentIdSchema).min(1).max(32),
+  limits: TeamLimitsSchema.optional(),
+}).strict();
+
+export const HarnessSpecV03Schema = GraphBodySchema.extend({
+  version: z.literal("0.3"),
+  subgraphs: z.record(ComponentIdSchema, GraphBodySchema).optional(),
+  agentTemplates: z.record(ComponentIdSchema, AgentTemplateSchema).optional(),
+  teams: z.record(ComponentIdSchema, TeamSchema).optional(),
+  runtime: AdvancedRuntimeSchema.optional(),
+  tests: z.array(HarnessTestCaseV02Schema).optional(),
+  studio: StudioGraphLayoutSchema.extend({
+    subgraphs: z.record(ComponentIdSchema, StudioGraphLayoutSchema).optional(),
+  }).strict().optional(),
+}).strict();
+
 export const HarnessSpecSchema = z.discriminatedUnion("version", [
   HarnessSpecV01Schema,
   HarnessSpecV02Schema,
+  HarnessSpecV03Schema,
 ]);
 
 export type ModelComponent = z.infer<typeof ModelComponentSchema>;
@@ -233,6 +290,10 @@ export type HarnessTestCase = HarnessTestCaseV01 | HarnessTestCaseV02;
 export type GraphBody = z.infer<typeof GraphBodySchema>;
 export type HarnessSpecV01 = z.infer<typeof HarnessSpecV01Schema>;
 export type HarnessSpecV02 = z.infer<typeof HarnessSpecV02Schema>;
+export type HarnessSpecV03 = z.infer<typeof HarnessSpecV03Schema>;
+export type AgentTemplateSpec = z.infer<typeof AgentTemplateSchema>;
+export type TeamSpec = z.infer<typeof TeamSchema>;
+export type TeamLimits = z.infer<typeof TeamLimitsSchema>;
 export type HarnessSpec = z.infer<typeof HarnessSpecSchema>;
 export type ComponentType = string;
 

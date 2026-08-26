@@ -3,8 +3,8 @@ import {
   HarnessRuntime,
   validateSpec,
   type RunEvent,
-} from "@harnest/core";
-import { loadSpecFile } from "@harnest/core/node";
+} from "@harnestai/core";
+import { loadSpecFile } from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
 import { approvalBroker } from "@/lib/approval-broker";
 import {

@@ -1,0 +1,17 @@
+[
+  {
+    "id": "computes-and-finishes",
+    "input": "Python 코드 인터프리터로 1부터 100까지의 합을 계산하고 결과를 설명해줘.",
+    "assertions": [
+      {
+        "type": "includes",
+        "value": ""
+      },
+      {
+        "type": "iterations",
+        "min": 1,
+        "max": 4
+      }
+    ]
+  }
+]

@@ -16,7 +16,7 @@ import {
   type HarnessSpec,
   type HarnessTestCase,
   type RunEvent,
-} from "@harnest/core";
+} from "@harnestai/core/browser";
 import {
   Background,
   BackgroundVariant,
@@ -43,7 +43,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type DragEvent,
+  type PointerEvent as ReactPointerEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import {
@@ -67,6 +67,7 @@ import {
 import { catalogMap, colorFor, glyphFor, validationRegistryFor } from "@/lib/component-catalog";
 import { EMPTY_SPEC } from "@/lib/default-spec";
 import { HarnessNodeComponent } from "./harness-node";
+import { HarnessEdgeComponent } from "./harness-edge";
 import { Inspector } from "./inspector";
 import {
   connectionCanRun,
@@ -75,7 +76,7 @@ import {
   type ConnectionSummary,
 } from "@/lib/connections";
 import { formatExperimentValue, parseExperimentValue } from "@/lib/experiments";
-import { requestJson, apiErrorMessage } from "@/lib/api-client";
+import { ClientApiError, requestJson, apiErrorMessage } from "@/lib/api-client";
 import { buildReadiness } from "@/lib/readiness";
 import { diagnosticFieldPath, diagnosticRecoveryAction } from "@/lib/diagnostics";
 import { STUDIO_SURFACE_HREFS, surfaceFromPathname, type StudioSurface } from "@/lib/studio-route";
@@ -95,11 +96,16 @@ import { JourneyAction, ReadinessTrail, SetupJourney, type SetupJourneyStep } fr
 import { Button, ConfirmDialog } from "./ui/ui";
 import type { SettingsPage } from "./studio-settings";
 import { eventNodeId, eventSummary, IntegrationWorkspace, RunsWorkspace, type StoredRun } from "./studio-workspaces";
+import { VersionHistory } from "./version-history";
+import { ProjectFiles } from "./project-files";
+import { layoutGraph } from "@/lib/graph-layout";
+import { latestRunSnapshot, liveGraph } from "@/lib/live-graph";
+import { readNdjson } from "@/lib/ndjson";
+import { randomId } from "@/lib/random-id";
 
-const DND_MIME = "application/x-harnest-component";
 const nodeTypes = { harness: HarnessNodeComponent };
-const defaultEdgeOptions = { type: "smoothstep", interactionWidth: 24 };
-const snapGrid: [number, number] = [16, 16];
+const edgeTypes = { harness: HarnessEdgeComponent };
+const defaultEdgeOptions = { type: "harness", interactionWidth: 24 };
 const LEGACY_COMPONENT_TYPES = new Set(["model", "prompt", "agent", "output"]);
 function PlaygroundLoading() {
   const { t } = useI18n();
@@ -128,7 +134,7 @@ type BootState =
   | { phase: "error"; message: string }
   | { phase: "ready"; payload: SpecPayload };
 
-type DockTab = "yaml" | "problems" | "tests" | "experiments" | "trace";
+type DockTab = "project" | "yaml" | "problems" | "tests" | "experiments" | "trace";
 
 type AttachmentPicker = { nodeId: string; slot: "tools" | "skills"; pendingItemId?: string };
 type PendingSkillAttach = { nodeId: string; skillId: string };
@@ -164,26 +170,72 @@ interface TestReport {
   cases: TestCaseResult[];
 }
 
-type SimpleTestAssertion = Extract<HarnessAssertion, { value: string }>;
-
-const SIMPLE_TEST_ASSERTIONS: readonly SimpleTestAssertion["type"][] = ["includes", "equals", "matches"];
+const STRING_ASSERTION_TYPES: readonly HarnessAssertion["type"][] = ["includes", "equals", "matches"];
+const TEST_ASSERTION_TYPES: readonly HarnessAssertion["type"][] = [
+  "includes", "equals", "matches", "output-schema", "tool-called", "latency", "iterations",
+];
 
 const testAssertions = (test: HarnessTestCase): readonly HarnessAssertion[] => {
   if ("assertions" in test && test.assertions) return test.assertions;
   return test.assertion ? [test.assertion] : [];
 };
 
-const simpleTestAssertion = (test: HarnessTestCase) => testAssertions(test)
-  .find((assertion): assertion is SimpleTestAssertion => "value" in assertion);
-
-const replaceSimpleTestAssertion = (test: HarnessTestCase, assertion: SimpleTestAssertion): HarnessTestCase => {
-  if ("assertions" in test && test.assertions) {
-    const index = test.assertions.findIndex((candidate) => "value" in candidate);
-    if (index < 0) return test;
-    return { ...test, assertions: test.assertions.map((candidate, candidateIndex) => candidateIndex === index ? assertion : candidate) };
+const assertionForType = (type: HarnessAssertion["type"]): HarnessAssertion => {
+  switch (type) {
+    case "includes": case "equals": case "matches": return { type, value: "" };
+    case "output-schema": return { type, schema: { type: "object" } };
+    case "tool-called": return { type, tool: "", minCalls: 1 };
+    case "latency": return { type, maxMs: 5_000 };
+    case "iterations": return { type, max: 3 };
   }
-  return { ...test, assertion };
 };
+
+const replaceTestAssertions = (
+  test: HarnessTestCase,
+  assertions: readonly HarnessAssertion[],
+  version: HarnessSpec["version"],
+): HarnessTestCase => {
+  if (version === "0.1") return { ...test, assertion: assertions[0] as Extract<HarnessAssertion, { value: string }> } as HarnessTestCase;
+  const next = { ...test, assertions: [...assertions] } as HarnessTestCase & { assertion?: HarnessAssertion };
+  delete next.assertion;
+  return next;
+};
+
+function TestJsonEditor({ label, value, disabled, onChange }: {
+  label: string;
+  value: unknown;
+  disabled: boolean;
+  onChange: (value: unknown) => void;
+}) {
+  const { t } = useI18n();
+  const [text, setText] = useState(() => JSON.stringify(value, null, 2));
+  const [error, setError] = useState("");
+  useEffect(() => { setText(JSON.stringify(value, null, 2)); setError(""); }, [value]);
+  return <label className="test-case-field"><span>{label}</span><textarea value={text} disabled={disabled} spellCheck={false} aria-invalid={Boolean(error)} onChange={(event) => setText(event.target.value)} onBlur={() => {
+    try { onChange(JSON.parse(text) as unknown); setError(""); } catch { setError(t("inspector.jsonInvalid")); }
+  }} />{error && <small className="field-error">{error}</small>}</label>;
+}
+
+function TestAssertionEditor({ assertion, disabled, removable, advanced, onChange, onRemove }: {
+  assertion: HarnessAssertion;
+  disabled: boolean;
+  removable: boolean;
+  advanced: boolean;
+  onChange: (assertion: HarnessAssertion) => void;
+  onRemove: () => void;
+}) {
+  const { t } = useI18n();
+  const number = (value: string) => value === "" ? undefined : Number(value);
+  return <div className="test-expectation">
+    <label><span>{t("tests.expect")}</span><select value={assertion.type} disabled={disabled} onChange={(event) => onChange(assertionForType(event.target.value as HarnessAssertion["type"]))}>{(advanced ? TEST_ASSERTION_TYPES : STRING_ASSERTION_TYPES).map((type) => <option value={type} key={type}>{type}</option>)}</select></label>
+    {(assertion.type === "includes" || assertion.type === "equals" || assertion.type === "matches") && <label><span>{assertion.type === "matches" ? t("tests.pattern") : t("tests.expectedText")}</span><input value={assertion.value} disabled={disabled} onChange={(event) => onChange({ ...assertion, value: event.target.value })} /></label>}
+    {assertion.type === "output-schema" && <TestJsonEditor label={t("tests.outputSchema")} value={assertion.schema} disabled={disabled} onChange={(schema) => onChange({ ...assertion, schema: schema as Record<string, unknown> })} />}
+    {assertion.type === "tool-called" && <><label><span>{t("tests.tool")}</span><input required value={assertion.tool} disabled={disabled} onChange={(event) => onChange({ ...assertion, tool: event.target.value })} /></label><label><span>{t("tests.minCalls")}</span><input type="number" min={0} value={assertion.minCalls ?? ""} disabled={disabled} onChange={(event) => onChange({ ...assertion, minCalls: number(event.target.value) })} /></label><label><span>{t("tests.maxCalls")}</span><input type="number" min={0} value={assertion.maxCalls ?? ""} disabled={disabled} onChange={(event) => onChange({ ...assertion, maxCalls: number(event.target.value) })} /></label></>}
+    {assertion.type === "latency" && <label><span>{t("tests.maxLatency")}</span><input type="number" min={0} value={assertion.maxMs} disabled={disabled} onChange={(event) => onChange({ ...assertion, maxMs: Number(event.target.value) })} /></label>}
+    {assertion.type === "iterations" && <><label><span>{t("tests.minIterations")}</span><input type="number" min={0} value={assertion.min ?? ""} disabled={disabled} onChange={(event) => onChange({ ...assertion, min: number(event.target.value) })} /></label><label><span>{t("tests.maxIterations")}</span><input type="number" min={0} value={assertion.max ?? ""} disabled={disabled} onChange={(event) => onChange({ ...assertion, max: number(event.target.value) })} /></label></>}
+    {removable && <button className="button" type="button" disabled={disabled} onClick={onRemove}>{t("tests.removeCheck")}</button>}
+  </div>;
+}
 
 interface ExperimentResult {
   readonly id: string;
@@ -209,6 +261,7 @@ interface DisplayNodeCacheEntry {
   readonly diagnostics: Diagnostic[];
   readonly run?: NodeRunPresentation;
   readonly locked: boolean;
+  readonly pinned: boolean;
   readonly canInsertAtPort: NonNullable<HarnessNode["data"]["canInsertAtPort"]>;
   readonly getPortInsertions: NonNullable<HarnessNode["data"]["getPortInsertions"]>;
   readonly onInsertAtPort: NonNullable<HarnessNode["data"]["onInsertAtPort"]>;
@@ -227,6 +280,7 @@ const PALETTE_LABEL_KEYS = {
 } as const;
 
 const DOCK_LABEL_KEYS = {
+  project: "builder.dock.project",
   problems: "builder.dock.issues",
   tests: "builder.dock.tests",
   experiments: "builder.dock.compare",
@@ -337,6 +391,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteCategory, setPaletteCategory] = useState("all");
+  const [pendingPlacement, setPendingPlacement] = useState<{ type: string; label: string }>();
+  const [placementGhost, setPlacementGhost] = useState<{ x: number; y: number; label: string }>();
+  const suppressPaletteClickUntil = useRef(0);
+  const [layouting, setLayouting] = useState(false);
+  const [canvasMode, setCanvasMode] = useState<"design" | "live">("design");
+  const [liveRunPhase, setLiveRunPhase] = useState<"idle" | "starting" | "running" | "error">("idle");
+  const [liveInput, setLiveInput] = useState("");
+  const [liveInstruction, setLiveInstruction] = useState("");
+  const [liveTarget, setLiveTarget] = useState("run");
   const [studioCatalog, setStudioCatalog] = useState<StudioCatalogPayload>({
     components: catalog,
     tools: [],
@@ -358,13 +421,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [favorites, setFavorites] = useState<ReadonlySet<string>>(new Set());
   const [recents, setRecents] = useState<readonly string[]>([]);
   const [savePhase, setSavePhase] = useState<"idle" | "saving" | "error">("idle");
+  const [saveConflict, setSaveConflict] = useState(false);
   const [lastSavedAt, setLastSavedAt] = useState<number>();
   const initialStatus = useCallback(() => initial.diagnostics?.some((item) => item.severity === "error")
     ? t("builder.status.hostIssues", { count: initial.diagnostics.length })
     : initial.exists ? t("builder.status.loaded") : t("builder.status.new"), [initial.diagnostics, initial.exists, t]);
   const [statusNote, setStatusNote] = useState(initialStatus);
   useEffect(() => setStatusNote(initialStatus()), [initialStatus, locale]);
-  const [dropTarget, setDropTarget] = useState(false);
   const [runInput, setRunInput] = useState("");
   const [runId, setRunId] = useState("");
   const [trace, setTrace] = useState<RunEvent[]>([]);
@@ -380,6 +443,10 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const [storedRunPhase, setStoredRunPhase] = useState<"idle" | "loading" | "error">("idle");
   const runsRequested = useRef(false);
   const experimentAbortRef = useRef<AbortController | null>(null);
+  const liveAbortRef = useRef<AbortController | null>(null);
+  const saveAbortRef = useRef<AbortController | undefined>(undefined);
+  const saveSessionIdRef = useRef(randomId());
+  const lastSavedYamlRef = useRef(initial.yaml);
   const reviewedSkillScripts = useRef(new Set<string>());
   const confirmedTemplate = useRef<string | undefined>(undefined);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -435,6 +502,26 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    const receiveRunEvent = (raw: Event) => {
+      const event = (raw as CustomEvent<RunEvent>).detail;
+      if (!event || typeof event !== "object") return;
+      if (event.type === "run-start") {
+        setRunId(event.runId);
+        setTrace([event]);
+        setLiveRunPhase("running");
+        return;
+      }
+      setTrace((events) => events.some((candidate) => candidate.runId === event.runId && candidate.sequence === event.sequence)
+        ? events : [...events, event]);
+      if (event.type === "run-snapshot" && event.snapshot.agents.length) setCanvasMode("live");
+      if (event.type === "run-end") setLiveRunPhase("idle");
+      if (event.type === "error") setLiveRunPhase("error");
+    };
+    window.addEventListener("harnest-run-event", receiveRunEvent);
+    return () => window.removeEventListener("harnest-run-event", receiveRunEvent);
+  }, []);
+
   const refreshStudioCatalog = useCallback(async () => {
     const next = await requestJson<StudioCatalogPayload>("/api/catalog");
     setStudioCatalog(next);
@@ -482,6 +569,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     root: { ...document.draft.root, entrypoint: activeGraph.entrypoint },
     nodes: activeGraph.nodes,
     edges: activeGraph.edges,
+    layout: activeGraph.layout,
   } : document.draft, [activeGraph, document.draft]);
   const documentDraftRef = useRef(document.draft);
   const viewDraftRef = useRef(viewDraft);
@@ -507,9 +595,15 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       type: "replace-draft",
       draft: {
         ...documentDraftRef.current,
+        root: { ...documentDraftRef.current.root, version: draft.root.version },
         subgraphs: {
           ...documentDraftRef.current.subgraphs,
-          [activeSubgraph]: { entrypoint: draft.root.entrypoint, nodes: draft.nodes, edges: draft.edges },
+          [activeSubgraph]: {
+            entrypoint: draft.root.entrypoint,
+            nodes: draft.nodes,
+            edges: draft.edges,
+            ...(draft.layout ? { layout: draft.layout } : {}),
+          },
         },
       },
       touch,
@@ -520,7 +614,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const displayedDiagnostics = document.yamlState === "synced" ? document.diagnostics : document.yamlDiagnostics;
   const experimentRunning = experimentPhase === "running";
   const running = experimentRunning;
-  const graphLocked = running || document.yamlState !== "synced";
+  const graphLocked = running || layouting || canvasMode === "live" || document.yamlState !== "synced";
   const dirty = document.revision !== document.savedRevision || document.yamlState !== "synced";
   const structuralValidationCache = useRef({
     semanticRevision: document.semanticRevision,
@@ -662,7 +756,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       setStatusNote(validation.diagnostics[0]?.message ?? t("builder.portUnavailable"));
       return;
     }
-    const connection = { ...candidate, id: `connection_${crypto.randomUUID().slice(0, 8)}` };
+    const connection = { ...candidate, id: `connection_${randomId().slice(0, 8)}` };
     const edge: HarnessEdge = {
       id: connection.id,
       type: "smoothstep",
@@ -737,11 +831,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const displayNodeCache = useRef(new Map<string, DisplayNodeCacheEntry>());
   const displayNodes = useMemo(() => {
     const nextCache = new Map<string, DisplayNodeCacheEntry>();
+    const pinnedNodes = new Set(viewDraft.layout?.pinned ?? []);
     const nodes = viewDraft.nodes.map((node) => {
       const diagnostics = diagnosticsByNode.get(node.id) ?? EMPTY_NODE_DIAGNOSTICS;
       const run = runByNode.get(node.id);
       const cached = displayNodeCache.current.get(node.id);
-      if (cached?.source === node && cached.diagnostics === diagnostics && cached.run === run && cached.locked === graphLocked
+      const pinned = pinnedNodes.has(node.id);
+      if (cached?.source === node && cached.diagnostics === diagnostics && cached.run === run && cached.locked === graphLocked && cached.pinned === pinned
         && cached.canInsertAtPort === canInsertAtPort && cached.getPortInsertions === getPortInsertions
         && cached.onInsertAtPort === insertAtPort && cached.onAddAttachment === openAttachmentPicker) {
         nextCache.set(node.id, cached);
@@ -755,6 +851,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           runState: run?.runState ?? "idle",
           lastRun: run?.lastRun,
           locked: graphLocked,
+          pinned,
           canInsertAtPort,
           getPortInsertions,
           onInsertAtPort: insertAtPort,
@@ -766,6 +863,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         diagnostics,
         run,
         locked: graphLocked,
+        pinned,
         canInsertAtPort,
         getPortInsertions,
         onInsertAtPort: insertAtPort,
@@ -776,33 +874,60 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     });
     displayNodeCache.current = nextCache;
     return nodes;
-  }, [canInsertAtPort, diagnosticsByNode, getPortInsertions, graphLocked, insertAtPort, openAttachmentPicker, runByNode, viewDraft.nodes]);
+  }, [canInsertAtPort, diagnosticsByNode, getPortInsertions, graphLocked, insertAtPort, openAttachmentPicker, runByNode, viewDraft.layout?.pinned, viewDraft.nodes]);
 
   const displayEdges = useMemo(() => viewDraft.edges.map((edge) => ({
     ...edge,
+    type: "harness",
     label: edge.data?.connection ? edgeLabel(edge.data.connection) : undefined,
     className: "",
     animated: false,
-    data: { ...edge.data!, running: false },
+    data: {
+      ...edge.data!,
+      kind: edge.data?.connection && "condition" in edge.data.connection ? "condition" as const : "data" as const,
+      running: false,
+    },
   })), [viewDraft.edges]);
+
+  const liveSnapshot = useMemo(() => latestRunSnapshot(trace), [trace]);
+  const liveProjection = useMemo(() => liveGraph(liveSnapshot, manifests, {
+    task: t("builder.live.task"),
+    agent: t("builder.live.agent"),
+    assigned: t("builder.live.edgeAssigned"),
+    handoff: t("builder.live.edgeHandoff"),
+    orchestrator: () => t("builder.live.orchestrator"),
+    workingOn: (taskId) => t("builder.live.workingOn", { task: taskId }),
+    depth: (value) => t("builder.live.depth", { count: value }),
+    tokens: (value) => t("playground.tokens", { count: value }),
+    status: (value) => ({
+      queued: t("builder.live.status.queued"), running: t("builder.live.status.running"),
+      waiting: t("builder.live.status.waiting"), blocked: t("builder.live.status.blocked"),
+      completed: t("builder.live.status.completed"), failed: t("builder.live.status.failed"),
+      cancelled: t("builder.live.status.cancelled"), superseded: t("builder.live.status.superseded"),
+    })[value],
+  }), [liveSnapshot, manifests, t]);
+  const canvasNodes = canvasMode === "live" ? liveProjection.nodes : displayNodes;
+  const canvasEdges = canvasMode === "live" ? liveProjection.edges : displayEdges;
 
   useEffect(() => {
     const store = reactFlowStore.getState();
-    store.setNodes(displayNodes);
-    store.setEdges(displayEdges);
-  }, [displayEdges, displayNodes, reactFlowStore]);
+    store.setNodes(canvasNodes);
+    store.setEdges(canvasEdges);
+  }, [canvasEdges, canvasNodes, reactFlowStore]);
 
   useEffect(() => {
-    const graph = activeSubgraph ?? "root";
-    if (!viewDraft.nodes.length || fittedGraph.current === graph) return undefined;
+    const graph = `${canvasMode}:${activeSubgraph ?? "root"}`;
+    if (!canvasNodes.length || fittedGraph.current === graph) return undefined;
     const timer = window.setTimeout(() => {
       fittedGraph.current = graph;
-      void reactFlow.fitView({ padding: 0.25 });
+      if (canvasMode === "design" && viewDraft.layout?.viewport) void reactFlow.setViewport(viewDraft.layout.viewport);
+      else void reactFlow.fitView({ padding: 0.25 });
     }, 100);
     return () => window.clearTimeout(timer);
-  }, [activeSubgraph, reactFlow, viewDraft.nodes.length]);
+  }, [activeSubgraph, canvasMode, canvasNodes.length, reactFlow, viewDraft.layout?.viewport]);
 
   const onNodesChange: OnNodesChange<HarnessNode> = useCallback((changes) => {
+    if (canvasMode === "live") return;
     if (graphLocked && changes.some((change) => change.type !== "select" && change.type !== "dimensions")) return;
     const persistentChanges = changes.filter((change) => change.type !== "position");
     if (!persistentChanges.length) return;
@@ -815,7 +940,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       draft = { ...draft, root: { ...draft.root, entrypoint: chooseEntrypoint(draft) } };
     }
     replaceViewDraft(draft, removed ? "semantic" : "none");
-  }, [graphLocked, replaceViewDraft]);
+  }, [canvasMode, graphLocked, replaceViewDraft]);
 
   const onNodeDragStop: OnNodeDrag<HarnessNode> = useCallback(() => {
     const current = viewDraftRef.current;
@@ -830,14 +955,65 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     if (changed) replaceViewDraft({ ...current, nodes }, "layout");
   }, [reactFlow, replaceViewDraft]);
 
+  const autoLayout = useCallback(async () => {
+    if (graphLocked) return;
+    const current = viewDraftRef.current;
+    const targets = current.nodes;
+    if (targets.length < 2) return;
+    const targetIds = new Set(targets.map(({ id }) => id));
+    const rendered = new Map(reactFlow.getNodes().map((node) => [node.id, node]));
+    const pinned = new Set(current.layout?.pinned ?? []);
+    setLayouting(true);
+    setStatusNote(t("builder.layout.running"));
+    try {
+      const positions = await layoutGraph({
+        direction: "RIGHT",
+        density: "comfortable",
+        nodes: targets.map((node) => {
+          const measured = rendered.get(node.id)?.measured;
+          return {
+            id: node.id,
+            position: node.position,
+            width: measured?.width ?? 260,
+            height: measured?.height ?? 128,
+            inputs: Object.keys(node.data.manifest.ports.inputs),
+            outputs: Object.keys(node.data.manifest.ports.outputs),
+            pinned: pinned.has(node.id),
+          };
+        }),
+        edges: current.edges.filter((edge) => targetIds.has(edge.source) && targetIds.has(edge.target)).map((edge) => ({
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          sourceHandle: edge.sourceHandle,
+          targetHandle: edge.targetHandle,
+        })),
+      });
+      const upgraded = current.root.version !== "0.3";
+      replaceViewDraft({
+        ...current,
+        root: { ...current.root, version: "0.3" },
+        nodes: current.nodes.map((node) => positions[node.id] ? { ...node, position: positions[node.id] } : node),
+        layout: { ...current.layout, direction: "RIGHT" },
+      }, upgraded ? "semantic" : "layout");
+      window.setTimeout(() => setLayouting(false), 320);
+      setStatusNote(t("builder.layout.done"));
+      return;
+    } catch (error) {
+      setStatusNote(apiErrorMessage(error, t("builder.layout.failed"), t));
+    }
+    setLayouting(false);
+  }, [graphLocked, reactFlow, replaceViewDraft, t]);
+
   const onEdgesChange: OnEdgesChange<HarnessEdge> = useCallback((changes) => {
+    if (canvasMode === "live") return;
     if (graphLocked && changes.some((change) => change.type !== "select")) return;
     const current = viewDraftRef.current;
     const edges = applyEdgeChanges(changes, current.edges);
     const removed = changes.some((change) => change.type === "remove");
     const draft = { ...current, edges };
     replaceViewDraft(draft, removed ? "semantic" : "none");
-  }, [graphLocked, replaceViewDraft]);
+  }, [canvasMode, graphLocked, replaceViewDraft]);
 
   const candidateConnection = useCallback((connection: Connection | HarnessEdge): HarnessConnection | null => {
     if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) return null;
@@ -862,7 +1038,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       setStatusNote(validation.diagnostics[0]?.message ?? t("builder.incompatible"));
       return;
     }
-    const id = `connection_${crypto.randomUUID().slice(0, 8)}`;
+    const id = `connection_${randomId().slice(0, 8)}`;
     const complete = { ...candidate, id };
     const edge: HarnessEdge = {
       id,
@@ -906,7 +1082,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         ? ["skills", "skill"].find((port) => agent.data.manifest.ports.inputs[port])
         : ["tools", "toolResults", "tool"].find((port) => agent.data.manifest.ports.inputs[port]));
       if (sourcePort && targetPort) {
-        const connectionId = `connection_${crypto.randomUUID().slice(0, 8)}`;
+        const connectionId = `connection_${randomId().slice(0, 8)}`;
         const connection = {
           id: connectionId,
           from: { component: id, port: sourcePort },
@@ -937,26 +1113,38 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     })}${attachTo ? t("builder.componentAttached", { node: attachTo.nodeId }) : ""}${upgraded ? t("builder.specUpgraded") : ""}`);
   }, [graphLocked, manifests, replaceViewDraft, t, viewDraft]);
 
-  const addAtCenter = useCallback((type: string) => {
-    const bounds = canvasRef.current?.getBoundingClientRect();
-    const center = reactFlow.screenToFlowPosition({
-      x: bounds ? bounds.left + bounds.width / 2 : window.innerWidth / 2,
-      y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
-    });
-    const index = viewDraft.nodes.length;
-    addComponent(type, {
-      x: center.x - 250 + (index % 2) * 270,
-      y: center.y - 90 + Math.floor(index / 2) * 160,
-    });
-  }, [addComponent, reactFlow, viewDraft.nodes.length]);
-
-  const handleDrop = useCallback((event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDropTarget(false);
-    const type = event.dataTransfer.getData(DND_MIME);
+  const placeComponent = useCallback((type: string, x: number, y: number) => {
     if (!manifests.has(type)) return;
-    addComponent(type, reactFlow.screenToFlowPosition({ x: event.clientX, y: event.clientY }));
+    addComponent(type, reactFlow.screenToFlowPosition({ x, y }));
   }, [addComponent, manifests, reactFlow]);
+
+  const beginPointerPlacement = useCallback((item: PaletteViewItem, event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (item.kind !== "components" || graphLocked || event.button !== 0) return;
+    const start = { x: event.clientX, y: event.clientY };
+    let moved = false;
+    const move = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== event.pointerId) return;
+      moved ||= Math.hypot(pointer.clientX - start.x, pointer.clientY - start.y) > 4;
+      if (moved) setPlacementGhost({ x: pointer.clientX, y: pointer.clientY, label: item.label });
+    };
+    const up = (pointer: PointerEvent) => {
+      if (pointer.pointerId !== event.pointerId) return;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      setPlacementGhost(undefined);
+      const bounds = canvasRef.current?.getBoundingClientRect();
+      if (moved) suppressPaletteClickUntil.current = performance.now() + 500;
+      if (moved && bounds && pointer.clientX >= bounds.left && pointer.clientX <= bounds.right
+        && pointer.clientY >= bounds.top && pointer.clientY <= bounds.bottom) {
+        placeComponent(item.id, pointer.clientX, pointer.clientY);
+        setPendingPlacement(undefined);
+      } else setPendingPlacement({ type: item.id, label: item.label });
+    };
+    window.addEventListener("pointermove", move, { passive: true });
+    window.addEventListener("pointerup", up, { once: true });
+    window.addEventListener("pointercancel", up, { once: true });
+  }, [graphLocked, placeComponent]);
 
   const updateComponent = useCallback((component: HarnessComponent) => {
     if (graphLocked) return;
@@ -1131,10 +1319,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   }, [attachSkill, connectionManagerOpen, pendingSkillAttach, studioCatalog.skills, viewDraft.edges, viewDraft.nodes]);
 
   const applyTemplate = useCallback((template: TemplateCatalogItem) => {
-    if (dirty && document.draft.nodes.length && confirmedTemplate.current !== template.id) {
+    const componentCount = document.draft.nodes.length
+      + Object.values(document.draft.subgraphs).reduce((count, graph) => count + graph.nodes.length, 0);
+    const subgraphCount = Object.keys(document.draft.subgraphs).length;
+    if (componentCount && confirmedTemplate.current !== template.id) {
       setConfirmation({
         title: t("confirm.template.title"),
-        description: t("confirm.template.description"),
+        description: t(dirty ? "confirm.template.descriptionUnsaved" : "confirm.template.descriptionSaved", {
+          components: componentCount,
+          subgraphs: subgraphCount,
+        }),
         confirmLabel: t("confirm.template.action"),
         onConfirm: () => {
           confirmedTemplate.current = template.id;
@@ -1161,7 +1355,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       return selected ? { ...component, config: { ...config, connectionId: selected.id } } as typeof component : component;
     };
     next.components = next.components.map(equip) as HarnessSpec["components"];
-    if (next.version === "0.2" && next.subgraphs) {
+    if (next.version !== "0.1" && next.subgraphs) {
       for (const graph of Object.values(next.subgraphs)) graph.components = graph.components.map(equip) as typeof graph.components;
     }
     dispatch({ type: "replace-draft", draft: specToDraft(next, catalog), touch: "semantic" });
@@ -1176,11 +1370,14 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     const missing = template.connectionKinds?.find((kind) => !connections.some((connection) =>
       connection.kind === kind && connectionCanRun(connection)));
     setStatusNote(t(missing ? "builder.templateNeedsConnection" : "builder.templateAutoWired", { name: template.label }));
-  }, [catalog, connections, dirty, document.draft.nodes.length, markRecent, t]);
+  }, [catalog, connections, dirty, document.draft.nodes.length, document.draft.subgraphs, markRecent, t]);
 
   const activatePaletteItem = useCallback((item: PaletteViewItem) => {
     markRecent(item.key);
-    if (item.kind === "components") addAtCenter(item.id);
+    if (item.kind === "components") {
+      setPendingPlacement({ type: item.id, label: item.label });
+      setStatusNote(t("builder.placement.ready", { name: item.label }));
+    }
     else if (item.kind === "tools") {
       const agent = selectedNode?.data.component.type === "agent" ? selectedNode.id : undefined;
       addTool(item.payload as ToolCatalogItem, agent);
@@ -1189,7 +1386,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       else setStatusNote(t("builder.selectAgentForSkill"));
     } else if (item.kind === "connections") openConnections();
     else applyTemplate(item.payload as TemplateCatalogItem);
-  }, [addAtCenter, addTool, applyTemplate, attachSkill, markRecent, openConnections, selectedNode]);
+  }, [addTool, applyTemplate, attachSkill, markRecent, openConnections, selectedNode, t]);
 
   const completeConnection = useCallback((connection: ConnectionSummary) => {
     if (connectionTargetNodeId) {
@@ -1417,27 +1614,58 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   const save = useCallback(async () => {
     if (!canSave) return;
     const revision = document.revision;
+    const yaml = stringifySpec(draftToSpec(document.draft));
+    if (yaml === lastSavedYamlRef.current) {
+      dispatch({ type: "save-result", revision });
+      setSavePhase("idle");
+      return;
+    }
+    saveAbortRef.current?.abort();
+    const controller = new AbortController();
+    saveAbortRef.current = controller;
     setSavePhase("saving");
     setStatusNote(t("builder.status.saving"));
     try {
-      const payload = await requestJson<{ diagnostics?: Diagnostic[] }>("/api/spec", {
+      const payload = await requestJson<{ diagnostics?: Diagnostic[]; superseded?: boolean; yaml?: string }>("/api/spec", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ yaml: stringifySpec(draftToSpec(document.draft)) }),
+        body: JSON.stringify({ yaml, baseYaml: lastSavedYamlRef.current, clientRevision: revision, saveSessionId: saveSessionIdRef.current }),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
+      if (payload.superseded) { setSavePhase("idle"); return; }
+      lastSavedYamlRef.current = payload.yaml ?? yaml;
       dispatch({ type: "save-result", revision });
       dispatch({ type: "host-diagnostics", diagnostics: payload.diagnostics ?? [] });
       setSavePhase("idle");
+      setSaveConflict(false);
       setLastSavedAt(Date.now());
       if (payload.diagnostics?.length) setActiveDock("problems");
       setStatusNote(payload.diagnostics?.length
         ? t("builder.savedWithHostIssues", { count: payload.diagnostics.length })
         : t("builder.status.saved"));
     } catch (error) {
+      if (controller.signal.aborted) return;
       setSavePhase("error");
+      setSaveConflict(error instanceof ClientApiError && error.details.code === "SPEC_CONFLICT");
       setStatusNote(apiErrorMessage(error, t("builder.saveFailed"), t));
+    } finally {
+      if (saveAbortRef.current === controller) saveAbortRef.current = undefined;
     }
   }, [canSave, document.draft, document.revision, t]);
+
+  const reloadProject = useCallback(async () => {
+    const payload = await requestJson<SpecPayload>("/api/spec", { cache: "no-store" });
+    saveAbortRef.current?.abort();
+    if (payload.catalog?.length) setCatalog(payload.catalog);
+    lastSavedYamlRef.current = payload.yaml;
+    dispatch({ type: "load-saved", spec: payload.spec, yaml: payload.yaml });
+    setActiveSubgraph(undefined);
+    setSavePhase("idle");
+    setSaveConflict(false);
+    setLastSavedAt(Date.now());
+    setStatusNote(t("project.saved"));
+  }, [t]);
 
   const loadStoredRuns = useCallback(async () => {
     setStoredRunPhase("loading");
@@ -1450,11 +1678,81 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     }
   }, []);
 
+  const startLiveRun = useCallback(async () => {
+    if (!canRun || !liveInput.trim() || liveRunPhase === "starting" || liveRunPhase === "running") return;
+    liveAbortRef.current?.abort();
+    liveAbortRef.current = null;
+    setLiveRunPhase("starting");
+    setTrace([]);
+    setCanvasMode("live");
+    let controller: AbortController | undefined;
+    try {
+      const started = await requestJson<{ runId: string; events: string }>("/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input: liveInput }),
+      }, { timeoutMs: 60_000 });
+      setRunId(started.runId);
+      controller = new AbortController();
+      liveAbortRef.current = controller;
+      setLiveRunPhase("running");
+      const response = await fetch(started.events, { signal: controller.signal, cache: "no-store" });
+      if (!response.ok) throw new Error(`Run event stream returned HTTP ${response.status}`);
+      await readNdjson<RunEvent>(response, (event) => {
+        setTrace((events) => events.some((candidate) => candidate.sequence === event.sequence) ? events : [...events, event]);
+        if (event.type === "error") setLiveRunPhase("error");
+        if (event.type === "run-end") setLiveRunPhase("idle");
+      });
+      setLiveRunPhase((phase) => phase === "running" ? "idle" : phase);
+      void loadStoredRuns();
+    } catch (error) {
+      if (!controller?.signal.aborted) {
+        setLiveRunPhase("error");
+        setStatusNote(apiErrorMessage(error, t("builder.live.failed"), t));
+      }
+    } finally {
+      if (liveAbortRef.current === controller) liveAbortRef.current = null;
+    }
+  }, [canRun, liveInput, liveRunPhase, loadStoredRuns, t]);
+
+  const stopLiveRun = useCallback(async () => {
+    if (!runId) return;
+    await requestJson(`/api/runs/${encodeURIComponent(runId)}`, { method: "DELETE" }).catch(() => undefined);
+    liveAbortRef.current?.abort();
+    liveAbortRef.current = null;
+    setLiveRunPhase("idle");
+  }, [runId]);
+
+  const sendLiveInstruction = useCallback(async () => {
+    if (!runId || !liveInstruction.trim()) return;
+    const snapshot = latestRunSnapshot(trace);
+    const command = liveTarget.startsWith("task:")
+      ? { type: "task-directive", taskId: liveTarget.slice(5), instruction: liveInstruction }
+      : liveTarget.startsWith("agent:")
+        ? { type: "message", target: { kind: "agent", id: liveTarget.slice(6) }, content: liveInstruction }
+        : liveTarget.startsWith("team:")
+          ? { type: "message", target: { kind: "team", id: liveTarget.slice(5) }, content: liveInstruction }
+          : { type: "message", target: { kind: "run" }, content: liveInstruction };
+    try {
+      await requestJson(`/api/runs/${encodeURIComponent(runId)}/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      });
+      setLiveInstruction("");
+      setStatusNote(t("builder.live.commandSent"));
+      if (!snapshot) setLiveTarget("run");
+    } catch (error) {
+      setStatusNote(apiErrorMessage(error, t("builder.live.commandFailed"), t));
+    }
+  }, [liveInstruction, liveTarget, runId, t, trace]);
+
   const inspectStoredRun = useCallback(async (stored: StoredRun) => {
     setActiveDock("trace");
     if (stored.events) {
       setRunId(stored.runId);
       setTrace(stored.events);
+      if (stored.events.some((event) => event.type === "run-snapshot")) setCanvasMode("live");
       return;
     }
     setStoredRunPhase("loading");
@@ -1462,6 +1760,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       const payload = await requestJson<{ run: StoredRun }>(`/api/runs?runId=${encodeURIComponent(stored.runId)}`);
       setRunId(payload.run.runId);
       setTrace(payload.run.events ?? []);
+      if (payload.run.events?.some((event) => event.type === "run-snapshot")) setCanvasMode("live");
       setStoredRunPhase("idle");
     } catch {
       setStoredRunPhase("error");
@@ -1549,6 +1848,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   useEffect(() => () => {
     experimentAbortRef.current?.abort();
+    liveAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -1560,13 +1860,17 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   }, [activeSubgraph, document.draft.subgraphs]);
 
   useEffect(() => {
-    if (!paletteOpen) return;
+    if (!paletteOpen && !pendingPlacement) return;
     const closePalette = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPaletteOpen(false);
+      if (event.key === "Escape") {
+        setPaletteOpen(false);
+        setPendingPlacement(undefined);
+        setPlacementGhost(undefined);
+      }
     };
     window.addEventListener("keydown", closePalette);
     return () => window.removeEventListener("keydown", closePalette);
-  }, [paletteOpen]);
+  }, [paletteOpen, pendingPlacement]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -1580,9 +1884,20 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
 
   useEffect(() => {
     if (!canAutoSave) return;
-    const timer = setTimeout(() => void save(), 650);
+    const delay = document.historyPast.at(-1)?.touch === "layout" ? 1_200 : 850;
+    const timer = setTimeout(() => void save(), delay);
     return () => clearTimeout(timer);
-  }, [canAutoSave, save]);
+  }, [canAutoSave, document.historyPast, save]);
+
+  useEffect(() => {
+    const controller = saveAbortRef.current;
+    if (!controller) return;
+    controller.abort();
+    saveAbortRef.current = undefined;
+    setSavePhase("idle");
+  }, [document.revision]);
+
+  useEffect(() => () => saveAbortRef.current?.abort(), []);
 
   useEffect(() => {
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -1601,6 +1916,16 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   }, [canValidate, document.draft.nodes.length, document.validatedSemanticRevision, validate]);
 
   const completedRun = trace.some((event) => event.type === "run-end");
+  const liveOutcome = useMemo(() => {
+    const terminal = trace.findLast((event) => event.type === "run-end" || event.type === "error");
+    if (!terminal) return undefined;
+    const data = terminal as unknown as Record<string, unknown>;
+    const value = terminal.type === "run-end" ? data.output : data.message;
+    return {
+      ok: terminal.type === "run-end",
+      text: typeof value === "string" ? value : value === undefined ? "" : JSON.stringify(value, null, 2),
+    };
+  }, [trace]);
   const templateReady = viewDraft.nodes.length > 0;
   const requiredConnectionKinds = selectedTemplateId
     ? studioCatalog.templates.find((template) => template.id === selectedTemplateId)?.connectionKinds ?? []
@@ -1671,11 +1996,13 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
   };
   const addTest = () => {
     const id = uniqueComponentId("case", new Set(savedTests.map((test) => test.id)));
-    const test: HarnessTestCase = {
+    const test = {
       id,
       input: runInput.trim() || "Hello",
-      assertion: { type: "includes", value: "expected text" },
-    };
+      ...(document.draft.root.version === "0.1"
+        ? { assertion: { type: "includes" as const, value: "expected text" } }
+        : { assertions: [{ type: "includes" as const, value: "expected text" }] }),
+    } as HarnessTestCase;
     replaceTests([...savedTests, test]);
     setActiveDock("tests");
   };
@@ -1708,7 +2035,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       <button className="button button-primary" disabled={!document.pendingSpec || running} onClick={() => dispatch({ type: "apply-yaml" })}>{t("common.apply")} YAML</button>
     </div>
   );
-  const dockTabs: DockTab[] = ["problems", "tests", "experiments", "trace", "yaml"];
+  const dockTabs: DockTab[] = ["problems", "tests", "experiments", "trace", "project", "yaml"];
   const moveDockFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, tab: DockTab) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
     event.preventDefault();
@@ -1732,7 +2059,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         setConnections(next);
         void refreshStudioCatalog().catch(() => setStatusNote(t("builder.catalogRefresh.connection")));
       }}
-      onComplete={requestedConnectionKind || requestedConnectionId || connectionTargetNodeId || attachmentPicker ? completeConnection : undefined}
+      onComplete={completeConnection}
     />}
     {customToolOpen && <CustomToolManager
       open
@@ -1849,14 +2176,12 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               <button
                 className="palette-item"
                 style={{ "--port-color": colorFor(item.category) } as CSSProperties}
-                draggable={item.kind === "components" && !graphLocked}
                 disabled={!item.available || (item.kind === "components" && graphLocked)}
-                onClick={() => activatePaletteItem(item)}
-                onDragStart={(event) => {
-                  if (item.kind !== "components") return;
-                  event.dataTransfer.setData(DND_MIME, item.id);
-                  event.dataTransfer.effectAllowed = "copy";
+                onClick={() => {
+                  if (performance.now() < suppressPaletteClickUntil.current) return;
+                  activatePaletteItem(item);
                 }}
+                onPointerDown={(event) => beginPointerPlacement(item, event)}
               >
                 <span className="palette-glyph" aria-hidden="true">{glyphFor(item.label)}</span>
                 <span><span className="palette-title">{item.label}</span><span className="palette-description">{categoryLabel(t, item.category)} · {item.description}</span></span>
@@ -1867,19 +2192,21 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           )) : <div className="palette-empty">{t("builder.catalog.empty")}{paletteKind === "connections" && <button className="button button-primary" onClick={() => openConnections()}>{t("connections.add")}</button>}</div>}
         </div>
       </aside>}
+      {placementGhost && <div className="canvas-drag-ghost" style={{ left: placementGhost.x, top: placementGhost.y }} aria-hidden="true">＋ {placementGhost.label}</div>}
 
       <section
         ref={canvasRef}
-        className={`canvas-panel ${dropTarget ? "is-drop-target" : ""}`}
+        className={`canvas-panel ${pendingPlacement ? "is-placing" : ""} ${layouting ? "is-auto-layouting" : ""}`}
         aria-label={t("builder.canvas")}
-        onDragEnter={(event) => { event.preventDefault(); if (!graphLocked) setDropTarget(true); }}
-        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(false); }}
-        onDragOver={(event) => { if (!graphLocked) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }}
-        onDrop={handleDrop}
       >
         {!setupDismissed && !setupComplete && <SetupJourney steps={setupSteps} onDismiss={() => setSetupDismissed(true)} />}
         <div className="canvas-toolbar">
           <button className="catalog-toggle" type="button" aria-expanded={paletteOpen} onClick={() => setPaletteOpen((current) => !current)}>＋ {t("builder.add")}</button>
+          <span className="canvas-mode" role="group" aria-label={t("builder.canvas.mode")}>
+            <button type="button" className={canvasMode === "design" ? "is-active" : ""} aria-pressed={canvasMode === "design"} onClick={() => setCanvasMode("design")}>{t("builder.canvas.design")}</button>
+            <button type="button" className={canvasMode === "live" ? "is-active" : ""} aria-pressed={canvasMode === "live"} onClick={() => setCanvasMode("live")}>{t("builder.canvas.live")}</button>
+          </span>
+          {canvasMode === "design" && <>
           <button className={`graph-crumb ${activeSubgraph ? "" : "is-active"}`} disabled={!activeSubgraph} onClick={() => setActiveSubgraph(undefined)}>{t("builder.root")}</button>
           {activeSubgraph && <><span aria-hidden="true">›</span><span className="graph-crumb is-active">{activeSubgraph}</span></>}
           {Object.keys(document.draft.subgraphs).length > 0 && (
@@ -1892,31 +2219,63 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             <button type="button" disabled={!canUndo} aria-label={t("builder.undo")} title={`${t("builder.undo")} (Ctrl/⌘ Z)`} onClick={() => { dispatch({ type: "undo" }); setStatusNote(t("builder.undoDone")); }}>↶</button>
             <button type="button" disabled={!canRedo} aria-label={t("builder.redo")} title={`${t("builder.redo")} (Ctrl/⌘ Shift Z)`} onClick={() => { dispatch({ type: "redo" }); setStatusNote(t("builder.redoDone")); }}>↷</button>
           </span>
-          <span className="utility-label">{t("builder.graphSummary", { components: viewDraft.nodes.length, connections: viewDraft.edges.length })}</span>
+          <span className="canvas-layout-tools" role="group" aria-label={t("builder.layout.aria")}>
+            <button type="button" disabled={graphLocked || viewDraft.nodes.length < 2} onClick={() => void autoLayout()}>{t("builder.layout.action")}</button>
+          </span>
+          <VersionHistory
+            currentYaml={document.yamlState === "synced" ? document.yamlText : stringifySpec(draftToSpec(document.draft))}
+            onRestored={(spec, yaml) => {
+              saveAbortRef.current?.abort();
+              lastSavedYamlRef.current = yaml;
+              dispatch({ type: "load-saved", spec, yaml });
+              setActiveSubgraph(undefined);
+              setLastSavedAt(Date.now());
+              setSavePhase("idle");
+              setStatusNote(t("versions.restore"));
+            }}
+          />
+          </>}
+          <span className="utility-label">{canvasMode === "live"
+            ? t("builder.live.summary", { agents: liveSnapshot?.agents.length ?? 0, tasks: liveSnapshot?.tasks.length ?? 0 })
+            : t("builder.graphSummary", { components: viewDraft.nodes.length, connections: viewDraft.edges.length })}</span>
         </div>
-        {viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">{t("builder.blank.eyebrow")}</span><strong>{t("builder.blank.title")}</strong><span>{t("builder.blank.description")}</span><button className="onboarding-blank" onClick={() => { setPaletteKind("templates"); setPaletteOpen(true); }}>{t("setup.browseRecipes")}</button></div>}
+        {canvasMode === "design" && viewDraft.nodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">{t("builder.blank.eyebrow")}</span><strong>{t("builder.blank.title")}</strong><span>{t("builder.blank.description")}</span><button className="onboarding-blank" onClick={() => { setPaletteKind("templates"); setPaletteOpen(true); }}>{t("setup.browseRecipes")}</button></div>}
+        {canvasMode === "live" && canvasNodes.length === 0 && <div className="commissioning-onboarding"><span className="sheet-eyebrow">{t("builder.canvas.live")}</span><strong>{t("builder.live.empty")}</strong><span>{t("builder.live.emptyDescription")}</span></div>}
         <ReactFlow<HarnessNode, HarnessEdge>
-          defaultNodes={displayNodes}
-          defaultEdges={displayEdges}
+          defaultNodes={canvasNodes}
+          defaultEdges={canvasEdges}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           defaultEdgeOptions={defaultEdgeOptions}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           isValidConnection={isValidConnection}
-          onPaneClick={() => {
+          onPaneClick={(event) => {
+            if (canvasMode === "live") return;
+            if (pendingPlacement) {
+              placeComponent(pendingPlacement.type, event.clientX, event.clientY);
+              setPendingPlacement(undefined);
+              return;
+            }
             const nodes = viewDraft.nodes.map((node) => ({ ...node, selected: false }));
             const edges = viewDraft.edges.map((edge) => ({ ...edge, selected: false }));
             replaceViewDraft({ ...viewDraft, nodes, edges }, "none");
           }}
-          nodesDraggable={!graphLocked}
-          nodesConnectable={!graphLocked}
+          nodesDraggable={canvasMode === "design" && !graphLocked}
+          nodesConnectable={canvasMode === "design" && !graphLocked}
           edgesReconnectable={false}
           deleteKeyCode={graphLocked ? null : ["Backspace", "Delete"]}
-          snapToGrid
-          snapGrid={snapGrid}
-          fitView
+          snapToGrid={false}
+          onMoveEnd={(_event, viewport) => {
+            if (canvasMode !== "design" || viewDraft.root.version !== "0.3") return;
+            const previous = viewDraft.layout?.viewport;
+            if (previous && previous.x === viewport.x && previous.y === viewport.y && previous.zoom === viewport.zoom) return;
+            replaceViewDraft({ ...viewDraft, layout: { ...viewDraft.layout, viewport } }, "layout");
+          }}
+          fitView={!viewDraft.layout?.viewport}
+          defaultViewport={viewDraft.layout?.viewport}
           fitViewOptions={{ padding: 0.25 }}
           minZoom={0.25}
           maxZoom={1.8}
@@ -1939,8 +2298,48 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
       </section>
 
       <aside className="inspector-panel" aria-label={t("builder.inspector.aria")}>
-        <div className="panel-heading"><h2>{t("builder.inspector")}</h2><span className="panel-count">{selectedEdge ? t("builder.inspector.connection") : selectedNode?.data.component.type ?? t("builder.inspector.none")}</span></div>
-        <Inspector
+        {canvasMode === "live" ? <>
+          <div className="panel-heading"><h2>{t("builder.live.activity")}</h2><span className={`panel-count is-${liveRunPhase}`}>{liveSnapshot?.status ?? liveRunPhase}</span></div>
+          <div className="live-activity" aria-live="polite">
+            <section>
+              <label htmlFor="live-run-input">{t("builder.live.request")}</label>
+              <textarea id="live-run-input" value={liveInput} disabled={liveRunPhase === "starting" || liveRunPhase === "running"} placeholder={t("builder.live.requestPlaceholder")} onChange={(event) => setLiveInput(event.target.value)} />
+              <div className="live-actions">
+                <button className="button button-primary" disabled={!canRun || !liveInput.trim() || liveRunPhase === "starting" || liveRunPhase === "running"} onClick={() => void startLiveRun()}>{liveRunPhase === "starting" ? t("common.preparing") : t("builder.live.start")}</button>
+                <button className="button button-danger" disabled={liveRunPhase !== "running"} onClick={() => void stopLiveRun()}>{t("builder.live.stop")}</button>
+              </div>
+            </section>
+            {runId && <section className="live-run-identity"><span>{t("builder.live.runId")}</span><code>{runId}</code></section>}
+            {liveOutcome && <section className={`live-result ${liveOutcome.ok ? "is-success" : "is-error"}`}>
+              <h3>{t(liveOutcome.ok ? "builder.live.finalResult" : "builder.live.failureResult")}</h3>
+              <pre>{liveOutcome.text || t("builder.live.emptyResult")}</pre>
+            </section>}
+            {liveSnapshot && <>
+              <section className="live-metrics">
+                <span><strong>{liveSnapshot.agents.length}</strong>{t("builder.live.agents")}</span>
+                <span><strong>{liveSnapshot.tasks.length}</strong>{t("builder.live.tasks")}</span>
+                <span><strong>{liveSnapshot.revision}</strong>{t("builder.live.revision")}</span>
+              </section>
+              <section>
+                <label htmlFor="live-target">{t("builder.live.target")}</label>
+                <select id="live-target" value={liveTarget} onChange={(event) => setLiveTarget(event.target.value)}>
+                  <option value="run">{t("builder.live.everyone")}</option>
+                  {[...new Set(liveSnapshot.agents.map((agent) => agent.teamId))].map((team) => <option key={`team:${team}`} value={`team:${team}`}>{t("builder.live.team")} · {team}</option>)}
+                  {liveSnapshot.tasks.map((task) => <option key={`task:${task.id}`} value={`task:${task.id}`}>{t("builder.live.task")} · {task.id}</option>)}
+                  {liveSnapshot.agents.map((agent) => <option key={`agent:${agent.id}`} value={`agent:${agent.id}`}>{t("builder.live.agent")} · {agent.template}</option>)}
+                </select>
+                <textarea value={liveInstruction} disabled={liveRunPhase !== "running"} placeholder={t("builder.live.instructionPlaceholder")} onChange={(event) => setLiveInstruction(event.target.value)} />
+                <button className="button" disabled={liveRunPhase !== "running" || !liveInstruction.trim()} onClick={() => void sendLiveInstruction()}>{t("builder.live.send")}</button>
+              </section>
+              <section className="live-feed"><h3>{t("builder.live.feed")}</h3>
+                {liveSnapshot.messages.slice(-12).toReversed().map((message) => <article key={message.id}><span>{message.from} → {message.to.kind}{message.to.id ? `:${message.to.id}` : ""}</span><p>{message.content}</p></article>)}
+                {!liveSnapshot.messages.length && <p>{t("builder.live.noMessages")}</p>}
+              </section>
+            </>}
+          </div>
+        </> : <>
+          <div className="panel-heading"><h2>{t("builder.inspector")}</h2><span className="panel-count">{selectedEdge ? t("builder.inspector.connection") : selectedNode?.data.component.type ?? t("builder.inspector.none")}</span></div>
+          <Inspector
           node={selectedNode}
           edge={selectedEdge}
           entrypoint={viewDraft.root.entrypoint}
@@ -1954,6 +2353,10 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
           subgraphs={Object.keys(document.draft.subgraphs)}
           connections={connections}
           tools={studioCatalog.tools}
+          specVersion={document.draft.root.version}
+          projectGraph={activeSubgraph}
+          projectLocked={dirty || running}
+          onProjectChanged={reloadProject}
           focusPath={diagnosticFocus && diagnosticFocus.componentId === selectedNode?.id ? diagnosticFocus.path : undefined}
           focusVersion={diagnosticFocus?.version}
           onOpenConnections={(kind) => openConnections(kind, selectedNode?.id)}
@@ -1975,7 +2378,8 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
             }
             setActiveSubgraph(name);
           }}
-        />
+          />
+        </>}
       </aside>
 
       <section className={`bottom-dock ${dockOpen ? "" : "is-collapsed"}`} aria-label={t("builder.dock.aria")}>
@@ -2011,6 +2415,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               </div>
             </div>
           )}
+          {activeDock === "project" && <ProjectFiles locked={dirty || running} onChanged={reloadProject} />}
           {activeDock === "problems" && (displayedDiagnostics.length ? (
             <ul className="diagnostic-list">
               {displayedDiagnostics.map((diagnostic, index) => {
@@ -2040,20 +2445,21 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
               <div className="tests-workspace">
                 <section className="test-case-list" aria-label={t("tests.aria")}>
                   {savedTests.length ? savedTests.map((test, index) => {
-                    const assertion = simpleTestAssertion(test);
-                    const assertionCount = testAssertions(test).length;
+                    const assertions = testAssertions(test);
                     return <article className="test-case-editor" key={`${index}:${test.id}`}>
                       <div className="test-case-heading">
                         <label><span>{t("tests.caseId")}</span><input value={test.id} maxLength={64} disabled={running} onChange={(event) => updateTest(index, (current) => ({ ...current, id: event.target.value }))} /></label>
                         <button className="button" disabled={running} title={`${t("common.remove")} ${test.id}`} onClick={() => removeTest(index)}>{t("common.remove")}</button>
                       </div>
-                      {typeof test.input === "string" ? <label className="test-case-field"><span>{t("tests.request")}</span><textarea value={test.input} disabled={running} onChange={(event) => updateTest(index, (current) => ({ ...current, input: event.target.value }))} /></label>
-                        : <div className="test-case-advanced"><span>{t("tests.structuredRequest")}</span><small>{t("tests.structuredRequestHelp")}</small></div>}
-                      {assertion ? <div className="test-expectation">
-                        <label><span>{t("tests.expect")}</span><select value={assertion.type} disabled={running} onChange={(event) => updateTest(index, (current) => replaceSimpleTestAssertion(current, { ...assertion, type: event.target.value as SimpleTestAssertion["type"] }))}>{SIMPLE_TEST_ASSERTIONS.map((type) => <option value={type} key={type}>{type}</option>)}</select></label>
-                        <label><span>{assertion.type === "matches" ? t("tests.pattern") : t("tests.expectedText")}</span><input value={assertion.value} disabled={running} onChange={(event) => updateTest(index, (current) => replaceSimpleTestAssertion(current, { ...assertion, value: event.target.value }))} /></label>
-                        {assertionCount > 1 && <small>{t("tests.additionalChecks", { count: assertionCount - 1 })}</small>}
-                      </div> : <div className="test-case-advanced"><span>{t("tests.advancedChecks", { count: assertionCount })}</span><small>{t("tests.caseUnchanged")}</small><button className="button" onClick={() => setActiveDock("yaml")}>{t("tests.editYaml")}</button></div>}
+                      {typeof test.input === "string" ? <>
+                        <label className="test-case-field"><span>{t("tests.request")}</span><textarea value={test.input} disabled={running} onChange={(event) => updateTest(index, (current) => ({ ...current, input: event.target.value }))} /></label>
+                        {document.draft.root.version !== "0.1" && <button className="button" type="button" disabled={running} onClick={() => updateTest(index, (current) => ({ ...current, input: {} }))}>{t("tests.useJsonInput")}</button>}
+                      </> : <>
+                        <TestJsonEditor label={t("tests.structuredRequest")} value={test.input} disabled={running} onChange={(input) => updateTest(index, (current) => ({ ...current, input }))} />
+                        <button className="button" type="button" disabled={running} onClick={() => updateTest(index, (current) => ({ ...current, input: JSON.stringify(current.input, null, 2) }))}>{t("tests.useTextInput")}</button>
+                      </>}
+                      {document.draft.root.version !== "0.1" && <button className="button" type="button" disabled={running} onClick={() => updateTest(index, (current) => replaceTestAssertions(current, [...testAssertions(current), assertionForType("includes")], "0.2"))}>{t("tests.addCheck")}</button>}
+                      {assertions.map((assertion, assertionIndex) => <TestAssertionEditor key={`${assertionIndex}:${assertion.type}`} assertion={assertion} disabled={running} advanced={document.draft.root.version !== "0.1"} removable={document.draft.root.version !== "0.1" && assertions.length > 1} onChange={(next) => updateTest(index, (current) => replaceTestAssertions(current, testAssertions(current).map((candidate, candidateIndex) => candidateIndex === assertionIndex ? next : candidate), document.draft.root.version))} onRemove={() => updateTest(index, (current) => replaceTestAssertions(current, testAssertions(current).filter((_, candidateIndex) => candidateIndex !== assertionIndex), "0.2"))} />)}
                     </article>;
                   }) : <div className="empty-dock"><span>{t("tests.empty")}</span><button className="button button-primary" onClick={addTest}>{t("tests.addFirst")}</button></div>}
                 </section>
@@ -2152,7 +2558,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         <span>{savePhase === "error" ? t("save.failed") : savePhase === "saving" ? t("save.saving") : dirty ? t("save.queued") : lastSavedAt ? t("save.saved", { time: formatTime(lastSavedAt, { hour: "2-digit", minute: "2-digit" }) }) : t("common.ready")}</span>
         <span>{document.yamlState === "synced" ? t("builder.yaml.statusSynced") : t("builder.yaml.statusPending")}</span>
         <span>{errorDiagnostics.length ? t("save.issues", { count: errorDiagnostics.length }) : document.validationPhase === "checking" ? t("save.validating") : serverValidated ? t("save.valid") : document.validationPhase}</span>
-        {savePhase === "error" && <button className="status-retry" onClick={() => void save()}>{t("common.retry")}</button>}
+        {savePhase === "error" && <button className="status-retry" onClick={() => void (saveConflict ? reloadProject() : save())}>{t(saveConflict ? "common.refresh" : "common.retry")}</button>}
       </footer>
       </>}
 
@@ -2167,6 +2573,10 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         connections={connections}
         toolCount={studioCatalog.tools.length}
         skillCount={studioCatalog.skills.length}
+        specVersion={document.draft.root.version}
+        runtimeConfig={document.draft.root.runtime && typeof document.draft.root.runtime === "object" && !Array.isArray(document.draft.root.runtime)
+          ? document.draft.root.runtime as Readonly<Record<string, unknown>> : {}}
+        runtimeLocked={running}
         onOpenChange={(open) => { if (!open) navigate("builder"); }}
         onPageChange={(page) => router.replace(`${STUDIO_SURFACE_HREFS.settings}?section=${page}`)}
         onThemeChange={applyTheme}
@@ -2174,6 +2584,11 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         onManageConnections={() => openConnections()}
         onManageTools={() => setCustomToolOpen(true)}
         onManageSkills={() => setSkillManagerOpen(true)}
+        onRuntimeChange={(runtime) => {
+          const root = { ...documentDraftRef.current.root };
+          if (runtime) root.runtime = runtime; else delete root.runtime;
+          dispatch({ type: "replace-draft", draft: { ...documentDraftRef.current, root }, touch: "semantic" });
+        }}
       >{managerDialogs}</StudioSettings>}
       {confirmation && <ConfirmDialog open title={confirmation.title} description={confirmation.description} confirmLabel={confirmation.confirmLabel} cancelLabel={t("common.cancel")} danger onConfirm={confirmation.onConfirm} onOpenChange={(open) => { if (!open) setConfirmation(undefined); }} />}
       {surface !== "settings" && managerDialogs}

@@ -1,11 +1,12 @@
-import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnestai/core";
 import type {
   AdapterContext,
   ModelAdapter,
   ModelEvent,
   ModelRequest,
+  ModelContentPart,
   TokenUsage,
-} from "@harnest/core";
+} from "@harnestai/core";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1/";
 const DEFAULT_API_KEY = "env:OPENAI_API_KEY";
@@ -17,6 +18,15 @@ export interface OpenAICompatibleAdapterOptions {
   readonly baseUrl?: string;
   readonly apiKey?: string;
 }
+
+const openAiContent = (content: string | readonly ModelContentPart[]): unknown => typeof content === "string"
+  ? content
+  : content.map((part) => part.type === "text"
+    ? { type: "text", text: part.text }
+    : { type: "image_url", image_url: { url: `data:${part.mimeType};base64,${part.data}` } });
+
+const textContent = (content: string | readonly ModelContentPart[]): string => typeof content === "string"
+  ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
 
 function endpoint(baseUrl: string): URL {
   return new URL("chat/completions", baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
@@ -36,6 +46,9 @@ function tokenUsage(value: unknown): TokenUsage | undefined {
   const outputTokens =
     typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined;
   const totalTokens = typeof usage.total_tokens === "number" ? usage.total_tokens : undefined;
+  const inputDetails = asRecord(usage.prompt_tokens_details) ?? asRecord(usage.input_tokens_details);
+  const cachedInputTokens = typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : undefined;
+  const cacheWriteInputTokens = typeof inputDetails?.cache_write_tokens === "number" ? inputDetails.cache_write_tokens : undefined;
   if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) {
     return undefined;
   }
@@ -44,6 +57,8 @@ function tokenUsage(value: unknown): TokenUsage | undefined {
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
   };
 }
 
@@ -75,9 +90,10 @@ async function throwHttpError(response: Response, adapterId: string): Promise<ne
     // The status still provides a stable normalized error when the body is not JSON.
   }
 
+  const contextOverflow = /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message);
   throw new AdapterError(message, {
     adapterId,
-    code: `http_${response.status}`,
+    code: contextOverflow ? "context_overflow" : `http_${response.status}`,
     status: response.status,
     retryable: response.status === 429 || response.status >= 500,
     ...(requestId === undefined ? {} : { requestId }),
@@ -96,7 +112,7 @@ function messages(request: ModelRequest): unknown[] {
   return request.messages.map((message) => {
     if (message.role === "assistant" && message.toolCalls?.length) return {
       role: "assistant",
-      content: message.content || null,
+      content: textContent(message.content) || null,
       tool_calls: message.toolCalls.map((call) => ({
         id: call.id,
         type: "function",
@@ -105,10 +121,10 @@ function messages(request: ModelRequest): unknown[] {
     };
     if (message.role === "tool") return {
       role: "tool",
-      content: message.content,
+      content: textContent(message.content),
       tool_call_id: message.toolCallId,
     };
-    return { role: message.role, content: message.content };
+    return { role: message.role, content: openAiContent(message.content) };
   });
 }
 
@@ -120,10 +136,21 @@ export function createOpenAICompatibleAdapter(
 
   return {
     id,
-    capabilities: { streaming: true, json: true, cancellation: true, tools: true },
+    capabilities: {
+      streaming: true,
+      json: true,
+      cancellation: true,
+      tools: true,
+      inputMedia: ["image"],
+      promptCaching: ["automatic"],
+    },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
+      const baseUrl = request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL;
+      const officialOpenAI = (() => {
+        try { return new URL(baseUrl).hostname.toLocaleLowerCase() === "api.openai.com"; } catch { return false; }
+      })();
       const body: Record<string, unknown> = {
         model: request.model,
         messages: messages(request),
@@ -149,11 +176,19 @@ export function createOpenAICompatibleAdapter(
                 },
               },
             }),
+        ...(request.promptCache && officialOpenAI ? { prompt_cache_key: request.promptCache.key } : {}),
+      };
+
+      if (request.promptCache && !officialOpenAI) yield {
+        type: "cache",
+        status: "bypass",
+        mode: request.promptCache.mode,
+        reason: "Prompt-cache extensions are disabled for custom OpenAI-compatible endpoints",
       };
 
       let response: Response;
       try {
-        response = await (context.fetch ?? fetch)(endpoint(request.baseUrl ?? options.baseUrl ?? DEFAULT_BASE_URL), {
+        response = await (context.fetch ?? fetch)(endpoint(baseUrl), {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -192,12 +227,25 @@ export function createOpenAICompatibleAdapter(
         const root = asRecord(payload);
         const errorMessage = providerMessage(root);
         if (errorMessage) {
-          throw new AdapterError(errorMessage, { adapterId: id, code: "provider_error" });
+          throw new AdapterError(errorMessage, {
+            adapterId: id,
+            code: /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(errorMessage)
+              ? "context_overflow" : "provider_error",
+          });
         }
         if (typeof root?.model === "string") model = root.model;
 
         const usage = tokenUsage(root?.usage);
-        if (usage) yield { type: "usage", usage };
+        if (usage) {
+          yield { type: "usage", usage };
+          if (request.promptCache && officialOpenAI) yield {
+            type: "cache",
+            status: (usage.cachedInputTokens ?? 0) > 0 ? "hit" : (usage.cacheWriteInputTokens ?? 0) > 0 ? "write" : "miss",
+            mode: "automatic",
+            ...(usage.cachedInputTokens === undefined ? {} : { cachedInputTokens: usage.cachedInputTokens }),
+            ...(usage.cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens: usage.cacheWriteInputTokens }),
+          };
+        }
 
         const choices = Array.isArray(root?.choices) ? root.choices : [];
         for (const choiceValue of choices) {

@@ -1,5 +1,5 @@
-import { validateSpec } from "@harnest/core";
-import { loadSpecFile } from "@harnest/core/node";
+import { validateSpec } from "@harnestai/core";
+import { loadSpecFile } from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "../../../lib/api-server";
 import { StudioConnectionService } from "../../../lib/connections-server";
 import { playgroundCapabilities } from "../../../lib/playground";

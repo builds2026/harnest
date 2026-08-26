@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const now = "2026-08-24T09:00:00.000Z";
+const e2eBaseUrl = `http://127.0.0.1:${Number(process.env.HARNEST_E2E_PORT ?? "3100")}`;
 const emptySpec = {
   version: "0.2",
   components: [],
@@ -22,7 +23,7 @@ async function useEnglish(page: Page) {
   await page.context().addCookies([{
     name: "harnest.studio.locale",
     value: "en-US",
-    url: "http://127.0.0.1:3000",
+    url: e2eBaseUrl,
   }]);
 }
 
@@ -112,9 +113,10 @@ test("expired, insufficient-scope, and revocation-pending states expose recovery
     : route.continue());
   await page.goto("/settings?section=connections");
   await page.getByRole("button", { name: "Manage services" }).click();
-  await expect(page.getByText("Authentication expired", { exact: true })).toBeVisible();
-  await expect(page.getByText("More permissions required", { exact: true })).toBeVisible();
-  await expect(page.getByText("Disconnect pending", { exact: true })).toBeVisible();
+  const manager = page.getByRole("dialog", { name: "Services" });
+  await expect(manager.getByText("Authentication expired", { exact: true })).toBeVisible();
+  await expect(manager.getByText("More permissions required", { exact: true })).toBeVisible();
+  await expect(manager.getByText("Disconnect pending", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Test connection" }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in again" }).first()).toBeVisible();
 });
@@ -134,14 +136,53 @@ test("autosave ignores navigation boundaries and URL history remains restorable"
   await page.route("**/api/validate", (route) => route.fulfill({ json: { ok: true, diagnostics: [] } }));
   await page.goto("/builder");
   await page.locator(".h-node").click();
-  await page.locator(".inspector-panel textarea").first().fill("Changed {{input}}");
-  await expect.poll(() => saves).toBeGreaterThan(0);
+  const editor = page.locator(".inspector-panel textarea").first();
+  await editor.fill("Changed once {{input}}");
+  await editor.fill("Changed twice {{input}}");
+  await editor.fill("Changed finally {{input}}");
+  await expect.poll(() => saves).toBe(1);
+  await page.waitForTimeout(1_400);
+  expect(saves).toBe(1);
+
+  const node = page.locator(".h-node").first();
+  const box = await node.boundingBox();
+  if (!box) throw new Error("Harness node is not visible");
+  await page.mouse.move(box.x + box.width / 2, box.y + 28);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 120, box.y + 88, { steps: 24 });
+  expect(saves).toBe(1);
+  await page.mouse.up();
+  await expect.poll(() => saves).toBe(2);
+  await page.waitForTimeout(1_400);
+  expect(saves).toBe(2);
+
   await page.getByRole("link", { name: "Runs" }).click();
   await expect(page).toHaveURL(/\/runs$/);
   await page.goBack();
   await expect(page).toHaveURL(/\/builder$/);
   await page.reload();
   await expect(page).toHaveURL(/\/builder$/);
+});
+
+test("recipe replacement warns before resetting a saved Harness", async ({ page }) => {
+  const promptSpec = {
+    ...emptySpec,
+    components: [{ id: "prompt", type: "prompt", config: { template: "Keep {{input}}" } }],
+    entrypoint: "prompt",
+    studio: { positions: { prompt: { x: 80, y: 80 } } },
+  };
+  await page.route("**/api/spec", (route) => route.request().method() === "GET"
+    ? route.fulfill({ json: { ...specPayload(true), spec: promptSpec } })
+    : route.fulfill({ json: { ok: true, diagnostics: [] } }));
+  await page.route("**/api/validate", (route) => route.fulfill({ json: { ok: true, diagnostics: [] } }));
+  await page.goto("/builder");
+  await page.getByRole("button", { name: /Add/ }).click();
+  await page.getByRole("tab", { name: "Recipes" }).click();
+  await page.locator(".palette-item").first().click();
+  const warning = page.getByRole("alertdialog");
+  await expect(warning).toContainText("tests, runtime settings, and layout");
+  await warning.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator(".h-node")).toHaveCount(1);
 });
 
 test("initial API failure and empty run history have explicit retry/empty states", async ({ page }) => {

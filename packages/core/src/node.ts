@@ -1,10 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
+  chmod,
   lstat,
   mkdir,
   open,
-  readFile,
   readdir,
   realpath,
   rename,
@@ -15,20 +15,36 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { Client, StreamableHTTPClientTransport, type Tool } from "@modelcontextprotocol/client";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  type ElicitRequestParams,
+  type ElicitResult,
+  type Tool,
+} from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { build } from "esbuild";
-import { AdapterError, AdapterRegistry, type ModelAdapter } from "./adapter.js";
+import {
+  AdapterError,
+  AdapterRegistry,
+  type ModelAdapter,
+  type PromptCacheEntry,
+  type PromptCacheStore,
+} from "./adapter.js";
 import type { ConnectionProfile } from "./connection.js";
 import type {
   ComponentDefinition,
   ComponentRegistry,
+  ArtifactReference,
+  RunAttachment,
   RuntimeServices,
   ServiceExecutionContext,
   ServiceResult,
 } from "./component.js";
 import type { RunEvent } from "./runtime.js";
+import type { RunSnapshot } from "./orchestration.js";
 import { normalizeSpec } from "./graph.js";
+import { acquireRunExecutionLease, releaseRunExecutionLease } from "./node-run-idempotency.js";
 import {
   ConnectionManager,
   canonicalExecutable,
@@ -42,9 +58,10 @@ import {
   protocolMode,
   type ContainerMount,
   type McpConnectionHandle,
+  type McpElicitationHandler,
 } from "./node-connections.js";
 import { NodeSkillStore } from "./node-skills.js";
-import { atomicWriteVerifiedFile, openVerifiedFile, readVerifiedFile } from "./safe-files.js";
+import { atomicWriteVerifiedFile, isSensitiveWorkspacePath, openVerifiedFile, readVerifiedFile } from "./safe-files.js";
 import {
   BUILTIN_TOOL_MANIFESTS,
   NodeToolStore,
@@ -58,20 +75,24 @@ import {
   runBoundedProcess,
 } from "./node-tools.js";
 import {
-  parseSpec,
   stringifySpec,
   type Diagnostic,
   type HarnessSpec,
   type ParseResult,
   type ValidationResult,
 } from "./spec.js";
-import type {
-  ToolApprovalDecision,
-  ToolApprovalRequest,
-  ToolBinding,
-  ToolDefinition,
-  ToolRegistry,
+import {
+  normalizePermissionDecision,
+  type LegacyPermissionDecision,
+  type PermissionDecision,
+  type ToolApprovalDecision,
+  type ToolApprovalRequest,
+  type ToolBinding,
+  type ToolDefinition,
+  type ToolRegistry,
 } from "./tool.js";
+import { loadHarnestProjectSpec } from "./node-project.js";
+import type { PermissionProvider, PersistentPermissionGrant, PersistentPermissionScope } from "./provider.js";
 
 export {
   ConnectionManager,
@@ -84,25 +105,19 @@ export {
   type ConnectionManagerOptions,
   type ConnectionTestOptions,
   type McpConnectionHandle,
+  type McpElicitationHandler,
 } from "./node-connections.js";
 export * from "./node-skills.js";
 export * from "./node-skill-install.js";
 export * from "./node-tools.js";
+export * from "./node-project.js";
+export { isSensitiveWorkspacePath } from "./safe-files.js";
 
 export async function loadSpecFile(filePath: string): Promise<ParseResult> {
-  try {
-    return parseSpec(await readFile(filePath, "utf8"));
-  } catch (error) {
-    return {
-      ok: false,
-      diagnostics: [{
-        code: "FILE_READ",
-        path: filePath,
-        message: error instanceof Error ? error.message : `Could not read '${filePath}'`,
-        severity: "error",
-      }],
-    };
-  }
+  const loaded = await loadHarnestProjectSpec(filePath);
+  return loaded.ok
+    ? { ok: true, spec: loaded.spec, diagnostics: [] }
+    : loaded;
 }
 
 export async function saveSpecFile(filePath: string, spec: HarnessSpec): Promise<void> {
@@ -113,6 +128,111 @@ export async function saveSpecFile(filePath: string, spec: HarnessSpec): Promise
   } finally {
     await rm(temporary, { force: true });
   }
+}
+
+const MCP_CREDENTIAL_FIELD = /(?:password|passphrase|secret|token|api[-_]?key|access[-_]?token|credential|private[-_]?key)/iu;
+const MCP_FORM_KEYS = new Set([
+  "type", "title", "description", "enum", "minimum", "maximum", "minLength", "maxLength", "default",
+]);
+
+const mcpFormSchema = (value: unknown): Readonly<Record<string, unknown>> => {
+  const schema = asRecord(value);
+  const properties = asRecord(schema?.properties);
+  if (!schema || schema.type !== "object" || !properties) throw new Error("MCP form elicitation requires an object schema");
+  if (Object.keys(schema).some((key) => !["type", "title", "description", "properties", "required", "additionalProperties"].includes(key))
+    || schema.additionalProperties === true) {
+    throw new Error("MCP form elicitation contains an unsupported schema keyword");
+  }
+  if (Object.keys(properties).length > 50) throw new Error("MCP form elicitation has too many fields");
+  const safeProperties: Record<string, unknown> = {};
+  for (const [name, candidate] of Object.entries(properties)) {
+    if (MCP_CREDENTIAL_FIELD.test(name)) throw new Error(`MCP credential field '${name}' must use URL elicitation`);
+    const field = asRecord(candidate);
+    if (!field || !["string", "number", "integer", "boolean"].includes(String(field.type))) {
+      throw new Error(`MCP form field '${name}' must be primitive`);
+    }
+    if (typeof field.format === "string" && MCP_CREDENTIAL_FIELD.test(field.format)) {
+      throw new Error(`MCP credential format '${field.format}' must use URL elicitation`);
+    }
+    if (Object.keys(field).some((key) => !MCP_FORM_KEYS.has(key))) {
+      throw new Error(`MCP form field '${name}' contains an unsupported schema keyword`);
+    }
+    safeProperties[name] = { ...field };
+  }
+  const required = schema.required;
+  if (required !== undefined && (!Array.isArray(required)
+    || required.some((name) => typeof name !== "string" || !Object.hasOwn(properties, name)))) {
+    throw new Error("MCP form required fields are invalid");
+  }
+  return {
+    type: "object",
+    ...(typeof schema.title === "string" ? { title: schema.title } : {}),
+    ...(typeof schema.description === "string" ? { description: schema.description } : {}),
+    properties: safeProperties,
+    ...(required === undefined ? {} : { required: [...required] }),
+    additionalProperties: false,
+  };
+};
+
+const mcpElicitationUrl = (value: unknown): URL => {
+  if (typeof value !== "string") throw new Error("MCP URL elicitation URL is invalid");
+  const url = new URL(value);
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("MCP URL elicitation must use HTTPS, or HTTP on a literal loopback address");
+  }
+  if (url.username || url.password || url.hash) throw new Error("MCP URL elicitation must not contain credentials or a fragment");
+  for (const name of url.searchParams.keys()) {
+    if (MCP_CREDENTIAL_FIELD.test(name)) throw new Error("MCP URL elicitation must not carry tokens or credentials");
+  }
+  return url;
+};
+
+/** Maps both legacy push-style and modern input_required MCP elicitation through RunControl. */
+export async function resolveMcpElicitation(
+  params: ElicitRequestParams,
+  context: ServiceExecutionContext,
+  requesterId = "mcp",
+): Promise<ElicitResult> {
+  if (!context.requestInteraction) throw new Error("MCP elicitation requires an interactive run");
+  const candidate = params as ElicitRequestParams & Readonly<Record<string, unknown>>;
+  const mode = candidate.mode ?? "form";
+  const schema = mode === "form" ? mcpFormSchema(candidate.requestedSchema) : undefined;
+  const url = mode === "url" ? mcpElicitationUrl(candidate.url) : undefined;
+  if (mode !== "form" && mode !== "url") throw new Error("MCP elicitation mode is invalid");
+  const response = await context.requestInteraction({
+    nodeId: context.nodeId,
+    kind: mode === "form" ? "form" : "oauth",
+    requester: { kind: "mcp", id: requesterId },
+    title: mode === "form" ? "MCP input required" : "MCP connection required",
+    message: typeof candidate.message === "string" ? candidate.message : "The MCP server requires input.",
+    blocking: "run",
+    ...(schema ? { schema } : {}),
+    ...(url ? { data: {
+      url: url.toString(),
+      ...(typeof candidate.elicitationId === "string" ? { elicitationId: candidate.elicitationId } : {}),
+    } } : {}),
+  });
+  if (response.action !== "submit") return { action: response.action === "decline" ? "decline" : "cancel" };
+  const content = asRecord(response.value);
+  if (!content) throw new Error(`MCP ${mode} elicitation submit response must be an object`);
+  if (Object.keys(content).some((name) => MCP_CREDENTIAL_FIELD.test(name))) {
+    throw new Error("MCP elicitation response must not contain credentials or tokens");
+  }
+  if (mode === "url") {
+    if (Object.keys(content).some((name) => name !== "connectionRef")
+      || typeof content.connectionRef !== "string" || !content.connectionRef
+      || content.connectionRef.length > 512) {
+      throw new Error("MCP URL elicitation response must contain only an external connectionRef");
+    }
+    return { action: "accept", content: { connectionRef: content.connectionRef } };
+  }
+  const allowed = new Set(Object.keys(asRecord(schema?.properties) ?? {}));
+  if (Object.keys(content).some((name) => !allowed.has(name))) throw new Error("MCP form response contains an unknown field");
+  for (const value of Object.values(content)) {
+    if (!["string", "number", "boolean"].includes(typeof value)) throw new Error("MCP form response values must be primitive");
+  }
+  return { action: "accept", content: content as ElicitResult["content"] };
 }
 
 const packageSpecifier = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
@@ -236,7 +356,7 @@ export async function loadRuntimeModules(
   baseDir: string,
   options?: ModuleLoadOptions,
 ): Promise<ValidationResult> {
-  const specifiers = spec.version === "0.2" ? spec.runtime?.modules ?? [] : [];
+  const specifiers = spec.version === "0.1" ? [] : spec.runtime?.modules ?? [];
   if (specifiers.length > 0 && options?.allowModuleExecution !== true) {
     return {
       ok: false,
@@ -317,11 +437,7 @@ async function projectEntry(root: string, configuredPath: unknown): Promise<stri
 }
 
 function isSensitiveProjectPath(root: string, target: string): boolean {
-  const segments = relative(root, target).split(sep);
-  return segments.some((segment) =>
-    segment.startsWith(".")
-    || /^(?:credentials?|secrets?|service[-_]?account|firebase[-_]?adminsdk|id_(?:dsa|ecdsa|ed25519|rsa))(?:[._-]|$)/i.test(segment)
-    || /\.(?:jks|key|keystore|p12|pfx|pem)$/i.test(segment));
+  return isSensitiveWorkspacePath(root, target);
 }
 
 async function storageDirectory(root: string, child?: string): Promise<string> {
@@ -553,15 +669,356 @@ export interface NodeRuntimeServiceOptions {
   readonly toolStore?: NodeToolStore;
   readonly skillStore?: NodeSkillStore;
   readonly approvedToolIds?: readonly string[];
+  /** Stable Harness identity used to scope persisted Tool grants. Defaults to the project directory. */
+  readonly harnessId?: string;
   /** Project-contained directories exposed only to approved process sandboxes. */
   readonly sandboxWorkspace?: {
     readonly inputDirectory?: string;
     readonly outputDirectory?: string;
+    /** Expose a secret-filtered project snapshot at /workspace. Defaults to write when file access is enabled. */
+    readonly projectAccess?: "read" | "write";
   };
   readonly requestToolApproval?: (
     request: ToolApprovalRequest,
     context: ServiceExecutionContext,
-  ) => ToolApprovalDecision | Promise<ToolApprovalDecision>;
+  ) => (Omit<ToolApprovalDecision, "mode"> & { readonly mode?: PermissionDecision | LegacyPermissionDecision })
+    | Promise<Omit<ToolApprovalDecision, "mode"> & { readonly mode?: PermissionDecision | LegacyPermissionDecision }>;
+}
+
+export interface PersistedToolPermission {
+  readonly harnessId: string;
+  readonly toolId: string;
+  readonly connectionId?: string;
+  readonly capability?: "tool-execution" | "workspace-read" | "workspace-write" | "process" | "network" | "module-execution";
+  readonly resource?: string;
+  readonly createdAt: string;
+}
+
+export interface NodeArtifactContent {
+  readonly artifact: ArtifactReference;
+  readonly content: Buffer;
+}
+
+interface ToolPermissionFile {
+  readonly version: 1 | 2;
+  readonly grants: readonly PersistedToolPermission[];
+}
+
+interface ToolPermissionScope {
+  readonly capability: NonNullable<PersistedToolPermission["capability"]>;
+  readonly resource: string;
+}
+
+const safePermissionResource = (value: unknown, fallback = "*"): string => {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const trimmed = value.trim().slice(0, 512);
+  if (trimmed.includes("\0") || trimmed.includes("\\") || trimmed.split("/").some((part) => part === "..")) return "[invalid]";
+  return trimmed;
+};
+
+const toolPermissionScope = (request: ToolApprovalRequest): ToolPermissionScope => {
+  const input = request.input && typeof request.input === "object" && !Array.isArray(request.input)
+    ? request.input as Record<string, unknown> : {};
+  if (request.tool.id === "builtin.file") return {
+    capability: input.operation === "read" ? "workspace-read" : "workspace-write",
+    resource: safePermissionResource(input.path),
+  };
+  if (request.tool.id === "builtin.shell") return {
+    capability: "process",
+    resource: safePermissionResource(input.command),
+  };
+  if (request.tool.id === "builtin.code-runner") return {
+    capability: "process",
+    resource: safePermissionResource(input.runtime, "container"),
+  };
+  if (request.tool.id === "builtin.http" || request.tool.id === "builtin.web-scrape") {
+    let resource = "[invalid]";
+    try { resource = new URL(String(input.url)).origin; } catch { /* execution validation reports the invalid URL */ }
+    return { capability: "network", resource };
+  }
+  if (request.tool.id === "builtin.web-search") return {
+    capability: "network",
+    resource: request.tool.connectionId ?? "search-service",
+  };
+  if (request.tool.source === "module") return { capability: "module-execution", resource: request.tool.id };
+  return { capability: "tool-execution", resource: request.tool.action ?? request.tool.id };
+};
+
+interface SandboxProjectFile {
+  readonly sha256: string;
+  readonly mode: number;
+}
+
+interface SandboxProjectWorkspace {
+  readonly directory: string;
+  readonly access: "read" | "write";
+  readonly baseline: Map<string, SandboxProjectFile>;
+}
+
+interface SandboxArtifactDirectory {
+  readonly directory: string;
+  readonly managed: boolean;
+}
+
+const SANDBOX_PROJECT_MAX_FILES = 10_000;
+const SANDBOX_PROJECT_MAX_BYTES = 256 * 1_048_576;
+const SANDBOX_PROJECT_MAX_FILE_BYTES = 16 * 1_048_576;
+const SANDBOX_PROJECT_IGNORED_DIRECTORIES = new Set([
+  ".git", ".next", ".turbo", "build", "coverage", "dist", "node_modules",
+]);
+
+const fileSha256 = (content: Uint8Array): string => createHash("sha256").update(content).digest("hex");
+const ARTIFACT_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const ARTIFACT_ID = /^artifact_[a-f0-9]{24}$/u;
+const ARTIFACT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const ARTIFACT_RETAINED_RUNS = 100;
+
+const artifactPreview = (mimeType: string, name: string): ArtifactReference["preview"] => {
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("video/")) return "video";
+  if (mimeType.startsWith("audio/")) return "audio";
+  if (mimeType === "application/pdf" || name.toLocaleLowerCase().endsWith(".pdf")) return "pdf";
+  if (mimeType.startsWith("text/") || /\.(?:csv|html?|json|md|svg|tsx?|ya?ml)$/iu.test(name)) return "text";
+  return "none";
+};
+
+const artifactMimeType = (name: string): string => {
+  const extension = name.toLocaleLowerCase().split(".").at(-1) ?? "";
+  return ({
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+    svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
+    mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", pdf: "application/pdf",
+    json: "application/json", csv: "text/csv", tsv: "text/tab-separated-values", md: "text/markdown",
+    txt: "text/plain", html: "text/html", yaml: "application/yaml", yml: "application/yaml",
+    zip: "application/zip",
+  } as Record<string, string>)[extension] ?? "application/octet-stream";
+};
+
+const fileStoreLocks = new Map<string, Promise<unknown>>();
+
+function withFileStoreLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = fileStoreLocks.get(key) ?? Promise.resolve();
+  const next = previous.then(task, task);
+  fileStoreLocks.set(key, next);
+  void next.finally(() => {
+    if (fileStoreLocks.get(key) === next) fileStoreLocks.delete(key);
+  }).catch(() => undefined);
+  return next;
+}
+
+interface PromptCacheFile {
+  readonly version: 1;
+  readonly entries: readonly PromptCacheEntry[];
+}
+
+const validPromptCacheEntry = (value: unknown): value is PromptCacheEntry => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as PromptCacheEntry;
+  return /^[a-f0-9]{64}$/u.test(entry.key)
+    && /^[a-z][a-z0-9._-]*$/u.test(entry.adapterId)
+    && typeof entry.model === "string" && entry.model.length > 0 && entry.model.length <= 512
+    && typeof entry.resource === "string" && entry.resource.length > 0 && entry.resource.length <= 1_024
+    && Number.isFinite(Date.parse(entry.createdAt)) && Number.isFinite(Date.parse(entry.expiresAt))
+    && (entry.cachedInputTokens === undefined
+      || (Number.isSafeInteger(entry.cachedInputTokens) && entry.cachedInputTokens >= 0));
+};
+
+export class FilePromptCacheStore implements PromptCacheStore {
+  readonly #projectDirectory: string;
+
+  constructor(projectDirectory: string) {
+    this.#projectDirectory = resolve(projectDirectory);
+  }
+
+  async #location(): Promise<{ root: string; file: string }> {
+    const project = await realpath(this.#projectDirectory);
+    const hiddenPath = join(project, ".harnest");
+    await mkdir(hiddenPath, { recursive: true, mode: 0o700 });
+    const hidden = await realpath(hiddenPath);
+    const runtimePath = join(hidden, "runtime");
+    await mkdir(runtimePath, { recursive: true, mode: 0o700 });
+    const root = await realpath(runtimePath);
+    if (!isInside(project, root)) throw new Error("Prompt cache storage resolves outside the project");
+    return { root, file: join(root, "context-cache.json") };
+  }
+
+  async #read(root: string, file: string): Promise<PromptCacheEntry[]> {
+    try {
+      const parsed = JSON.parse((await readVerifiedFile(file, root, 1_048_576)).toString("utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid shape");
+      const candidate = parsed as { version?: unknown; entries?: unknown };
+      if (candidate.version !== 1 || !Array.isArray(candidate.entries)
+        || candidate.entries.some((entry) => !validPromptCacheEntry(entry))) throw new Error("invalid shape");
+      return candidate.entries;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [];
+      throw new Error("Prompt cache storage is invalid", { cause: error });
+    }
+  }
+
+  async #write(root: string, file: string, entries: readonly PromptCacheEntry[]): Promise<void> {
+    const retained = entries
+      .filter((entry) => Date.parse(entry.expiresAt) > Date.now())
+      .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+      .slice(0, 256);
+    const payload: PromptCacheFile = { version: 1, entries: retained };
+    await atomicWriteVerifiedFile(file, root, `${JSON.stringify(payload, null, 2)}\n`);
+  }
+
+  async get(key: string): Promise<PromptCacheEntry | undefined> {
+    if (!/^[a-f0-9]{64}$/u.test(key)) return undefined;
+    const { root, file } = await this.#location();
+    return withFileStoreLock(file, async () => {
+      const entries = await this.#read(root, file);
+      const active = entries.filter((entry) => Date.parse(entry.expiresAt) > Date.now());
+      if (active.length !== entries.length) await this.#write(root, file, active);
+      const entry = active.find((candidate) => candidate.key === key);
+      return entry ? { ...entry } : undefined;
+    });
+  }
+
+  async set(entry: PromptCacheEntry): Promise<void> {
+    if (!validPromptCacheEntry(entry)) throw new Error("Prompt cache entry is invalid");
+    const { root, file } = await this.#location();
+    await withFileStoreLock(file, async () => {
+      const entries = (await this.#read(root, file)).filter((candidate) => candidate.key !== entry.key);
+      await this.#write(root, file, [...entries, { ...entry }]);
+    });
+  }
+
+  async delete(key: string): Promise<void> {
+    const { root, file } = await this.#location();
+    await withFileStoreLock(file, async () => {
+      const entries = await this.#read(root, file);
+      await this.#write(root, file, entries.filter((entry) => entry.key !== key));
+    });
+  }
+
+  async list(): Promise<readonly PromptCacheEntry[]> {
+    const { root, file } = await this.#location();
+    return withFileStoreLock(file, async () => {
+      const entries = await this.#read(root, file);
+      const active = entries.filter((entry) => Date.parse(entry.expiresAt) > Date.now());
+      if (active.length !== entries.length) await this.#write(root, file, active);
+      return active.map((entry) => ({ ...entry }));
+    });
+  }
+
+  async clear(): Promise<number> {
+    const { root, file } = await this.#location();
+    return withFileStoreLock(file, async () => {
+      const count = (await this.#read(root, file)).length;
+      await this.#write(root, file, []);
+      return count;
+    });
+  }
+}
+
+class ToolPermissionStore {
+  readonly #projectDirectory: string;
+
+  constructor(projectDirectory: string) {
+    this.#projectDirectory = resolve(projectDirectory);
+  }
+
+  async #location(): Promise<{ root: string; file: string }> {
+    const project = await realpath(this.#projectDirectory);
+    const hiddenPath = join(project, ".harnest");
+    await mkdir(hiddenPath, { recursive: true });
+    const hidden = await realpath(hiddenPath);
+    if (!isInside(project, hidden)) throw new Error("Tool permission storage resolves outside the project");
+    return { root: hidden, file: join(hidden, "tool-permissions.json") };
+  }
+
+  async #read(root: string, file: string): Promise<ToolPermissionFile> {
+    try {
+      const parsed = JSON.parse((await readVerifiedFile(file, root, 1_048_576)).toString("utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid shape");
+      const candidate = parsed as { version?: unknown; grants?: unknown };
+      if ((candidate.version !== 1 && candidate.version !== 2) || !Array.isArray(candidate.grants)) throw new Error("invalid shape");
+      const grants = candidate.grants.filter((grant): grant is PersistedToolPermission => Boolean(
+        grant && typeof grant === "object" && !Array.isArray(grant)
+        && typeof (grant as PersistedToolPermission).harnessId === "string"
+        && typeof (grant as PersistedToolPermission).toolId === "string"
+        && ((grant as PersistedToolPermission).connectionId === undefined
+          || typeof (grant as PersistedToolPermission).connectionId === "string")
+        && ((grant as PersistedToolPermission).capability === undefined
+          || ["tool-execution", "workspace-read", "workspace-write", "process", "network", "module-execution"].includes((grant as PersistedToolPermission).capability!))
+        && ((grant as PersistedToolPermission).resource === undefined
+          || typeof (grant as PersistedToolPermission).resource === "string")
+        && typeof (grant as PersistedToolPermission).createdAt === "string",
+      ));
+      return { version: candidate.version, grants };
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return { version: 2, grants: [] };
+      }
+      throw new Error("Tool permission storage is invalid", { cause: error });
+    }
+  }
+
+  async list(harnessId: string): Promise<PersistedToolPermission[]> {
+    const { root, file } = await this.#location();
+    const stored = await this.#read(root, file);
+    return stored.grants.filter((grant) => grant.harnessId === harnessId).map((grant) => ({ ...grant }));
+  }
+
+  async allows(harnessId: string, request: ToolApprovalRequest): Promise<boolean> {
+    const scope = toolPermissionScope(request);
+    return (await this.list(harnessId)).some((grant) => grant.toolId === request.tool.id
+      && grant.connectionId === request.tool.connectionId
+      && (grant.capability === undefined || (grant.capability === scope.capability && grant.resource === scope.resource)));
+  }
+
+  async grant(harnessId: string, request: ToolApprovalRequest): Promise<void> {
+    const { root, file } = await this.#location();
+    await withFileStoreLock(file, async () => {
+      const stored = await this.#read(root, file);
+      const scope = toolPermissionScope(request);
+      if (stored.grants.some((grant) => grant.harnessId === harnessId && grant.toolId === request.tool.id
+        && grant.connectionId === request.tool.connectionId && grant.capability === scope.capability
+        && grant.resource === scope.resource)) return;
+      const next: PersistedToolPermission = {
+        harnessId,
+        toolId: request.tool.id,
+        ...(request.tool.connectionId ? { connectionId: request.tool.connectionId } : {}),
+        ...scope,
+        createdAt: new Date().toISOString(),
+      };
+      await atomicWriteVerifiedFile(file, root, JSON.stringify({ version: 2, grants: [...stored.grants, next] }, null, 2));
+    });
+  }
+
+  async grantScope(scope: PersistentPermissionScope): Promise<void> {
+    const { root, file } = await this.#location();
+    await withFileStoreLock(file, async () => {
+      const stored = await this.#read(root, file);
+      if (stored.grants.some((grant) => grant.harnessId === scope.harnessId && grant.toolId === scope.toolId
+        && grant.connectionId === scope.connectionId && grant.capability === scope.capability
+        && grant.resource === scope.resource)) return;
+      await atomicWriteVerifiedFile(file, root, JSON.stringify({ version: 2, grants: [...stored.grants, {
+        harnessId: scope.harnessId,
+        toolId: scope.toolId,
+        ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
+        capability: scope.capability,
+        ...(scope.resource ? { resource: scope.resource } : {}),
+        createdAt: new Date().toISOString(),
+      } satisfies PersistedToolPermission] }, null, 2));
+    });
+  }
+
+  async revoke(harnessId: string, toolId: string, connectionId?: string, capability?: PersistedToolPermission["capability"], resource?: string): Promise<boolean> {
+    const { root, file } = await this.#location();
+    return withFileStoreLock(file, async () => {
+      const stored = await this.#read(root, file);
+      const grants = stored.grants.filter((grant) => !(grant.harnessId === harnessId && grant.toolId === toolId
+        && grant.connectionId === connectionId && (capability === undefined
+          || (grant.capability === capability && grant.resource === resource))));
+      if (grants.length === stored.grants.length) return false;
+      await atomicWriteVerifiedFile(file, root, JSON.stringify({ version: 2, grants }, null, 2));
+      return true;
+    });
+  }
 }
 
 interface McpConnection {
@@ -587,18 +1044,58 @@ export class NodeRuntimeServices implements RuntimeServices {
   readonly connectionManager: ConnectionManager;
   readonly toolStore: NodeToolStore;
   readonly skillStore: NodeSkillStore;
+  readonly promptCache: FilePromptCacheStore;
+  readonly harnessId: string;
+  readonly providers: NonNullable<RuntimeServices["providers"]>;
   readonly #projectDirectory: string;
   readonly #root: Promise<string>;
   readonly #memory: FileMemoryStore;
   readonly #options: NodeRuntimeServiceOptions;
+  readonly #harnessId: string;
+  readonly #toolPermissions: ToolPermissionStore;
   readonly #connections = new Map<string, Promise<McpConnection>>();
   readonly #connectionSecrets = new Map<string, { readonly value: string; readonly runIds: Set<string> }>();
+  readonly #sandboxProjects = new Map<string, Promise<SandboxProjectWorkspace>>();
+  readonly #sandboxSyncLocks = new Map<string, Promise<void>>();
+  readonly #artifactDirectories = new Map<string, Promise<SandboxArtifactDirectory>>();
 
   constructor(projectDirectory: string, options: NodeRuntimeServiceOptions = {}) {
     this.#projectDirectory = resolve(projectDirectory);
     this.#root = projectRoot(projectDirectory);
     this.#memory = new FileMemoryStore(projectDirectory);
     this.#options = options;
+    this.#harnessId = resolve(options.harnessId ?? projectDirectory);
+    this.harnessId = this.#harnessId;
+    this.#toolPermissions = new ToolPermissionStore(projectDirectory);
+    const permissionId = (scope: PersistentPermissionScope) => `permission_${createHash("sha256")
+      .update(JSON.stringify(scope)).digest("hex").slice(0, 24)}`;
+    const permissionFrom = (grant: PersistedToolPermission): PersistentPermissionGrant | undefined => {
+      if (grant.capability !== "network" && grant.capability !== "process" && grant.capability !== "workspace-write") return undefined;
+      const scope: PersistentPermissionScope = {
+        harnessId: grant.harnessId, toolId: grant.toolId,
+        ...(grant.connectionId ? { connectionId: grant.connectionId } : {}),
+        capability: grant.capability,
+        ...(grant.resource ? { resource: grant.resource } : {}),
+      };
+      return { id: permissionId(scope), scope, effect: "allow_always", createdAt: grant.createdAt };
+    };
+    const permissions: PermissionProvider = {
+      list: async ({ harnessId }) => (await this.#toolPermissions.list(harnessId)).flatMap((grant) => permissionFrom(grant) ?? []),
+      find: async (scope) => (await this.#toolPermissions.list(scope.harnessId)).map(permissionFrom)
+        .find((grant) => grant?.id === permissionId(scope)),
+      grant: async ({ scope }) => {
+        await this.#toolPermissions.grantScope(scope);
+        return { id: permissionId(scope), scope, effect: "allow_always", createdAt: new Date().toISOString() };
+      },
+      revoke: async ({ id }) => {
+        const grant = (await this.#toolPermissions.list(this.#harnessId)).map(permissionFrom).find((candidate) => candidate?.id === id);
+        return grant ? this.#toolPermissions.revoke(
+          grant.scope.harnessId, grant.scope.toolId, grant.scope.connectionId, grant.scope.capability, grant.scope.resource,
+        ) : false;
+      },
+    };
+    this.providers = { permissions };
+    this.promptCache = new FilePromptCacheStore(projectDirectory);
     this.connectionManager = options.connectionManager ?? new ConnectionManager(projectDirectory);
     this.skillStore = options.skillStore ?? new NodeSkillStore({ projectDirectory });
     this.toolStore = options.toolStore ?? new NodeToolStore({
@@ -731,10 +1228,25 @@ export class NodeRuntimeServices implements RuntimeServices {
     return guardedFetch(true, { maxStreamBytes: 16 * 1_048_576 })(url, init);
   }
 
-  releaseRun(runId: string): void {
+  async releaseRun(runId: string): Promise<void> {
     for (const [reference, unlocked] of this.#connectionSecrets) {
       unlocked.runIds.delete(runId);
       if (unlocked.runIds.size === 0) this.#connectionSecrets.delete(reference);
+    }
+    const staged = this.#sandboxProjects.get(runId);
+    this.#sandboxProjects.delete(runId);
+    const lock = this.#sandboxSyncLocks.get(runId);
+    this.#sandboxSyncLocks.delete(runId);
+    await lock?.catch(() => undefined);
+    if (staged) {
+      const workspace = await staged.catch(() => undefined);
+      if (workspace) await rm(workspace.directory, { recursive: true, force: true });
+    }
+    const artifacts = this.#artifactDirectories.get(runId);
+    this.#artifactDirectories.delete(runId);
+    const artifactDirectory = await artifacts?.catch(() => undefined);
+    if (artifactDirectory?.managed && (await readdir(artifactDirectory.directory)).length === 0) {
+      await rm(artifactDirectory.directory, { recursive: true, force: true });
     }
   }
 
@@ -926,15 +1438,17 @@ export class NodeRuntimeServices implements RuntimeServices {
     const engine = await canonicalExecutable(profile.config.engine, profile.id);
     const name = `harnest-${randomUUID()}`;
     const engineEnvironment = containerEngineEnvironment();
-    const mounts = request.toolId === "builtin.code-runner" ? await this.#sandboxMounts() : [];
+    const mounts = await this.#sandboxMounts(request.runId, request.toolId === "builtin.code-runner");
     try {
-      return await runBoundedProcess({
+      const result = await runBoundedProcess({
         ...request,
         command: engine.path,
         args: containerRunArguments(profile, name, command, [], imageId, mounts),
         cwd: dirname(engine.path),
         environment: engineEnvironment,
       });
+      if (request.runId) await this.#syncSandboxProject(request.runId);
+      return result;
     } finally {
       await runBoundedProcess({
         toolId: `${request.toolId}:cleanup`, command: engine.path, args: ["rm", "--force", name],
@@ -944,29 +1458,380 @@ export class NodeRuntimeServices implements RuntimeServices {
     }
   }
 
-  async #sandboxMounts(): Promise<ContainerMount[]> {
+  async #sandboxMounts(runId: string | undefined, includePlaygroundFiles: boolean): Promise<ContainerMount[]> {
     const configured = this.#options.sandboxWorkspace;
-    if (!configured) return [];
     const root = await this.#root;
     const mounts: ContainerMount[] = [];
-    for (const [directory, target, readOnly] of [
-      [configured.inputDirectory, "/mnt/data", true],
-      [configured.outputDirectory, "/mnt/output", false],
-    ] as const) {
-      if (!directory) continue;
-      const lexical = resolve(directory);
-      if (!isInside(root, lexical)) throw new Error("Sandbox workspace must stay inside the project");
-      const lexicalInfo = await lstat(lexical);
-      if (!lexicalInfo.isDirectory() || lexicalInfo.isSymbolicLink()) {
-        throw new Error("Sandbox workspace must be a regular directory");
+    if (configured) {
+      for (const [directory, target, readOnly, enabled] of [
+        [configured.inputDirectory, "/mnt/data", true, includePlaygroundFiles],
+        [configured.outputDirectory, "/mnt/output", false, true],
+      ] as const) {
+        if (!enabled) continue;
+        if (!directory) continue;
+        const lexical = resolve(directory);
+        if (!isInside(root, lexical)) throw new Error("Sandbox workspace must stay inside the project");
+        const lexicalInfo = await lstat(lexical);
+        if (!lexicalInfo.isDirectory() || lexicalInfo.isSymbolicLink()) {
+          throw new Error("Sandbox workspace must be a regular directory");
+        }
+        const canonical = await realpath(lexical);
+        if (canonical === root || !isInside(root, canonical) || !(await stat(canonical)).isDirectory()) {
+          throw new Error("Sandbox workspace resolves outside the project");
+        }
+        mounts.push({ source: canonical, target, readOnly });
+        if (target === "/mnt/output" && runId) {
+          this.#artifactDirectories.set(runId, Promise.resolve({ directory: canonical, managed: false }));
+        }
       }
-      const canonical = await realpath(lexical);
-      if (canonical === root || !isInside(root, canonical) || !(await stat(canonical)).isDirectory()) {
-        throw new Error("Sandbox workspace resolves outside the project");
+    }
+    if (runId && !mounts.some(({ target }) => target === "/mnt/output")) {
+      const artifacts = await this.#artifactDirectory(runId);
+      mounts.push({ source: artifacts.directory, target: "/mnt/output", readOnly: false });
+    }
+    const access = configured?.projectAccess ?? (this.#options.allowFileSystem === true ? "write" : undefined);
+    if (access && runId) {
+      const workspace = await this.#sandboxProject(runId, access);
+      mounts.push({ source: workspace.directory, target: "/workspace", readOnly: access === "read" });
+      const dependencies = join(root, "node_modules");
+      try {
+        const lexical = await lstat(dependencies);
+        const canonical = await realpath(dependencies);
+        if (lexical.isDirectory() && !lexical.isSymbolicLink() && isInside(root, canonical)
+          && (await stat(canonical)).isDirectory()) {
+          mounts.push({ source: canonical, target: "/workspace/node_modules", readOnly: true });
+        }
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
       }
-      mounts.push({ source: canonical, target, readOnly });
     }
     return mounts;
+  }
+
+  #sandboxProject(runId: string, access: "read" | "write"): Promise<SandboxProjectWorkspace> {
+    const existing = this.#sandboxProjects.get(runId);
+    if (existing) return existing;
+    const created = this.#createSandboxProject(access);
+    this.#sandboxProjects.set(runId, created);
+    void created.catch(() => {
+      if (this.#sandboxProjects.get(runId) === created) this.#sandboxProjects.delete(runId);
+    });
+    return created;
+  }
+
+  async #createSandboxProject(access: "read" | "write"): Promise<SandboxProjectWorkspace> {
+    const root = await this.#root;
+    const workspaces = await storageDirectory(root, "runtime/workspaces");
+    const directory = join(workspaces, randomUUID());
+    await mkdir(directory, { mode: 0o700 });
+    const baseline = new Map<string, SandboxProjectFile>();
+    let files = 0;
+    let bytes = 0;
+    const visit = async (source: string, destination: string): Promise<void> => {
+      const entries = await readdir(source, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const sourcePath = join(source, entry.name);
+        const relativePath = relative(root, sourcePath).split(sep).join("/");
+        if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) continue;
+        if (entry.isDirectory() && SANDBOX_PROJECT_IGNORED_DIRECTORIES.has(entry.name)) continue;
+        if (relativePath !== ".harnest" && isSensitiveWorkspacePath(root, sourcePath)) continue;
+        const lexical = await lstat(sourcePath);
+        if (lexical.isSymbolicLink()) continue;
+        const canonical = await realpath(sourcePath);
+        if (!isInside(root, canonical)) continue;
+        const destinationPath = join(destination, entry.name);
+        if (entry.isDirectory()) {
+          await mkdir(destinationPath, { mode: access === "write" ? 0o777 : 0o755 });
+          await chmod(destinationPath, access === "write" ? 0o777 : 0o755);
+          await visit(canonical, destinationPath);
+          continue;
+        }
+        const info = await stat(canonical);
+        if (!info.isFile() || info.size > SANDBOX_PROJECT_MAX_FILE_BYTES) continue;
+        files += 1;
+        bytes += info.size;
+        if (files > SANDBOX_PROJECT_MAX_FILES || bytes > SANDBOX_PROJECT_MAX_BYTES) {
+          throw new Error(
+            `Approved workspace exceeds the sandbox snapshot limit (${SANDBOX_PROJECT_MAX_FILES} files / 256 MiB)`,
+          );
+        }
+        const content = await readVerifiedFile(canonical, root, SANDBOX_PROJECT_MAX_FILE_BYTES);
+        await writeFile(destinationPath, content, { flag: "wx", mode: access === "write" ? 0o666 : 0o444 });
+        await chmod(destinationPath, access === "write" ? 0o666 : 0o444);
+        baseline.set(relativePath, { sha256: fileSha256(content), mode: info.mode & 0o777 });
+      }
+    };
+    try {
+      await chmod(directory, access === "write" ? 0o777 : 0o755);
+      await visit(root, directory);
+      return { directory, access, baseline };
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async #syncSandboxProject(runId: string): Promise<void> {
+    const pending = this.#sandboxProjects.get(runId);
+    if (!pending) return;
+    const workspace = await pending;
+    if (workspace.access !== "write") return;
+    const previous = this.#sandboxSyncLocks.get(runId) ?? Promise.resolve();
+    const next = previous.then(() => this.#applySandboxChanges(workspace));
+    this.#sandboxSyncLocks.set(runId, next);
+    try {
+      await next;
+    } finally {
+      if (this.#sandboxSyncLocks.get(runId) === next) this.#sandboxSyncLocks.delete(runId);
+    }
+  }
+
+  async #applySandboxChanges(workspace: SandboxProjectWorkspace): Promise<void> {
+    const root = await this.#root;
+    let files = 0;
+    let bytes = 0;
+    const visit = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) continue;
+        const lexical = await lstat(path);
+        if (lexical.isSymbolicLink()) continue;
+        const canonical = await realpath(path);
+        if (!isInside(workspace.directory, canonical)) continue;
+        if (entry.isDirectory()) {
+          await visit(canonical);
+          continue;
+        }
+        const relativePath = relative(workspace.directory, canonical).split(sep).join("/");
+        const target = resolve(root, relativePath);
+        if (!isInside(root, target) || isSensitiveWorkspacePath(root, target)) continue;
+        const info = await stat(canonical);
+        if (!info.isFile() || info.size > SANDBOX_PROJECT_MAX_FILE_BYTES) {
+          throw new Error(`Sandbox change '${relativePath}' exceeds the 16 MiB file limit`);
+        }
+        files += 1;
+        bytes += info.size;
+        if (files > SANDBOX_PROJECT_MAX_FILES || bytes > SANDBOX_PROJECT_MAX_BYTES) {
+          throw new Error("Sandbox changes exceed the approved workspace limit");
+        }
+        const content = await readVerifiedFile(canonical, workspace.directory, SANDBOX_PROJECT_MAX_FILE_BYTES);
+        const sha256 = fileSha256(content);
+        const baseline = workspace.baseline.get(relativePath);
+        if (baseline?.sha256 === sha256) continue;
+        let current: Buffer | undefined;
+        try {
+          const lexicalTarget = await lstat(target);
+          if (!lexicalTarget.isFile() || lexicalTarget.isSymbolicLink()) {
+            throw new Error(`Workspace target '${relativePath}' is not a regular file`);
+          }
+          current = await readVerifiedFile(await realpath(target), root, SANDBOX_PROJECT_MAX_FILE_BYTES);
+        } catch (error) {
+          if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+        }
+        if ((baseline && (!current || fileSha256(current) !== baseline.sha256)) || (!baseline && current)) {
+          throw new Error(`Workspace target '${relativePath}' changed outside the sandbox; reload and retry`);
+        }
+        await this.#ensureSandboxTargetParent(root, relativePath);
+        await atomicWriteVerifiedFile(target, root, content);
+        const mode = baseline?.mode ?? ((info.mode & 0o111) ? 0o700 : 0o600);
+        await chmod(target, mode);
+        workspace.baseline.set(relativePath, { sha256, mode });
+      }
+    };
+    await visit(workspace.directory);
+  }
+
+  async #ensureSandboxTargetParent(root: string, relativePath: string): Promise<void> {
+    const segments = dirname(relativePath).split("/").filter((segment) => segment && segment !== ".");
+    let current = root;
+    for (const segment of segments) {
+      const next = join(current, segment);
+      if (!isInside(root, next) || isSensitiveWorkspacePath(root, next)) {
+        throw new Error(`Workspace directory '${relativePath}' is protected`);
+      }
+      try {
+        const info = await lstat(next);
+        if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(
+          `Workspace directory '${relativePath}' changed while applying sandbox output`,
+        );
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+        await mkdir(next, { mode: 0o700 });
+      }
+      current = await realpath(next);
+      if (!isInside(root, current)) throw new Error(`Workspace directory '${relativePath}' resolves outside the project`);
+    }
+  }
+
+  #artifactDirectory(runId: string): Promise<SandboxArtifactDirectory> {
+    if (!ARTIFACT_RUN_ID.test(runId)) return Promise.reject(new Error("Artifact run id is invalid"));
+    const existing = this.#artifactDirectories.get(runId);
+    if (existing) return existing;
+    const created = this.#createManagedArtifactDirectory(runId);
+    this.#artifactDirectories.set(runId, created);
+    void created.catch(() => {
+      if (this.#artifactDirectories.get(runId) === created) this.#artifactDirectories.delete(runId);
+    });
+    return created;
+  }
+
+  async #createManagedArtifactDirectory(runId: string): Promise<SandboxArtifactDirectory> {
+    if (!ARTIFACT_RUN_ID.test(runId)) throw new Error("Artifact run id is invalid");
+    const root = await this.#root;
+    const artifacts = await storageDirectory(root, "artifacts");
+    await this.#pruneManagedArtifacts(artifacts, runId);
+    const directory = join(artifacts, runId);
+    await mkdir(directory, { mode: 0o777 }).catch((error: unknown) => {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error;
+    });
+    const lexical = await lstat(directory);
+    const canonical = await realpath(directory);
+    if (!lexical.isDirectory() || lexical.isSymbolicLink() || !isInside(artifacts, canonical)) {
+      throw new Error("Artifact directory is unsafe");
+    }
+    await chmod(canonical, 0o777);
+    return { directory: canonical, managed: true };
+  }
+
+  async #pruneManagedArtifacts(artifacts: string, currentRunId: string): Promise<void> {
+    const candidates: Array<{ path: string; mtimeMs: number; runId: string }> = [];
+    for (const entry of await readdir(artifacts, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || !ARTIFACT_RUN_ID.test(entry.name) || entry.name === currentRunId) continue;
+      const lexical = join(artifacts, entry.name);
+      try {
+        const link = await lstat(lexical);
+        const canonical = await realpath(lexical);
+        if (!link.isDirectory() || link.isSymbolicLink() || !isInside(artifacts, canonical)) continue;
+        candidates.push({ path: canonical, mtimeMs: (await stat(canonical)).mtimeMs, runId: entry.name });
+      } catch {
+        // A concurrent cleanup already handled this entry.
+      }
+    }
+    candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+    const now = Date.now();
+    await Promise.all(candidates.flatMap((candidate, index) => {
+      if (this.#artifactDirectories.has(candidate.runId)
+        || (index < ARTIFACT_RETAINED_RUNS && now - candidate.mtimeMs <= ARTIFACT_RETENTION_MS)) return [];
+      return [rm(candidate.path, { recursive: true, force: true })];
+    }));
+  }
+
+  async #storedArtifactDirectory(runId: string): Promise<SandboxArtifactDirectory | undefined> {
+    if (!ARTIFACT_RUN_ID.test(runId)) throw new Error("Artifact run id is invalid");
+    const active = this.#artifactDirectories.get(runId);
+    if (active) return active;
+    const root = await this.#root;
+    const artifacts = await storageDirectory(root, "artifacts");
+    const directory = join(artifacts, runId);
+    try {
+      const lexical = await lstat(directory);
+      const canonical = await realpath(directory);
+      if (!lexical.isDirectory() || lexical.isSymbolicLink() || !isInside(artifacts, canonical)) {
+        throw new Error("Artifact directory is unsafe");
+      }
+      return { directory: canonical, managed: true };
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async #artifactEntries(runId: string): Promise<Array<NodeArtifactContent>> {
+    const stored = await this.#storedArtifactDirectory(runId);
+    if (!stored) return [];
+    const output: NodeArtifactContent[] = [];
+    let total = 0;
+    const visit = async (directory: string, depth: number): Promise<void> => {
+      if (depth > 5) return;
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        if (output.length >= 100) return;
+        const path = join(directory, entry.name);
+        if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) continue;
+        const lexical = await lstat(path);
+        if (lexical.isSymbolicLink()) continue;
+        const canonical = await realpath(path);
+        if (!isInside(stored.directory, canonical)) continue;
+        if (entry.isDirectory()) {
+          await visit(canonical, depth + 1);
+          continue;
+        }
+        const info = await stat(canonical);
+        if (!info.isFile() || info.size <= 0 || info.size > 64 * 1_048_576 || total + info.size > 256 * 1_048_576) continue;
+        total += info.size;
+        const content = await readVerifiedFile(canonical, stored.directory, 64 * 1_048_576);
+        const sha256 = fileSha256(content);
+        const name = relative(stored.directory, canonical).split(sep).join("/");
+        const id = `artifact_${createHash("sha256").update(`${runId}\0${name}\0${sha256}`).digest("hex").slice(0, 24)}`;
+        const mimeType = artifactMimeType(name);
+        output.push({
+          artifact: {
+            id,
+            name,
+            mimeType,
+            size: content.byteLength,
+            sha256,
+            ref: `harnest-artifact:${runId}/${id}`,
+            preview: artifactPreview(mimeType, name),
+            status: "ready",
+          },
+          content,
+        });
+      }
+    };
+    await visit(stored.directory, 0);
+    return output;
+  }
+
+  async listArtifacts(runId: string): Promise<readonly ArtifactReference[]> {
+    const active = await this.#storedArtifactDirectory(runId);
+    if (active && !active.managed) {
+      const external = await this.#artifactEntries(runId);
+      if (external.length) {
+        const managed = await this.#createManagedArtifactDirectory(runId);
+        for (const { artifact, content } of external) {
+          const target = resolve(managed.directory, ...artifact.name.split("/"));
+          if (!isInside(managed.directory, target)) throw new Error("Artifact path is invalid");
+          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+          await atomicWriteVerifiedFile(target, managed.directory, content);
+        }
+        this.#artifactDirectories.set(runId, Promise.resolve(managed));
+      }
+    }
+    return (await this.#artifactEntries(runId)).map(({ artifact }) => artifact);
+  }
+
+  async readAttachment(attachment: RunAttachment, _context: ServiceExecutionContext): Promise<Uint8Array> {
+    const inputDirectory = this.#options.sandboxWorkspace?.inputDirectory;
+    if (!inputDirectory || typeof attachment.sandboxPath !== "string"
+      || !attachment.sandboxPath.startsWith("/mnt/data/")) {
+      throw new Error(`Attachment '${attachment.name}' is not available in this runtime`);
+    }
+    const relativePath = attachment.sandboxPath.slice("/mnt/data/".length);
+    if (!relativePath || relativePath.includes("\\") || relativePath.split("/").some((part) => !part || part === "." || part === "..")) {
+      throw new Error("Attachment path is invalid");
+    }
+    const root = await realpath(resolve(inputDirectory));
+    const target = resolve(root, ...relativePath.split("/"));
+    if (!isInside(root, target)) throw new Error("Attachment resolves outside the selected run files");
+    const lexical = await lstat(target);
+    if (!lexical.isFile() || lexical.isSymbolicLink()) throw new Error("Attachment is not a regular file");
+    const canonical = await realpath(target);
+    if (!isInside(root, canonical)) throw new Error("Attachment resolves outside the selected run files");
+    const info = await stat(canonical);
+    if (info.size !== attachment.size || info.size > 20 * 1_048_576) {
+      throw new Error(`Attachment '${attachment.name}' changed or exceeds the direct model-input limit`);
+    }
+    return readVerifiedFile(canonical, root, 20 * 1_048_576);
+  }
+
+  async readArtifact(runId: string, artifactId: string): Promise<NodeArtifactContent> {
+    if (!ARTIFACT_ID.test(artifactId)) throw new Error("Artifact id is invalid");
+    const found = (await this.#artifactEntries(runId)).find(({ artifact }) => artifact.id === artifactId);
+    if (!found) throw new Error("Artifact was not found");
+    return found;
   }
 
   async #executeModule(request: ModuleExecutionRequest): Promise<unknown> {
@@ -1018,6 +1883,7 @@ export class NodeRuntimeServices implements RuntimeServices {
       maxOutputBytes: request.maxOutputBytes,
       signal: request.signal,
       connectionId: request.connectionId,
+      runId: request.context.runId,
     }, ["node", "-"]);
     const offset = result.stdout.lastIndexOf(marker);
     const encoded = offset < 0 ? "" : result.stdout.slice(offset + marker.length).split(/\r?\n/u, 1)[0]?.trim() ?? "";
@@ -1053,14 +1919,36 @@ export class NodeRuntimeServices implements RuntimeServices {
     context: ServiceExecutionContext,
   ): Promise<ToolApprovalDecision> {
     if (await this.#matchesPreapprovedTool(request.tool)) {
-      return { approved: true, source: "user", reason: `Tool '${request.tool.id}' was pre-approved` };
+      return { approved: true, source: "user", mode: "allow_always", reason: `Tool '${request.tool.id}' was pre-approved` };
     }
-    if (this.#options.requestToolApproval) return this.#options.requestToolApproval(request, context);
+    if (await this.#toolPermissions.allows(this.#harnessId, request)) {
+      return { approved: true, source: "policy", mode: "allow_always", reason: `Tool '${request.tool.id}' is always allowed for this Harness` };
+    }
+    if (this.#options.requestToolApproval) {
+      const decision = await this.#options.requestToolApproval(request, context);
+      const normalized: ToolApprovalDecision = {
+        ...decision,
+        mode: normalizePermissionDecision(decision.mode, decision.approved),
+      };
+      if (normalized.approved && normalized.mode === "allow_always") {
+        await this.#toolPermissions.grant(this.#harnessId, request);
+      }
+      return normalized;
+    }
     return {
       approved: false,
       source: "policy",
+      mode: "deny",
       reason: `Tool '${request.tool.id}' requires explicit approval`,
     };
+  }
+
+  listToolPermissions(): Promise<PersistedToolPermission[]> {
+    return this.#toolPermissions.list(this.#harnessId);
+  }
+
+  revokeToolPermission(toolId: string, connectionId?: string, capability?: PersistedToolPermission["capability"], resource?: string): Promise<boolean> {
+    return this.#toolPermissions.revoke(this.#harnessId, toolId, connectionId, capability, resource);
   }
 
   async #matchesPreapprovedTool(binding: ToolBinding): Promise<boolean> {
@@ -1188,8 +2076,8 @@ export class NodeRuntimeServices implements RuntimeServices {
     const args = asRecord(input);
     if (!args) throw new Error("MCP Tool arguments must be an object");
     const connectionId = typeof config.connectionId === "string" ? config.connectionId : undefined;
-    // Saved Connection lifecycle mutations must take effect on the next call; do not pool those sessions.
-    const ephemeral = connectionId !== undefined;
+    // Saved lifecycle mutations and run-bound interaction handlers must never share a pooled client.
+    const ephemeral = connectionId !== undefined || context.requestInteraction !== undefined;
     const pending = ephemeral ? this.#connect(config, context) : this.#connection(config, context);
     let connection: McpConnection;
     try {
@@ -1261,12 +2149,19 @@ export class NodeRuntimeServices implements RuntimeServices {
 
   async close(): Promise<void> {
     const settled = await Promise.allSettled(this.#connections.values());
+    const staged = await Promise.allSettled(this.#sandboxProjects.values());
     this.#connections.clear();
     this.#connectionSecrets.clear();
+    this.#sandboxProjects.clear();
+    this.#sandboxSyncLocks.clear();
+    this.#artifactDirectories.clear();
     await Promise.allSettled(settled.flatMap((result) => {
       if (result.status === "rejected") return [];
       return [this.#closeConnection(result.value)];
     }));
+    await Promise.allSettled(staged.flatMap((result) => result.status === "fulfilled"
+      ? [rm(result.value.directory, { recursive: true, force: true })]
+      : []));
   }
 
   async #evictConnection(
@@ -1315,6 +2210,9 @@ export class NodeRuntimeServices implements RuntimeServices {
   ): Promise<McpConnection> {
     const toolName = config.tool;
     if (typeof toolName !== "string" || !toolName) throw new Error("MCP tool is invalid");
+    const elicitationHandler: McpElicitationHandler | undefined = context.requestInteraction
+      ? (params) => resolveMcpElicitation(params, context, toolName)
+      : undefined;
     if (typeof config.connectionId === "string") {
       const profile = await this.connectionManager.require(config.connectionId, "mcp");
       const resolved = await this.resolveConnection(profile.id, context);
@@ -1337,6 +2235,7 @@ export class NodeRuntimeServices implements RuntimeServices {
               ...(this.#options.allowNetworkHosts ?? []), new URL(profile.config.url).host,
             ] }
             : this.#options.allowNetworkHosts !== undefined ? { allowNetworkHosts: this.#options.allowNetworkHosts } : {}),
+          ...(elicitationHandler ? { elicitationHandler } : {}),
         },
         async (changed) => {
           await this.connectionManager.storeDiscoveredTools(profile.id, changed);
@@ -1389,7 +2288,18 @@ export class NodeRuntimeServices implements RuntimeServices {
     }
     const client = new Client(
       { name: "harnest", version: "0.2.0" },
-      { versionNegotiation: protocolMode(config, transportType), listMaxPages: 16 },
+      {
+        versionNegotiation: protocolMode(config, transportType),
+        listMaxPages: 16,
+        ...(elicitationHandler ? {
+          capabilities: { elicitation: { form: {}, url: {} } },
+          inputRequired: { autoFulfill: true },
+        } : {}),
+      },
+    );
+    if (elicitationHandler) client.setRequestHandler(
+      "elicitation/create",
+      ({ params }) => elicitationHandler(params),
     );
     try {
       const requestOptions = { signal: context.signal, timeout, maxTotalTimeout: timeout };
@@ -1429,13 +2339,14 @@ export interface StoredRunEvent extends Readonly<Record<string, unknown>> {
   readonly type: string;
   readonly runId: string;
   readonly timestamp: string;
+  readonly sequence?: number;
 }
 
 export interface RunSummary {
   readonly runId: string;
   readonly startedAt: string;
   readonly finishedAt?: string;
-  readonly status: "running" | "succeeded" | "failed";
+  readonly status: "running" | "succeeded" | "failed" | "cancelled";
   readonly durationMs?: number;
   readonly eventCount: number;
 }
@@ -1460,6 +2371,8 @@ function safeTraceValue(
   key = "",
   depth = 0,
   budget: { remaining: number } = { remaining: 32_768 },
+  maxDepth = 3,
+  maxStringBytes = 512,
 ): unknown {
   if (budget.remaining <= 0) return "[TRUNCATED]";
   if (sensitiveKey.test(key)) {
@@ -1467,7 +2380,7 @@ function safeTraceValue(
     return "[REDACTED]";
   }
   if (typeof value === "string") {
-    const selected = truncateUtf8(value, Math.min(512, budget.remaining)).value;
+    const selected = truncateUtf8(value, Math.min(maxStringBytes, budget.remaining)).value;
     budget.remaining -= byteLength(selected);
     return selected;
   }
@@ -1475,7 +2388,7 @@ function safeTraceValue(
     budget.remaining -= 16;
     return value;
   }
-  if (depth >= 3) {
+  if (depth >= maxDepth) {
     budget.remaining -= Math.min(512, budget.remaining);
     return valueShape(value);
   }
@@ -1483,7 +2396,7 @@ function safeTraceValue(
     const result: unknown[] = [];
     for (const item of value.slice(0, 20)) {
       if (budget.remaining <= 0) break;
-      result.push(safeTraceValue(item, "", depth + 1, budget));
+      result.push(safeTraceValue(item, "", depth + 1, budget, maxDepth, maxStringBytes));
     }
     return result;
   }
@@ -1491,19 +2404,54 @@ function safeTraceValue(
   for (const [name, item] of Object.entries(value as Record<string, unknown>).slice(0, 50)) {
     if (budget.remaining <= 0) break;
     budget.remaining -= Math.min(byteLength(name), 128);
-    result[name] = safeTraceValue(item, name, depth + 1, budget);
+    result[name] = safeTraceValue(item, name, depth + 1, budget, maxDepth, maxStringBytes);
   }
   return result;
 }
 
 function storedEvent(event: RunEvent): StoredRunEvent {
-  return safeTraceValue(event) as StoredRunEvent;
+  const userResult = event.type === "run-end";
+  return safeTraceValue(event, "", 0, { remaining: 32_768 }, event.type === "run-snapshot" || userResult ? 7 : 3, userResult ? 24_576 : 512) as StoredRunEvent;
 }
 
-const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_RUN_FILE_BYTES = 8 * 1_048_576;
 const MAX_RUN_LINE_BYTES = 65_536;
 const MAX_RUN_EVENTS = 10_000;
+const MAX_RUN_SHARDS = 16;
+const MAX_RUN_BUNDLE_BYTES = MAX_RUN_SHARDS * MAX_RUN_FILE_BYTES;
+const MAX_RUN_SNAPSHOT_BYTES = 4 * 1_048_576;
+const MAX_RUN_COMMIT_BYTES = MAX_RUN_SNAPSHOT_BYTES + MAX_RUN_LINE_BYTES + 65_536;
+const RUN_SHARD = /^\d{6}\.ndjson$/;
+
+interface StoredRunCommit {
+  readonly version: 1 | 2;
+  readonly owner?: { readonly id: string; readonly pid: number };
+  readonly event: StoredRunEvent;
+  readonly snapshot: RunSnapshot;
+}
+
+const runStoreHost = globalThis as typeof globalThis & {
+  __harnestRunStoreOwner?: string;
+  __harnestActiveCommits?: Set<string>;
+};
+const RUN_STORE_OWNER = runStoreHost.__harnestRunStoreOwner ??= randomUUID();
+const ACTIVE_RUN_COMMITS = runStoreHost.__harnestActiveCommits ??= new Set<string>();
+const RUN_STORE_OPERATIONS = (runStoreHost as typeof runStoreHost & {
+  __harnestRunStoreOperations?: Map<string, Promise<void>>;
+}).__harnestRunStoreOperations ??= new Map<string, Promise<void>>();
+
+export * from "./node-run-idempotency.js";
+
+interface StoredRunMeta {
+  readonly version: 1;
+  readonly runId: string;
+  readonly startedAt: string;
+  readonly finishedAt?: string;
+  readonly status: RunSummary["status"];
+  readonly durationMs?: number;
+  readonly eventCount: number;
+}
 
 async function runFile(directory: string, runId: string): Promise<{
   readonly path: string;
@@ -1549,8 +2497,8 @@ function parseRunEvents(runId: string, text: string): StoredRunEvent[] {
   return events;
 }
 
-async function openRunFileForAppend(directory: string, runId: string): Promise<FileHandle> {
-  const path = resolve(directory, `${runId}.ndjson`);
+async function openRunFileForAppend(directory: string, filename: string): Promise<FileHandle> {
+  const path = resolve(directory, filename);
   if (!isInside(directory, path)) throw new Error("Run trace resolves outside Harnest storage");
   try {
     const info = await lstat(path);
@@ -1589,46 +2537,119 @@ async function openRunFileForAppend(directory: string, runId: string): Promise<F
 
 export class FileRunStore {
   readonly #root: Promise<string>;
-  readonly #pending = new Map<string, Promise<void>>();
+  readonly #operationRoot: string;
 
   constructor(projectDirectory: string) {
     this.#root = projectRoot(projectDirectory);
+    this.#operationRoot = resolve(projectDirectory);
   }
 
   append(event: RunEvent): Promise<void> {
     if (!RUN_ID.test(event.runId)) return Promise.reject(new Error("Run id is invalid"));
-    const previous = this.#pending.get(event.runId) ?? Promise.resolve();
-    const next = previous.then(() => this.#append(event), () => this.#append(event));
-    this.#pending.set(event.runId, next);
-    void next.finally(() => {
-      if (this.#pending.get(event.runId) === next) this.#pending.delete(event.runId);
-    }).catch(() => undefined);
-    return next;
+    const write = () => this.#withRunLease(event.runId, async () => {
+      await this.#recoverCommit(event.runId);
+      await this.#append(event);
+    });
+    return this.#enqueue(event.runId, write);
+  }
+
+  commit(event: RunEvent, snapshot: RunSnapshot): Promise<void> {
+    if (event.runId !== snapshot.runId || !RUN_ID.test(event.runId)) return Promise.reject(new Error("Run commit is invalid"));
+    const write = () => this.#withRunLease(event.runId, async () => {
+      await this.#recoverCommit(event.runId);
+      const root = await this.#root;
+      const bundle = await storageDirectory(root, `runs/${event.runId}`);
+      const commit: StoredRunCommit = {
+        version: 2, owner: { id: RUN_STORE_OWNER, pid: process.pid },
+        event: storedEvent(event), snapshot: this.#snapshotValue(snapshot),
+      };
+      const existing = await this.#readBundle(bundle, event.runId).catch((error: unknown) => {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [];
+        throw error;
+      });
+      if (typeof commit.event.sequence === "number") {
+        const duplicate = existing.find(({ sequence }) => sequence === commit.event.sequence);
+        if (duplicate && JSON.stringify(duplicate) !== JSON.stringify(commit.event)) {
+          throw new Error(`Run event sequence ${commit.event.sequence} conflicts with stored history`);
+        }
+        if (!duplicate && typeof existing.at(-1)?.sequence === "number"
+          && existing.at(-1)!.sequence! >= commit.event.sequence) {
+          throw new Error(`Run event sequence ${commit.event.sequence} is already committed`);
+        }
+      }
+      const serialized = `${JSON.stringify(commit)}\n`;
+      if (byteLength(serialized) > MAX_RUN_COMMIT_BYTES) throw new Error("Run commit exceeds the recovery journal limit");
+      const journal = resolve(bundle, "commit.json");
+      ACTIVE_RUN_COMMITS.add(journal);
+      try {
+        await atomicWriteVerifiedFile(journal, bundle, serialized);
+        await this.#applyCommit(bundle, commit);
+        await rm(journal, { force: true });
+      } finally { ACTIVE_RUN_COMMITS.delete(journal); }
+    });
+    return this.#enqueue(event.runId, write);
   }
 
   async read(runId: string): Promise<StoredRunEvent[]> {
     if (!RUN_ID.test(runId)) throw new Error("Run id is invalid");
-    await this.#pending.get(runId);
-    const directory = await storageDirectory(await this.#root, "runs");
-    const file = await runFile(directory, runId);
-    if (file.size > MAX_RUN_FILE_BYTES) throw new Error("Run trace exceeds the 8 MiB safety limit");
-    const selected = await readBounded(file.path, directory, MAX_RUN_FILE_BYTES);
-    if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
-    return parseRunEvents(runId, selected.text);
+    await this.#waitForPending(runId);
+    return this.#stableRead(async () => {
+      const directory = await storageDirectory(await this.#root, "runs");
+      const bundle = await this.#bundle(directory, runId);
+      if (bundle) { await this.#recoverCommit(runId, bundle); return this.#readBundle(bundle, runId); }
+      const file = await runFile(directory, runId);
+      if (file.size > MAX_RUN_FILE_BYTES) throw new Error("Run trace exceeds the 8 MiB safety limit");
+      const selected = await readBounded(file.path, directory, MAX_RUN_FILE_BYTES);
+      if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
+      return parseRunEvents(runId, selected.text);
+    });
+  }
+
+  async readEvents(runId: string, afterSequence = 0): Promise<StoredRunEvent[]> {
+    return (await this.read(runId)).filter((event) => typeof event.sequence !== "number" || event.sequence > afterSequence);
+  }
+
+  async readSnapshot(runId: string): Promise<RunSnapshot | undefined> {
+    if (!RUN_ID.test(runId)) throw new Error("Run id is invalid");
+    await this.#waitForPending(runId);
+    return this.#stableRead(async () => {
+      const directory = await storageDirectory(await this.#root, "runs");
+      const bundle = await this.#bundle(directory, runId);
+      if (!bundle) return undefined;
+      await this.#recoverCommit(runId, bundle);
+      try {
+        const parsed = JSON.parse((await readVerifiedFile(resolve(bundle, "snapshot.json"), bundle, MAX_RUN_SNAPSHOT_BYTES)).toString("utf8")) as unknown;
+        const record = asRecord(parsed);
+        return record?.runId === runId ? record as unknown as RunSnapshot : undefined;
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+        throw error;
+      }
+    });
+  }
+
+  saveSnapshot(snapshot: RunSnapshot): Promise<void> {
+    if (!RUN_ID.test(snapshot.runId)) return Promise.reject(new Error("Run id is invalid"));
+    return this.#enqueue(snapshot.runId, () => this.#withRunLease(snapshot.runId, () => this.#saveSnapshot(snapshot)));
   }
 
   async list(limit = 50): Promise<RunSummary[]> {
     const boundedLimit = Math.min(Math.max(1, Math.floor(limit)), 500);
     const directory = await storageDirectory(await this.#root, "runs");
-    const files = (await readdir(directory, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".ndjson"))
-      .map((entry) => entry.name.slice(0, -7))
-      .filter((runId) => RUN_ID.test(runId));
+    const files = new Set((await readdir(directory, { withFileTypes: true })).flatMap((entry) => {
+      const runId = entry.isFile() && entry.name.endsWith(".ndjson") ? entry.name.slice(0, -7)
+        : entry.isDirectory() ? entry.name : "";
+      return RUN_ID.test(runId) && (entry.isDirectory() || entry.isFile()) ? [runId] : [];
+    }));
     const ordered: { runId: string; modified: number }[] = [];
     for (const runId of files) {
       try {
-        const file = await runFile(directory, runId);
-        if (file.size <= MAX_RUN_FILE_BYTES) ordered.push({ runId, modified: file.modified });
+        const bundle = await this.#bundle(directory, runId);
+        if (bundle) ordered.push({ runId, modified: (await stat(bundle)).mtimeMs });
+        else {
+          const file = await runFile(directory, runId);
+          if (file.size <= MAX_RUN_FILE_BYTES) ordered.push({ runId, modified: file.modified });
+        }
       } catch {
         // A concurrently removed, linked, or invalid trace is not listable.
       }
@@ -1638,6 +2659,11 @@ export class FileRunStore {
     const summaries: RunSummary[] = [];
     for (const { runId } of ordered) {
       if (summaries.length >= boundedLimit) break;
+      const bundle = await this.#bundle(directory, runId);
+      if (bundle) {
+        const meta = await this.#readMeta(bundle, runId);
+        if (meta) { summaries.push(meta); continue; }
+      }
       let events: StoredRunEvent[];
       try {
         events = await this.read(runId);
@@ -1662,25 +2688,55 @@ export class FileRunStore {
   }
 
   async #append(event: RunEvent): Promise<void> {
-    const serialized = JSON.stringify(storedEvent(event));
+    const safeEvent = storedEvent(event);
+    const serialized = JSON.stringify(safeEvent);
     if (byteLength(serialized) > MAX_RUN_LINE_BYTES) {
       throw new Error("Run trace event exceeds the 64 KiB line limit");
     }
     const line = Buffer.from(`${serialized}\n`, "utf8");
-    const directory = await storageDirectory(await this.#root, "runs");
-    const handle = await openRunFileForAppend(directory, event.runId);
+    const root = await this.#root;
+    const runs = await storageDirectory(root, "runs");
     try {
-      const opened = await handle.stat({ bigint: true });
-      if (opened.size + BigInt(line.byteLength) > BigInt(MAX_RUN_FILE_BYTES)) {
-        throw new Error("Run trace exceeds the 8 MiB safety limit");
-      }
-      const selected = await readBoundedHandle(handle, MAX_RUN_FILE_BYTES);
+      const legacy = await runFile(runs, event.runId);
+      if (legacy.size + line.byteLength > MAX_RUN_FILE_BYTES) throw new Error("Run trace exceeds the 8 MiB safety limit");
+      const selected = await readBounded(legacy.path, runs, MAX_RUN_FILE_BYTES);
       if (selected.truncated) throw new Error("Run trace exceeds the 8 MiB safety limit");
-      if (selected.text.length > 0 && !selected.text.endsWith("\n")) {
-        throw new Error("Run trace is incomplete and cannot be appended");
-      }
       const events = parseRunEvents(event.runId, selected.text);
       if (events.length >= MAX_RUN_EVENTS) throw new Error("Run trace exceeds the 10,000 event limit");
+      throw new Error("Legacy run traces are read-only");
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    const bundle = await storageDirectory(root, `runs/${event.runId}`);
+    const directory = await storageDirectory(root, `runs/${event.runId}/events`);
+    const shards = (await readdir(directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && RUN_SHARD.test(entry.name)).map(({ name }) => name).sort();
+    let shardNumber = shards.length ? Number(shards.at(-1)!.slice(0, 6)) : 1;
+    let filename = `${String(shardNumber).padStart(6, "0")}.ndjson`;
+    let handle = await openRunFileForAppend(directory, filename);
+    try {
+      let opened = await handle.stat({ bigint: true });
+      let selected = await readBoundedHandle(handle, MAX_RUN_FILE_BYTES);
+      if (selected.truncated || (selected.text.length > 0 && !selected.text.endsWith("\n"))) {
+        throw new Error("Run trace shard is incomplete");
+      }
+      let events = parseRunEvents(event.runId, selected.text);
+      const previous = events.at(-1) ?? (shards.length > 1 ? (await this.#readBundle(bundle, event.runId)).at(-1) : undefined);
+      if (typeof safeEvent.sequence === "number" && typeof previous?.sequence === "number"
+        && previous.sequence >= safeEvent.sequence) {
+        if (previous.sequence === safeEvent.sequence && JSON.stringify(previous) === serialized) return;
+        throw new Error(`Run event sequence ${safeEvent.sequence} is already committed`);
+      }
+      if (opened.size + BigInt(line.byteLength) > BigInt(MAX_RUN_FILE_BYTES) || events.length >= MAX_RUN_EVENTS) {
+        await handle.close();
+        shardNumber += 1;
+        if (shardNumber > MAX_RUN_SHARDS) throw new Error(`Run trace exceeds the ${MAX_RUN_SHARDS}-shard safety limit`);
+        filename = `${String(shardNumber).padStart(6, "0")}.ndjson`;
+        handle = await openRunFileForAppend(directory, filename);
+        opened = await handle.stat({ bigint: true });
+        selected = await readBoundedHandle(handle, MAX_RUN_FILE_BYTES);
+        events = parseRunEvents(event.runId, selected.text);
+      }
       const beforeWrite = await handle.stat({ bigint: true });
       if (beforeWrite.size !== opened.size) throw new Error("Run trace changed while it was being appended");
       const { bytesWritten } = await handle.write(line, 0, line.byteLength, null);
@@ -1693,5 +2749,198 @@ export class FileRunStore {
     } finally {
       await handle.close();
     }
+    if (event.type === "run-start" || event.type === "run-end" || event.type === "error") {
+      const existing = await this.#readMeta(bundle, event.runId);
+      const status = event.type === "run-end" ? "succeeded" : event.type === "error"
+        ? event.code === "RUN_CANCELLED" ? "cancelled" : "failed" : "running";
+      const meta: StoredRunMeta = {
+        version: 1,
+        runId: event.runId,
+        startedAt: existing?.startedAt ?? event.timestamp,
+        ...(event.type === "run-start" ? {} : { finishedAt: event.timestamp }),
+        status,
+        ...(event.type === "run-end" ? { durationMs: event.durationMs } : {}),
+        eventCount: event.sequence ?? (await this.#readBundle(bundle, event.runId)).length,
+      };
+      await atomicWriteVerifiedFile(resolve(bundle, "meta.json"), bundle, `${JSON.stringify(meta)}\n`);
+    }
+  }
+
+  async #bundle(runs: string, runId: string): Promise<string | undefined> {
+    const candidate = resolve(runs, runId);
+    if (!isInside(runs, candidate)) throw new Error("Run bundle resolves outside Harnest storage");
+    try {
+      const lexical = await lstat(candidate);
+      if (!lexical.isDirectory() || lexical.isSymbolicLink()) throw new Error("Run bundle is unsafe");
+      const canonical = await realpath(candidate);
+      if (!isInside(runs, canonical)) throw new Error("Run bundle resolves outside Harnest storage");
+      return canonical;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async #withRunLease<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    const root = await this.#root;
+    await acquireRunExecutionLease(root, runId, true);
+    try { return await operation(); } finally { await releaseRunExecutionLease(root, runId); }
+  }
+
+  #operationKey(runId: string): string {
+    return `${this.#operationRoot}\0${runId}`;
+  }
+
+  async #enqueue(runId: string, operation: () => Promise<void>): Promise<void> {
+    const key = this.#operationKey(runId);
+    const previous = RUN_STORE_OPERATIONS.get(key) ?? Promise.resolve();
+    const next = previous.then(operation, operation);
+    RUN_STORE_OPERATIONS.set(key, next);
+    try { await next; } finally {
+      if (RUN_STORE_OPERATIONS.get(key) === next) RUN_STORE_OPERATIONS.delete(key);
+    }
+  }
+
+  async #waitForPending(runId: string): Promise<void> {
+    await RUN_STORE_OPERATIONS.get(this.#operationKey(runId));
+  }
+
+  async #stableRead<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await operation(); } catch (error) {
+        if (attempt >= 4 || !(error instanceof Error)
+          || !/(?:changed during I\/O|incomplete|ENOENT)/iu.test(error.message)) throw error;
+        await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+  }
+
+  async #readBundle(bundle: string, runId: string): Promise<StoredRunEvent[]> {
+    const eventsDirectory = await realpath(resolve(bundle, "events"));
+    if (!isInside(bundle, eventsDirectory)) throw new Error("Run event storage is unsafe");
+    const shards = (await readdir(eventsDirectory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && RUN_SHARD.test(entry.name)).map(({ name }) => name).sort();
+    if (shards.length > MAX_RUN_SHARDS) throw new Error("Run trace has too many shards");
+    const events: StoredRunEvent[] = [];
+    let bytes = 0;
+    for (const shard of shards) {
+      const path = resolve(eventsDirectory, shard);
+      const info = await stat(path);
+      bytes += info.size;
+      if (info.size > MAX_RUN_FILE_BYTES || bytes > MAX_RUN_BUNDLE_BYTES) throw new Error("Run trace exceeds its safety limit");
+      const text = (await readVerifiedFile(path, eventsDirectory, MAX_RUN_FILE_BYTES)).toString("utf8");
+      events.push(...parseRunEvents(runId, text));
+    }
+    return events;
+  }
+
+  async #readMeta(bundle: string, runId: string): Promise<StoredRunMeta | undefined> {
+    try {
+      const value = JSON.parse((await readVerifiedFile(resolve(bundle, "meta.json"), bundle, 65_536)).toString("utf8")) as unknown;
+      const record = asRecord(value);
+      if (!record || record.version !== 1 || record.runId !== runId || typeof record.startedAt !== "string"
+        || !["running", "succeeded", "failed", "cancelled"].includes(String(record.status))
+        || typeof record.eventCount !== "number") return undefined;
+      return record as unknown as StoredRunMeta;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  #snapshotValue(snapshot: RunSnapshot): RunSnapshot {
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(snapshot, function (_key, value: unknown) {
+        if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Run snapshot contains a non-finite number");
+        if (typeof value === "bigint" || typeof value === "function" || typeof value === "symbol") {
+          throw new Error(`Run snapshot contains a non-JSON ${typeof value}`);
+        }
+        if (value === undefined && Array.isArray(this)) throw new Error("Run snapshot contains an undefined array item");
+        return value;
+      });
+    } catch (cause) {
+      throw new Error("Run snapshot is not JSON serializable", { cause });
+    }
+    if (byteLength(serialized) + 1 > MAX_RUN_SNAPSHOT_BYTES) throw new Error("Run snapshot exceeds the 4 MiB safety limit");
+    return JSON.parse(serialized) as RunSnapshot;
+  }
+
+  async #applyCommit(bundle: string, commit: StoredRunCommit): Promise<void> {
+    let events: StoredRunEvent[] = [];
+    try { events = await this.#readBundle(bundle, commit.event.runId); } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    const duplicate = typeof commit.event.sequence === "number"
+      ? events.find(({ sequence }) => sequence === commit.event.sequence)
+      : events.find((event) => JSON.stringify(event) === JSON.stringify(commit.event));
+    if (duplicate && JSON.stringify(duplicate) !== JSON.stringify(commit.event)) {
+      throw new Error(`Run event sequence ${commit.event.sequence ?? "without a sequence"} conflicts with stored history`);
+    }
+    if (!duplicate) await this.#append(commit.event as unknown as RunEvent);
+    let current: RunSnapshot | undefined;
+    try {
+      const value = JSON.parse((await readVerifiedFile(resolve(bundle, "snapshot.json"), bundle, MAX_RUN_SNAPSHOT_BYTES)).toString("utf8")) as unknown;
+      const record = asRecord(value);
+      if (record?.runId === commit.snapshot.runId) current = record as unknown as RunSnapshot;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    if ((current?.sequence ?? -1) < (commit.snapshot.sequence ?? 0)) await this.#saveSnapshot(commit.snapshot);
+  }
+
+  async #recoverCommit(runId: string, knownBundle?: string): Promise<void> {
+    const root = await this.#root;
+    const runs = await storageDirectory(root, "runs");
+    const bundle = knownBundle ?? await this.#bundle(runs, runId);
+    if (!bundle) return;
+    const journal = resolve(bundle, "commit.json");
+    if (ACTIVE_RUN_COMMITS.has(journal)) return;
+    let commit: StoredRunCommit;
+    try {
+      const parsed = JSON.parse((await readVerifiedFile(journal, bundle, MAX_RUN_COMMIT_BYTES)).toString("utf8")) as unknown;
+      const record = asRecord(parsed);
+      const event = asRecord(record?.event);
+      const snapshot = asRecord(record?.snapshot);
+      if ((record?.version !== 1 && record?.version !== 2) || event?.runId !== runId || snapshot?.runId !== runId) {
+        throw new Error("Run recovery journal is invalid");
+      }
+      const owner = asRecord(record.owner);
+      if (record.version === 2 && typeof owner?.pid === "number" && owner.pid !== process.pid) {
+        try { process.kill(owner.pid, 0); return; } catch (probe) {
+          if (probe && typeof probe === "object" && "code" in probe && probe.code === "EPERM") return;
+        }
+      }
+      commit = record as unknown as StoredRunCommit;
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
+      throw error;
+    }
+    await this.#applyCommit(bundle, commit);
+    await rm(journal, { force: true });
+  }
+
+  async #saveSnapshot(snapshot: RunSnapshot): Promise<void> {
+    const root = await this.#root;
+    const bundle = await storageDirectory(root, `runs/${snapshot.runId}`);
+    const safe = this.#snapshotValue(snapshot);
+    try {
+      const value = JSON.parse((await readVerifiedFile(resolve(bundle, "snapshot.json"), bundle, MAX_RUN_SNAPSHOT_BYTES)).toString("utf8")) as unknown;
+      const current = asRecord(value);
+      if (typeof current?.sequence === "number" && typeof safe.sequence === "number" && current.sequence > safe.sequence) {
+        throw new Error(`Run snapshot sequence ${safe.sequence} would regress stored sequence ${current.sequence}`);
+      }
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    const serialized = `${JSON.stringify(safe)}\n`;
+    if (byteLength(serialized) > MAX_RUN_SNAPSHOT_BYTES) throw new Error("Run snapshot exceeds the 4 MiB safety limit");
+    await atomicWriteVerifiedFile(resolve(bundle, "snapshot.json"), bundle, serialized);
+    const existing = await this.#readMeta(bundle, snapshot.runId);
+    if (existing) await atomicWriteVerifiedFile(resolve(bundle, "meta.json"), bundle, `${JSON.stringify({
+      ...existing,
+      status: snapshot.status,
+      ...(snapshot.status === "running" ? {} : { finishedAt: snapshot.updatedAt }),
+    })}\n`);
   }
 }

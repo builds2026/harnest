@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
-import type { Diagnostic, RunEvent } from "@harnest/core";
-import { AlertDialog } from "@base-ui/react/alert-dialog";
+import type { Diagnostic, RunEvent } from "@harnestai/core";
+import { HarnestClient } from "@harnestai/sdk";
 import { readNdjson } from "@/lib/ndjson";
-import { apiErrorMessage, requestJson } from "@/lib/api-client";
+import { apiErrorMessage, ClientApiError, requestJson } from "@/lib/api-client";
+import { randomId } from "@/lib/random-id";
 import type {
   PlaygroundCapabilities,
   PlaygroundFile,
@@ -13,6 +14,7 @@ import type {
   PlaygroundSessionSummary,
 } from "@/lib/playground";
 import { useI18n } from "./i18n-provider";
+import { InteractionRenderer, type InteractionResponseView, type InteractionView } from "./interaction-renderer";
 import { ConfirmDialog } from "./ui/ui";
 
 interface PlaygroundProject {
@@ -36,19 +38,6 @@ interface PlaygroundFilesEvent {
   readonly files: readonly PlaygroundFile[];
 }
 
-interface PendingApproval {
-  readonly runId: string;
-  readonly nodeId: string;
-  readonly callId: string;
-  readonly turn: number;
-  readonly tool: string;
-  readonly risk: string;
-  readonly input: unknown;
-  readonly inputDigest: string;
-  readonly inputBytes: number;
-  readonly previewLimited: boolean;
-}
-
 interface LiveRun {
   readonly events: readonly RunEvent[];
   readonly text: string;
@@ -56,13 +45,6 @@ interface LiveRun {
   readonly error?: string;
   readonly runId?: string;
 }
-
-const RISK_MESSAGE_KEYS = {
-  read: "playground.approval.risk.read",
-  write: "playground.approval.risk.write",
-  external: "playground.approval.risk.external",
-  destructive: "playground.approval.risk.destructive",
-} as const;
 
 const responseMessage = async (response: Response) => {
   const payload = await response.json().catch(() => null) as
@@ -78,6 +60,7 @@ const bytes = (value: number) => value < 1_024 ? `${value} B`
   : value < 1_048_576 ? `${(value / 1_024).toFixed(1)} KiB`
     : `${(value / 1_048_576).toFixed(1)} MiB`;
 const eventData = (event: RunEvent) => event as unknown as Record<string, unknown>;
+const activeRunKey = (sessionId: string) => `harnest.playground.active-run.${sessionId}`;
 
 function eventLabel(event: RunEvent, t: ReturnType<typeof useI18n>["t"]) {
   switch (event.type) {
@@ -85,14 +68,20 @@ function eventLabel(event: RunEvent, t: ReturnType<typeof useI18n>["t"]) {
     case "node-start": return t("playground.event.nodeStart", { node: event.nodeId });
     case "usage": return t("playground.event.usage", { node: event.nodeId });
     case "context-use": return t("playground.event.context", { node: event.nodeId, source: event.source });
+    case "context-compaction": return t("playground.event.contextCompacted", { node: event.nodeId, before: event.beforeBytes, after: event.afterBytes });
+    case "prompt-cache": return t("playground.event.promptCache", { node: event.nodeId, status: event.status });
     case "tool-call": return t("playground.event.toolRequested", { tool: event.tool });
     case "tool-approval": return t(event.approved ? "playground.event.toolApproved" : "playground.event.toolDenied", { tool: event.tool });
     case "tool-result": return t(event.ok ? "playground.event.toolCompleted" : "playground.event.toolFailed", { tool: event.tool, duration: Math.round(event.durationMs) });
+    case "interaction-requested": return t("playground.event.interactionRequested", { title: event.request.title });
+    case "interaction-resolved": return t("playground.event.interactionResolved");
+    case "run-paused": return t(event.paused ? "playground.event.runPaused" : "playground.event.runResumed");
     case "skill-use": return t("playground.event.skill", { skill: event.skill });
     case "fallback": return t("playground.event.fallback", { from: event.from, to: event.to });
     case "retry": return t("playground.event.retry", { node: event.nodeId, attempt: event.attempt });
     case "iteration": return t("playground.event.iteration", { node: event.nodeId, iteration: event.iteration, phase: event.phase });
     case "evaluation": return t(event.passed ? "playground.event.checkPassed" : "playground.event.checkFailed", { evaluator: event.evaluator });
+    case "artifact": case "artifact-created": case "artifact-updated": return t("playground.event.artifact", { name: event.artifact.name, size: event.artifact.size });
     case "node-end": return t("playground.event.nodeEnd", { node: event.nodeId, duration: Math.round(event.durationMs) });
     case "node-skip": return t("playground.event.nodeSkip", { node: event.nodeId });
     case "edge": return t("playground.event.edge", { from: event.from.component, to: event.to.component });
@@ -200,7 +189,7 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   const [previewFileId, setPreviewFileId] = useState<string>();
   const [message, setMessage] = useState("");
   const [liveRun, setLiveRun] = useState<LiveRun>();
-  const [runState, setRunState] = useState<"idle" | "running" | "cancelling">("idle");
+  const [runState, setRunState] = useState<"idle" | "running" | "paused" | "cancelling">("idle");
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [notice, setNotice] = useState("");
@@ -209,8 +198,10 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   const [rightTab, setRightTab] = useState<"files" | "sandbox" | "details">("files");
   const [disabledPlugins, setDisabledPlugins] = useState<ReadonlySet<string>>(new Set());
   const [modelValue, setModelValue] = useState("");
-  const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
-  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [pendingInteraction, setPendingInteraction] = useState<InteractionView>();
+  const [queuedInteractions, setQueuedInteractions] = useState<readonly InteractionView[]>([]);
+  const [interactionBusy, setInteractionBusy] = useState(false);
+  const [interactionError, setInteractionError] = useState("");
   const [confirmation, setConfirmation] = useState<{
     title: string;
     description: string;
@@ -219,6 +210,52 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   }>();
   const abortRef = useRef<AbortController | undefined>(undefined);
   const sessionLoad = useRef(0);
+
+  useEffect(() => {
+    if (pendingInteraction || !queuedInteractions.length) return;
+    setPendingInteraction(queuedInteractions[0]);
+    setQueuedInteractions((queued) => queued.slice(1));
+  }, [pendingInteraction, queuedInteractions]);
+
+  const acceptRunEvent = useCallback((event: RunEvent) => {
+    window.dispatchEvent(new CustomEvent<RunEvent>("harnest-run-event", { detail: event }));
+    if (session?.id && event.type === "run-start") localStorage.setItem(activeRunKey(session.id), event.runId);
+    if (session?.id && (event.type === "run-end" || event.type === "error")) localStorage.removeItem(activeRunKey(session.id));
+    setLiveRun((current) => ({
+      events: [...(current?.events ?? []), event],
+      text: event.type === "text-delta" ? `${current?.text ?? ""}${event.text}` : current?.text ?? "",
+      ...(current?.output !== undefined ? { output: current.output } : {}),
+      ...(current?.error ? { error: current.error } : {}),
+      ...(event.type === "run-start" ? { runId: event.runId } : current?.runId ? { runId: current.runId } : {}),
+      ...(event.type === "run-end" ? { output: outputText(event.output), runId: event.runId } : {}),
+      ...(event.type === "error" ? { error: event.message, runId: event.runId } : {}),
+    }));
+    if (event.type === "interaction-requested") {
+      setPendingInteraction((current) => {
+        if (!current) return event.request;
+        if (current.id !== event.request.id) setQueuedInteractions((queued) => queued.some(({ id }) => id === event.request.id)
+          ? queued : [...queued, event.request]);
+        return current.id === event.request.id ? event.request : current;
+      });
+    }
+    if (event.type === "interaction-resolved") {
+      setQueuedInteractions((queued) => queued.filter(({ id }) => id !== event.response.interactionId));
+      setPendingInteraction((current) => current?.id === event.response.interactionId ? undefined : current);
+    }
+    if (event.type === "run-paused") setRunState(event.paused ? "paused" : "running");
+  }, [session?.id]);
+
+  const acceptStreamValue = useCallback((value: RunEvent | PlaygroundFilesEvent) => {
+    if (value.type === "playground-files") {
+      if (value.live) setLiveFiles(value.files);
+      else {
+        setLiveFiles([]);
+        setFiles((current) => [...current.filter(({ id }) => !value.files.some((file) => file.id === id)), ...value.files]);
+      }
+      return;
+    }
+    acceptRunEvent(value);
+  }, [acceptRunEvent]);
 
   const loadSession = useCallback(async (id: string) => {
     const request = ++sessionLoad.current;
@@ -229,7 +266,7 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       setProject((current) => current ? { ...current, ready: payload.ready, diagnostics: payload.diagnostics, capabilities: payload.capabilities, retentionDays: payload.retentionDays } : current);
       setSession(payload.session);
       setFiles(payload.files);
-      setSelectedFileIds((current) => new Set([...current].filter((fileId) => payload.files.some(({ id: candidate }) => candidate === fileId))));
+      setSelectedFileIds(new Set((payload.session.activeFileIds ?? []).filter((fileId) => payload.files.some(({ id: candidate }) => candidate === fileId))));
       setPreviewFileId((current) => current && payload.files.some(({ id: candidate }) => candidate === current) ? current : payload.files[0]?.id);
       setNotice("");
     } catch (error) {
@@ -296,6 +333,60 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
     compact.addEventListener("change", collapse);
     return () => compact.removeEventListener("change", collapse);
   }, []);
+
+  useEffect(() => {
+    const sessionId = session?.id;
+    if (!sessionId || abortRef.current) return;
+    const runId = localStorage.getItem(activeRunKey(sessionId));
+    if (!runId) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    void (async () => {
+      try {
+        const client = new HarnestClient(window.location.origin);
+        const snapshot = await client.snapshot(runId, controller.signal) as unknown as {
+          status?: string;
+          pendingInteractions?: InteractionView[];
+          sequence?: number;
+        };
+        if (["succeeded", "failed", "cancelled"].includes(snapshot.status ?? "")) {
+          localStorage.removeItem(activeRunKey(sessionId));
+          await loadSession(sessionId);
+          return;
+        }
+        const history = await requestJson<{ run: { events?: RunEvent[] } }>(`/api/runs?runId=${encodeURIComponent(runId)}`);
+        const prior = history.run.events ?? [];
+        setLiveRun({
+          runId,
+          events: prior,
+          text: prior.filter((event): event is Extract<RunEvent, { type: "text-delta" }> => event.type === "text-delta").map(({ text }) => text).join(""),
+        });
+        setPendingInteraction(snapshot.pendingInteractions?.[0]);
+        setQueuedInteractions(snapshot.pendingInteractions?.slice(1) ?? []);
+        setRunState(snapshot.status === "paused" ? "paused" : "running");
+        let terminal = false;
+        const after = Math.max(snapshot.sequence ?? 0, ...prior.map(({ sequence }) => sequence ?? 0));
+        for await (const envelope of client.events(runId, { after, signal: controller.signal })) {
+          const event = envelope.data as RunEvent;
+          acceptRunEvent(event);
+          terminal ||= event.type === "run-end" || event.type === "error";
+        }
+        if (terminal) {
+          await loadSession(sessionId);
+          await refreshProject();
+          setLiveRun(undefined);
+          setPendingInteraction(undefined);
+          setQueuedInteractions([]);
+          setRunState("idle");
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) setNotice(apiErrorMessage(error, t("playground.error.run"), t));
+      } finally {
+        if (abortRef.current === controller) abortRef.current = undefined;
+      }
+    })();
+    return () => controller.abort();
+  }, [acceptRunEvent, loadSession, refreshProject, session?.id, t]);
 
   const showLeft = () => {
     setLeftOpen(true);
@@ -388,44 +479,57 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
     });
   };
 
-  const inspectApproval = async (event: Extract<RunEvent, { type: "tool-call" }>) => {
-    if (event.risk === "read" || !event.callId || !event.turn) return;
-    setApprovalBusy(true);
+  const respondToInteraction = async (response: InteractionResponseView) => {
+    if (!pendingInteraction || interactionBusy) return;
+    setInteractionBusy(true);
+    setInteractionError("");
+    const commandId = `interaction_${randomId().replaceAll("-", "")}`;
+    const sendResponse = () => requestJson(`/v1/runs/${encodeURIComponent(pendingInteraction.runId)}/commands`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commandId, type: "interaction.response", response }),
+    });
     try {
-      const payload = await requestJson<{ approval: PendingApproval }>("/api/approvals", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ action: "inspect", runId: event.runId, nodeId: event.nodeId, callId: event.callId, turn: event.turn }),
-      });
-      setPendingApproval(payload.approval);
+      try {
+        await sendResponse();
+      } catch (error) {
+        if (!(error instanceof ClientApiError) || error.details.code !== "RUN_NOT_ACTIVE" || !session || !project) throw error;
+        const lastUserMessage = [...session.messages].reverse().find(({ role }) => role === "user")?.content;
+        if (!lastUserMessage) throw error;
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const selectedModel = project.capabilities.models.find((option) => `${option.componentKey}\u0000${option.connectionId}` === modelValue);
+        const resumed = await fetch("/api/playground/run", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sessionId: session.id,
+            message: lastUserMessage,
+            resumeRunId: pendingInteraction.runId,
+            fileIds: [...selectedFileIds],
+            disabledPluginKeys: [...disabledPlugins],
+            ...(selectedModel ? { model: { componentKey: selectedModel.componentKey, connectionId: selectedModel.connectionId } } : {}),
+          }),
+          signal: controller.signal,
+        });
+        if (!resumed.ok) throw new Error(await responseMessage(resumed), { cause: error });
+        void readNdjson<RunEvent | PlaygroundFilesEvent>(resumed, acceptStreamValue).then(async () => {
+          await loadSession(session.id);
+          await refreshProject();
+          setLiveRun(undefined);
+          setRunState("idle");
+        }).catch((streamError: unknown) => {
+          if (!controller.signal.aborted) setNotice(apiErrorMessage(streamError, t("playground.error.run"), t));
+        });
+        await sendResponse();
+      }
+      setPendingInteraction(queuedInteractions[0]);
+      setQueuedInteractions((queued) => queued.slice(1));
+      setRunState(queuedInteractions.length ? "paused" : "running");
     } catch (error) {
-      setNotice(apiErrorMessage(error, t("playground.error.inspectApproval"), t));
+      setInteractionError(apiErrorMessage(error, t("playground.error.approval"), t));
     } finally {
-      setApprovalBusy(false);
-    }
-  };
-
-  const decideApproval = async (approved: boolean) => {
-    if (!pendingApproval || approvalBusy) return;
-    setApprovalBusy(true);
-    try {
-      await requestJson("/api/approvals", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          runId: pendingApproval.runId,
-          nodeId: pendingApproval.nodeId,
-          callId: pendingApproval.callId,
-          turn: pendingApproval.turn,
-          inputDigest: pendingApproval.inputDigest,
-          approved,
-        }),
-      });
-      setPendingApproval(undefined);
-    } catch (error) {
-      setNotice(apiErrorMessage(error, t("playground.error.approval"), t));
-    } finally {
-      setApprovalBusy(false);
+      setInteractionBusy(false);
     }
   };
 
@@ -437,7 +541,9 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
     setRunState("running");
     setNotice("");
     setLiveFiles([]);
-    setPendingApproval(undefined);
+    setPendingInteraction(undefined);
+    setQueuedInteractions([]);
+    setInteractionError("");
     const optimistic: PlaygroundMessage = { id: `local-${Date.now()}`, role: "user", content: input, createdAt: new Date().toISOString(), fileIds: [...selectedFileIds] };
     setSession((current) => current ? { ...current, messages: [...current.messages, optimistic] } : current);
     setMessage("");
@@ -457,29 +563,10 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(await responseMessage(response));
-      await readNdjson<RunEvent | PlaygroundFilesEvent>(response, (value) => {
-        if (value.type === "playground-files") {
-          if (value.live) setLiveFiles(value.files);
-          else { setLiveFiles([]); setFiles((current) => [...current.filter(({ id }) => !value.files.some((file) => file.id === id)), ...value.files]); }
-          return;
-        }
-        const event = value;
-        setLiveRun((current) => ({
-          events: [...(current?.events ?? []), event],
-          text: event.type === "text-delta" ? `${current?.text ?? ""}${event.text}` : current?.text ?? "",
-          ...(current?.output !== undefined ? { output: current.output } : {}),
-          ...(current?.error ? { error: current.error } : {}),
-          ...(event.type === "run-start" ? { runId: event.runId } : current?.runId ? { runId: current.runId } : {}),
-          ...(event.type === "run-end" ? { output: outputText(event.output), runId: event.runId } : {}),
-          ...(event.type === "error" ? { error: event.message, runId: event.runId } : {}),
-        }));
-        if (event.type === "tool-call") void inspectApproval(event);
-        if (event.type === "tool-approval") setPendingApproval(undefined);
-      });
+      await readNdjson<RunEvent | PlaygroundFilesEvent>(response, acceptStreamValue);
       await loadSession(session.id);
       await refreshProject();
       setLiveRun(undefined);
-      setSelectedFileIds(new Set());
     } catch (error) {
       if (controller.signal.aborted) {
         setLiveRun((current) => current ? { ...current, error: t("playground.runCancelled") } : current);
@@ -494,13 +581,17 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       if (abortRef.current === controller) abortRef.current = undefined;
       setRunState("idle");
       setLiveFiles([]);
-      setPendingApproval(undefined);
+      setPendingInteraction(undefined);
+      setQueuedInteractions([]);
     }
   };
 
-  const cancel = () => {
+  const cancel = async () => {
     if (!abortRef.current) return;
     setRunState("cancelling");
+    if (liveRun?.runId) {
+      await requestJson(`/v1/runs/${encodeURIComponent(liveRun.runId)}`, { method: "DELETE" }).catch(() => undefined);
+    }
     abortRef.current.abort();
     setNotice(t("playground.runCancelled"));
   };
@@ -510,7 +601,7 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       const next = new Set(current);
       if (next.has(key)) next.delete(key); else next.add(key);
       const codeRunnerAvailable = project?.capabilities.plugins.some((plugin) => plugin.id === "builtin.code-runner" && !next.has(plugin.componentKey));
-      if (!codeRunnerAvailable) setSelectedFileIds(new Set());
+      if (!codeRunnerAvailable && !project?.capabilities.attachments.directModelInput) setSelectedFileIds(new Set());
       return next;
     });
   };
@@ -522,14 +613,14 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   });
 
   const codeRunnerEnabled = Boolean(project?.capabilities.plugins.some((plugin) => plugin.id === "builtin.code-runner" && !disabledPlugins.has(plugin.componentKey)));
-  const canAttach = Boolean(project?.capabilities.attachments.enabled && codeRunnerEnabled);
+  const canAttach = Boolean(project?.capabilities.attachments.enabled
+    && (codeRunnerEnabled || project.capabilities.attachments.directModelInput));
   const uploadedFiles = files.filter(({ source }) => source === "upload");
   const sandboxFiles = [...files.filter(({ source }) => source === "artifact"), ...liveFiles];
   const previewFile = [...files, ...liveFiles].find(({ id }) => id === previewFileId);
   const currentFiles = rightTab === "files" ? uploadedFiles : sandboxFiles;
   const selectedModel = project?.capabilities.models.find((option) => `${option.componentKey}\u0000${option.connectionId}` === modelValue);
   const readyToSend = Boolean(session && project?.ready && message.trim() && runState === "idle" && !uploading);
-  const approvalRiskKey = pendingApproval && RISK_MESSAGE_KEYS[pendingApproval.risk as keyof typeof RISK_MESSAGE_KEYS];
   const setupIssueCount = project?.diagnostics.filter(({ severity }) => severity === "error").length ?? 0;
 
   if (loading && !project) return <section className="playground-loading"><span className="playground-spinner" /><strong>{t("playground.loading")}</strong><small>{t("playground.loading.description")}</small></section>;
@@ -561,19 +652,19 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
           <div className="message-author"><span>{item.role === "user" ? t("playground.you") : "H"}</span><strong>{item.role === "user" ? t("playground.you") : t("playground.harness")}</strong><time>{formatTime(item.createdAt)}</time></div>
           <div className="message-body"><div className="message-content">{item.content}</div>
             {item.fileIds?.length ? <div className="message-files">{item.fileIds.map((id) => <span key={id}>{files.find((file) => file.id === id)?.name ?? t("playground.attachedFile")}</span>)}</div> : null}
-            {item.role === "assistant" && <><RunTimeline runId={item.runId} />{(item.usage || item.costUsd !== undefined) && <div className="message-usage"><span>{t("playground.tokens", { count: item.usage?.totalTokens ?? "—" })}</span><span>${(item.costUsd ?? 0).toFixed(6)}</span><span>{item.finishReason ?? t("playground.unknown")}</span></div>}</>}
+            {item.role === "assistant" && <><RunTimeline runId={item.runId} />{(item.usage || item.costUsd !== undefined) && <div className="message-usage"><span>{t("playground.tokens", { count: item.usage?.totalTokens ?? "—" })}</span>{item.usage?.cachedInputTokens ? <span>{t("playground.cachedTokens", { count: item.usage.cachedInputTokens })}</span> : null}{item.usage?.cachedInputTokens && item.usage.inputTokens ? <span>{t("playground.cacheHitRatio", { ratio: Math.round(item.usage.cachedInputTokens / item.usage.inputTokens * 100) })}</span> : null}{item.usage?.cacheWriteInputTokens ? <span>{t("playground.cacheWriteTokens", { count: item.usage.cacheWriteInputTokens })}</span> : null}<span>${(item.costUsd ?? 0).toFixed(6)}</span><span>{item.finishReason ?? t("playground.unknown")}</span></div>}</>}
           </div>
         </article>)}
-        {liveRun && <article className="playground-message is-assistant is-live">
+        {liveRun && <article className="playground-message is-assistant">
           <div className="message-author"><span>H</span><strong>{t("playground.harness")}</strong><time>{t("playground.now")}</time></div>
-          <div className="message-body"><div className="working-label"><span className="is-live" />{runState === "cancelling" ? t("playground.cancelling") : liveRun.error ? t("common.needsAttention") : t("playground.working")}</div><div className="message-content">{liveRun.output ?? (liveRun.text || liveRun.error || "")}</div><RunTimeline runId={liveRun.runId} events={liveRun.events} live /></div>
+          <div className="message-body"><div className="working-label"><span className="is-live" />{runState === "cancelling" ? t("playground.cancelling") : runState === "paused" ? t("playground.waitingForInput") : liveRun.error ? t("common.needsAttention") : t("playground.working")}</div><div className="message-content">{liveRun.output ?? (liveRun.text || liveRun.error || "")}</div><RunTimeline runId={liveRun.runId} events={liveRun.events} live /></div>
         </article>}
       </div>
 
       <div className="playground-composer-wrap">
         {selectedFileIds.size > 0 && <div className="composer-files">{[...selectedFileIds].map((id) => { const file = files.find((candidate) => candidate.id === id); return file ? <button key={id} onClick={() => toggleFile(id)}>{file.name}<span>×</span></button> : null; })}</div>}
         <div className={`playground-composer ${!project?.ready ? "is-disabled" : ""}`}>
-          <textarea aria-label={t("playground.message")} placeholder={project?.ready ? t("playground.message.placeholder") : t("playground.message.blocked")} value={message} disabled={!project?.ready || runState !== "idle"} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void run(); } }} />
+          <textarea aria-label={t("playground.message")} placeholder={project?.ready ? t("playground.message.placeholder") : t("playground.message.blocked")} value={message} disabled={!project?.ready || runState !== "idle"} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void run(); } }} />
           <div className="composer-toolbar">
             <div className="composer-tools">
               <label className={`composer-tool-button ${!canAttach ? "is-disabled" : ""}`} title={canAttach ? t("playground.uploadHelp") : project?.capabilities.attachments.enabled ? t("playground.runnerDisabled") : t("playground.attachRunner")}>＋<span>{t("playground.attach")}</span><input type="file" multiple accept={project?.capabilities.attachments.accepted} disabled={!canAttach || uploading || runState !== "idle"} onChange={(event) => void upload(event)} /></label>
@@ -595,7 +686,7 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       </div><button className="panel-toggle" aria-label={t("playground.files.collapse")} aria-expanded="true" onClick={() => setRightOpen(false)}>→</button></header>
       {rightTab === "details" ? <div className="playground-details">
         <div className={`readiness-card ${project?.ready ? "is-ready" : "is-blocked"}`}><span>{project?.ready ? t("common.ready") : t("playground.status.blocked")}</span><strong>{project?.ready ? t("playground.status.canRun") : t("playground.status.issues", { count: setupIssueCount })}</strong></div>
-        <dl><div><dt>{t("playground.details.models")}</dt><dd>{project?.capabilities.models.length || t("playground.details.harnessDefault")}</dd></div><div><dt>{t("playground.details.optional")}</dt><dd>{project?.capabilities.plugins.length ?? 0}</dd></div><div><dt>{t("playground.details.workspace")}</dt><dd>{project?.capabilities.attachments.enabled ? t("playground.details.codeRunner") : t("playground.details.unsupported")}</dd></div><div><dt>{t("playground.details.replay")}</dt><dd>{t("playground.details.replayValue")}</dd></div><div><dt>{t("playground.details.retention")}</dt><dd>{t("playground.details.daysInactive", { count: project?.retentionDays ?? 30 })}</dd></div></dl>
+        <dl><div><dt>{t("playground.details.models")}</dt><dd>{project?.capabilities.models.length || t("playground.details.harnessDefault")}</dd></div><div><dt>{t("playground.details.optional")}</dt><dd>{project?.capabilities.plugins.length ?? 0}</dd></div><div><dt>{t("playground.details.workspace")}</dt><dd>{codeRunnerEnabled ? t("playground.details.codeRunner") : project?.capabilities.attachments.directModelInput ? t("playground.details.directMedia") : t("playground.details.unsupported")}</dd></div><div><dt>{t("playground.details.replay")}</dt><dd>{t("playground.details.replayValue")}</dd></div><div><dt>{t("playground.details.retention")}</dt><dd>{t("playground.details.daysInactive", { count: project?.retentionDays ?? 30 })}</dd></div></dl>
         <section><strong>{t("playground.details.isolation")}</strong><p>{t("playground.details.isolationHelp")}</p></section>
         <section><strong>{t("playground.details.cost")}</strong><p>{t("playground.details.costHelp")}</p></section>
         {project?.diagnostics.length ? <section><strong>{t("playground.details.diagnostics")}</strong><ul>{project.diagnostics.slice(0, 8).map((diagnostic, index) => <li key={`${diagnostic.code}:${index}`}>{diagnostic.message}</li>)}</ul></section> : null}
@@ -608,7 +699,13 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       </>}
     </aside> : <button className="collapsed-panel-button is-right" aria-label={t("playground.files.expand")} aria-expanded="false" onClick={showRight}>← {t("playground.files")}</button>}
 
-    {pendingApproval && <AlertDialog.Root open onOpenChange={(next) => { if (!next && !approvalBusy) void decideApproval(false); }}><AlertDialog.Portal><AlertDialog.Viewport className="approval-backdrop"><AlertDialog.Popup className="approval-dialog"><header><span className="sheet-eyebrow">{t("playground.approval.eyebrow")}</span><AlertDialog.Title id="playground-approval-title">{t("playground.approval.title", { name: pendingApproval.tool })}</AlertDialog.Title></header><div className="approval-body"><div className="approval-meter"><span>{t("playground.approval.capability")}</span><strong className={`risk-${pendingApproval.risk}`}>{approvalRiskKey ? t(approvalRiskKey) : pendingApproval.risk}</strong><span>{t("playground.approval.step")}</span><strong>{pendingApproval.turn}</strong></div><AlertDialog.Description id="playground-approval-description">{t("playground.approval.description")}</AlertDialog.Description><div className="approval-meter"><span>{t("playground.approval.requestSize")}</span><strong>{pendingApproval.inputBytes} bytes</strong><span>{t("playground.approval.preview")}</span><strong>{t(pendingApproval.previewLimited ? "playground.approval.incomplete" : "playground.approval.complete")}</strong></div>{pendingApproval.previewLimited && <p className="field-error">{t("playground.approval.previewLimited")}</p>}<pre>{JSON.stringify(pendingApproval.input, null, 2)}</pre></div><footer><button className="button" disabled={approvalBusy} onClick={() => void decideApproval(false)}>{t("playground.approval.deny")}</button><button className="button button-primary" disabled={approvalBusy || pendingApproval.previewLimited} onClick={() => void decideApproval(true)}>{approvalBusy ? t("playground.approval.sending") : t("playground.approval.allowOnce")}</button></footer></AlertDialog.Popup></AlertDialog.Viewport></AlertDialog.Portal></AlertDialog.Root>}
+    {pendingInteraction && <InteractionRenderer
+      request={pendingInteraction}
+      files={files.filter(({ source }) => source !== "sandbox")}
+      busy={interactionBusy}
+      error={interactionError}
+      onRespond={respondToInteraction}
+    />}
     {confirmation && <ConfirmDialog open title={confirmation.title} description={confirmation.description} confirmLabel={confirmation.confirmLabel} cancelLabel={t("common.cancel")} danger onConfirm={confirmation.onConfirm} onOpenChange={(open) => { if (!open) setConfirmation(undefined); }} />}
   </section>;
 }

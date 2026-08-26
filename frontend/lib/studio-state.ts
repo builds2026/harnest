@@ -7,14 +7,14 @@ import {
   type Diagnostic,
   type GraphBody,
   type HarnessSpec,
-} from "@harnest/core";
+} from "@harnestai/core/browser";
 import type { Edge, Node } from "@xyflow/react";
 import { catalogMap, validationRegistryFor } from "./component-catalog";
 
 export type HarnessComponent = HarnessSpec["components"][number];
 export type HarnessConnection = HarnessSpec["connections"][number];
 
-export type NodeRunState = "idle" | "running" | "success" | "error";
+export type NodeRunState = "idle" | "running" | "waiting" | "success" | "error" | "cancelled";
 
 export type HarnessNodeData = Record<string, unknown> & {
   component: HarnessComponent;
@@ -23,6 +23,10 @@ export type HarnessNodeData = Record<string, unknown> & {
   runState?: NodeRunState;
   iteration?: number;
   attempt?: number;
+  pinned?: boolean;
+  liveTitle?: string;
+  liveSubtitle?: string;
+  liveSummary?: string;
   lastRun?: {
     readonly runId?: string;
     readonly state: NodeRunState;
@@ -38,8 +42,9 @@ export type HarnessNodeData = Record<string, unknown> & {
 };
 
 export type HarnessEdgeData = Record<string, unknown> & {
-  connection: HarnessConnection;
+  connection?: HarnessConnection;
   running?: boolean;
+  kind?: "data" | "condition" | "task" | "handoff" | "message";
 };
 
 export type HarnessNode = Node<HarnessNodeData, "harness">;
@@ -72,6 +77,13 @@ export interface HarnessSubgraphDraft {
   entrypoint: string;
   nodes: HarnessNode[];
   edges: HarnessEdge[];
+  layout?: HarnessGraphLayout;
+}
+
+export interface HarnessGraphLayout {
+  readonly pinned?: readonly string[];
+  readonly viewport?: { readonly x: number; readonly y: number; readonly zoom: number };
+  readonly direction?: "RIGHT" | "DOWN";
 }
 
 export interface HarnessDraft {
@@ -79,6 +91,7 @@ export interface HarnessDraft {
   nodes: HarnessNode[];
   edges: HarnessEdge[];
   subgraphs: Record<string, HarnessSubgraphDraft>;
+  layout?: HarnessGraphLayout;
 }
 
 export type ValidationPhase =
@@ -127,6 +140,7 @@ export type StudioDocumentAction =
   | { type: "host-diagnostics"; diagnostics: Diagnostic[] }
   | { type: "set-catalog"; catalog: readonly ComponentManifest[] }
   | { type: "save-result"; revision: number }
+  | { type: "load-saved"; spec: HarnessSpec; yaml: string }
   | { type: "undo" }
   | { type: "redo" };
 
@@ -151,12 +165,17 @@ export function specToDraft(spec: HarnessSpec, catalog: readonly ComponentManife
   const { components, connections, studio, ...rest } = spec;
   const positions = studio?.positions ?? {};
   const manifests = catalogMap(catalog);
-  const specSubgraphs = spec.version === "0.2" ? spec.subgraphs ?? {} : {};
-  const subgraphPositions = spec.version === "0.2" ? spec.studio?.subgraphs ?? {} : {};
+  const specSubgraphs = spec.version !== "0.1" ? spec.subgraphs ?? {} : {};
+  const subgraphPositions = spec.version !== "0.1" ? spec.studio?.subgraphs ?? {} : {};
+  const studioV3 = spec.version === "0.3" ? spec.studio : undefined;
   const root = { ...rest } as typeof rest & { subgraphs?: unknown };
   delete root.subgraphs;
 
-  const graphDraft = (graph: GraphBody, graphPositions: Readonly<Record<string, { x: number; y: number }>>): HarnessSubgraphDraft => ({
+  const graphDraft = (
+    graph: GraphBody,
+    graphPositions: Readonly<Record<string, { x: number; y: number }>>,
+    layout?: HarnessGraphLayout,
+  ): HarnessSubgraphDraft => ({
     entrypoint: graph.entrypoint,
     nodes: graph.components.map((component, index) => ({
       id: component.id,
@@ -173,6 +192,7 @@ export function specToDraft(spec: HarnessSpec, catalog: readonly ComponentManife
       targetHandle: connection.to.port,
       data: { connection },
     })),
+    ...(layout ? { layout } : {}),
   });
 
   return {
@@ -197,8 +217,36 @@ export function specToDraft(spec: HarnessSpec, catalog: readonly ComponentManife
     })),
     subgraphs: Object.fromEntries(Object.entries(specSubgraphs).map(([name, graph]) => [
       name,
-      graphDraft(graph, subgraphPositions[name]?.positions ?? {}),
+      graphDraft(graph, subgraphPositions[name]?.positions ?? {}, spec.version === "0.3" ? {
+        ...(studioV3?.subgraphs?.[name]?.pinned ? { pinned: studioV3.subgraphs[name].pinned } : {}),
+        ...(studioV3?.subgraphs?.[name]?.viewport ? { viewport: studioV3.subgraphs[name].viewport } : {}),
+        ...(studioV3?.subgraphs?.[name]?.direction ? { direction: studioV3.subgraphs[name].direction } : {}),
+      } : undefined),
     ])),
+    ...(spec.version === "0.3" ? { layout: {
+      ...(studioV3?.pinned ? { pinned: studioV3.pinned } : {}),
+      ...(studioV3?.viewport ? { viewport: studioV3.viewport } : {}),
+      ...(studioV3?.direction ? { direction: studioV3.direction } : {}),
+    } } : {}),
+  };
+}
+
+function draftWithCatalog(draft: HarnessDraft, catalog: readonly ComponentManifest[]): HarnessDraft {
+  const manifests = catalogMap(catalog);
+  const updateNodes = (nodes: HarnessNode[]) => nodes.map((node) => ({
+    ...node,
+    data: {
+      ...node.data,
+      manifest: manifests.get(node.data.component.type) ?? unknownManifest(node.data.component.type),
+    },
+  }));
+  return {
+    ...draft,
+    nodes: updateNodes(draft.nodes),
+    subgraphs: Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [name, {
+      ...graph,
+      nodes: updateNodes(graph.nodes),
+    }])),
   };
 }
 
@@ -220,6 +268,9 @@ export function draftToSpec(draft: HarnessDraft): HarnessSpec {
   }]));
   const studioSubgraphs = Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [name, {
     positions: Object.fromEntries(graph.nodes.map((node) => [node.id, node.position])),
+    ...(draft.root.version === "0.3" && graph.layout?.pinned ? { pinned: [...graph.layout.pinned] } : {}),
+    ...(draft.root.version === "0.3" && graph.layout?.viewport ? { viewport: graph.layout.viewport } : {}),
+    ...(draft.root.version === "0.3" && graph.layout?.direction ? { direction: graph.layout.direction } : {}),
   }]));
   return {
     ...draft.root,
@@ -228,6 +279,9 @@ export function draftToSpec(draft: HarnessDraft): HarnessSpec {
     ...(Object.keys(subgraphs).length ? { subgraphs } : {}),
     studio: {
       positions,
+      ...(draft.root.version === "0.3" && draft.layout?.pinned ? { pinned: [...draft.layout.pinned] } : {}),
+      ...(draft.root.version === "0.3" && draft.layout?.viewport ? { viewport: draft.layout.viewport } : {}),
+      ...(draft.root.version === "0.3" && draft.layout?.direction ? { direction: draft.layout.direction } : {}),
       ...(Object.keys(studioSubgraphs).length ? { subgraphs: studioSubgraphs } : {}),
     },
   } as HarnessSpec;
@@ -414,12 +468,23 @@ export function studioDocumentReducer(
       return {
         ...state,
         catalog: action.catalog,
-        draft: specToDraft(draftToSpec(state.draft), action.catalog),
+        draft: draftWithCatalog(state.draft, action.catalog),
+        historyPast: state.historyPast.map((entry) => ({
+          ...entry,
+          draft: draftWithCatalog(entry.draft, action.catalog),
+        })),
+        historyFuture: state.historyFuture.map((entry) => ({
+          ...entry,
+          draft: draftWithCatalog(entry.draft, action.catalog),
+        })),
+        ...(state.transientDraft ? { transientDraft: draftWithCatalog(state.transientDraft, action.catalog) } : {}),
       };
     case "save-result":
       return action.revision === state.revision
         ? { ...state, savedRevision: action.revision }
         : state;
+    case "load-saved":
+      return createDocumentState(action.spec, state.catalog, action.yaml);
     case "undo": {
       const previous = state.historyPast.at(-1);
       if (!previous) return state;

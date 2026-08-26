@@ -1,180 +1,272 @@
-import { dirname, resolve } from "node:path";
-import anthropicAdapter from "@harnest/adapter-anthropic";
-import geminiAdapter from "@harnest/adapter-gemini";
-import ollamaAdapter from "@harnest/adapter-local";
-import openAIAdapter from "@harnest/adapter-openai";
 import {
-  AdapterRegistry,
-  DiagnosticError,
-  HarnessRuntime,
-  ToolRegistry,
-  createBuiltinComponentRegistry,
-  describeHarness,
-  runHarnessTests,
-  validateSpec,
-  type Diagnostic,
-  type HarnessSpec,
-  type HarnessIntegrationContract,
-  type HarnessTestOptions,
-  type HarnessTestReport,
-  type ModelAdapter,
+  CreateRunResponseSchema,
+  CreateRunRequestSchema,
+  IdempotencyKeySchema,
+  InteractionResponseSchema,
+  RunCommandSchema,
+  RunEventSchema,
+  SnapshotResponseSchema,
+  WireEnvelopeSchema,
+  toWireEvent,
+  type CreateRunResponse,
+  type CreateRunContext,
+  type InteractionResponse,
+  type RunCommand,
   type RunEvent,
-  type RunOptions,
-  type RunResult,
-} from "@harnest/core";
-import {
-  FileRunStore,
-  NodeRuntimeServices,
-  loadAdapterModules,
-  loadRuntimeModules,
-  loadSpecFile,
-  type NodeRuntimeServiceOptions,
-} from "@harnest/core/node";
+  type SnapshotResponse,
+  type WireEnvelope,
+} from "@harnestai/protocol";
 
-export interface HarnestLoadOptions {
-  readonly env?: Readonly<Record<string, string | undefined>>;
-  readonly adapters?: readonly ModelAdapter[];
-  readonly services?: NodeRuntimeServiceOptions;
-  readonly allowModuleExecution?: boolean;
-  readonly persistRuns?: boolean;
+export type {
+  CreateRunResponse,
+  CreateRunContext,
+  CreateRunRequest,
+  ExternalAttachment,
+  IdempotencyKey,
+  InteractionRequest,
+  InteractionResolved,
+  InteractionResponse,
+  Permission,
+  RunCommand,
+  RunEvent,
+  SnapshotResponse,
+  WireEnvelope,
+} from "@harnestai/protocol";
+
+export interface SSEMessage {
+  readonly id?: string;
+  readonly event?: string;
+  readonly data: string;
 }
 
-export class Harnest {
-  readonly file: string;
-  readonly spec: HarnessSpec;
-  readonly diagnostics: readonly Diagnostic[];
+export async function* parseSSE(stream: ReadableStream<Uint8Array>): AsyncIterable<SSEMessage> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let data: string[] = [];
+  let event: string | undefined;
+  let id: string | undefined;
+  let first = true;
 
-  get contract(): HarnessIntegrationContract {
-    return describeHarness(this.spec);
+  const consume = (line: string): SSEMessage | undefined => {
+    if (first) {
+      first = false;
+      if (line.startsWith("\uFEFF")) line = line.slice(1);
+    }
+    if (!line) {
+      if (!data.length) { event = undefined; return undefined; }
+      const message: SSEMessage = {
+        data: data.join("\n"),
+        ...(id === undefined ? {} : { id }),
+        ...(event === undefined ? {} : { event }),
+      };
+      data = [];
+      event = undefined;
+      return message;
+    }
+    if (line.startsWith(":")) return undefined;
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "data") data.push(value);
+    else if (field === "event") event = value;
+    else if (field === "id" && !value.includes("\0")) id = value;
+    return undefined;
+  };
+
+  try {
+    while (true) {
+      const next = await reader.read();
+      buffer += decoder.decode(next.value, { stream: !next.done });
+      let match: RegExpExecArray | null;
+      const lines = /^(.*?)(?:\r\n|\r|\n)/u;
+      while ((match = lines.exec(buffer))) {
+        if (!next.done && match[0].endsWith("\r") && match[0].length === buffer.length) break;
+        buffer = buffer.slice(match[0].length);
+        const message = consume(match[1] ?? "");
+        if (message) yield message;
+      }
+      if (next.done) break;
+    }
+    if (buffer) {
+      const message = consume(buffer);
+      if (message) yield message;
+    }
+    const final = consume("");
+    if (final) yield final;
+  } finally {
+    reader.releaseLock();
   }
-  readonly #adapters: AdapterRegistry;
-  readonly #components: ReturnType<typeof createBuiltinComponentRegistry>;
-  readonly #tools: ToolRegistry;
-  readonly #services: NodeRuntimeServices;
-  readonly #environment: Readonly<Record<string, string | undefined>>;
-  readonly #runs: FileRunStore | undefined;
-  #closed = false;
+}
 
-  private constructor(options: {
-    file: string;
-    spec: HarnessSpec;
-    diagnostics: readonly Diagnostic[];
-    adapters: AdapterRegistry;
-    components: ReturnType<typeof createBuiltinComponentRegistry>;
-    tools: ToolRegistry;
-    services: NodeRuntimeServices;
-    environment: Readonly<Record<string, string | undefined>>;
-    runs?: FileRunStore;
-  }) {
-    this.file = options.file;
-    this.spec = options.spec;
-    this.diagnostics = options.diagnostics;
-    this.#adapters = options.adapters;
-    this.#components = options.components;
-    this.#tools = options.tools;
-    this.#services = options.services;
-    this.#environment = options.environment;
-    this.#runs = options.runs;
+export interface HarnestClientOptions {
+  readonly baseUrl: string;
+  readonly token?: string;
+  readonly headers?: HeadersInit;
+  readonly fetch?: typeof globalThis.fetch;
+}
+
+export interface CreateRunOptions {
+  readonly resumeRunId?: string;
+  readonly context?: CreateRunContext;
+  readonly idempotencyKey?: string;
+  readonly signal?: AbortSignal;
+}
+
+export interface EventOptions {
+  readonly after?: number;
+  readonly lastEventId?: string;
+  readonly signal?: AbortSignal;
+}
+
+export class HarnestError extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+  readonly details: unknown;
+
+  constructor(message: string, status = 0, code?: string, details?: unknown) {
+    super(message);
+    this.name = "HarnestError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+export class HarnestClient {
+  readonly #baseUrl: URL;
+  readonly #headers: Headers;
+  readonly #fetch: typeof globalThis.fetch;
+
+  constructor(options: HarnestClientOptions | string) {
+    const resolved = typeof options === "string" ? { baseUrl: options } : options;
+    this.#baseUrl = new URL(`${resolved.baseUrl.replace(/\/+$/u, "")}/`);
+    this.#headers = new Headers(resolved.headers);
+    if (resolved.token) this.#headers.set("authorization", `Bearer ${resolved.token}`);
+    this.#fetch = resolved.fetch ?? globalThis.fetch;
+    if (!this.#fetch) throw new Error("A Fetch API implementation is required");
   }
 
-  static async load(file: string, options: HarnestLoadOptions = {}): Promise<Harnest> {
-    const absolute = resolve(file);
-    const parsed = await loadSpecFile(absolute);
-    if (!parsed.ok) throw new DiagnosticError("HarnessSpec could not be loaded", parsed.diagnostics);
-
-    const projectDirectory = dirname(absolute);
-    const adapters = new AdapterRegistry();
-    const components = createBuiltinComponentRegistry();
-    const tools = new ToolRegistry();
-    const services = new NodeRuntimeServices(projectDirectory, {
-      ...options.services,
-      ...(options.allowModuleExecution ? { allowModuleExecution: true as const } : {}),
+  async create(input: unknown, options: CreateRunOptions = {}): Promise<CreateRunResponse> {
+    const body = CreateRunRequestSchema.parse({
+      input,
+      ...(options.resumeRunId ? { resumeRunId: options.resumeRunId } : {}),
+      ...(options.context ? { context: options.context } : {}),
     });
-    try {
-      for (const definition of await services.toolDefinitions()) {
-        if (!tools.has(definition.id)) tools.register(definition);
+    const value = await this.#json("v1/runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+      ...(options.idempotencyKey === undefined
+        ? {} : { headers: { "idempotency-key": IdempotencyKeySchema.parse(options.idempotencyKey) } }),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    return CreateRunResponseSchema.parse({
+      runId: record.runId,
+      ...(typeof record.events === "string" ? { events: record.events } : {}),
+      ...(typeof record.snapshot === "string" ? { snapshot: record.snapshot } : {}),
+    });
+  }
+
+  async *events(runId: string, options: EventOptions = {}): AsyncIterable<WireEnvelope> {
+    const url = this.#url(`v1/runs/${encodeURIComponent(runId)}/events`);
+    if (options.after !== undefined) url.searchParams.set("after", String(options.after));
+    const headers = this.#requestHeaders({ accept: "text/event-stream" });
+    const lastEventId = options.lastEventId ?? (options.after === undefined ? undefined : String(options.after));
+    if (lastEventId !== undefined) headers.set("last-event-id", lastEventId);
+    const response = await this.#fetch(url, { headers, ...(options.signal ? { signal: options.signal } : {}) });
+    if (!response.ok) throw await this.#error(response);
+    if (!response.body) throw new HarnestError("Event response has no body", response.status);
+    for await (const message of parseSSE(response.body)) {
+      let value: unknown;
+      try { value = JSON.parse(message.data) as unknown; }
+      catch (cause) { throw new HarnestError("Event data is not valid JSON", response.status, "INVALID_EVENT", cause); }
+      const envelope = WireEnvelopeSchema.safeParse(value);
+      if (envelope.success) { yield envelope.data; continue; }
+      const raw = RunEventSchema.parse(value);
+      const sequence = raw.sequence ?? Number(message.id);
+      if (!Number.isInteger(sequence) || sequence < 0) {
+        throw new HarnestError("Event is missing a non-negative sequence", response.status, "INVALID_EVENT");
       }
-      for (const adapter of options.adapters ?? []) adapters.register(adapter);
-      const modulePermission = options.allowModuleExecution ? { allowModuleExecution: true as const } : undefined;
-      const adapterLoad = await loadAdapterModules(parsed.spec, adapters, projectDirectory, modulePermission);
-      const runtimeLoad = await loadRuntimeModules(
-        parsed.spec,
-        { adapters, components, tools },
-        projectDirectory,
-        modulePermission,
-      );
-      for (const adapter of [openAIAdapter, anthropicAdapter, geminiAdapter, ollamaAdapter]) {
-        if (!adapters.has(adapter.id)) adapters.register(adapter);
-      }
-      const environment = options.env ?? process.env;
-      const validation = validateSpec(parsed.spec, { registry: adapters, components, tools, env: environment });
-      const diagnostics = [
-        ...adapterLoad.diagnostics,
-        ...runtimeLoad.diagnostics,
-        ...validation.diagnostics,
-        ...await services.connectionDiagnostics(parsed.spec, tools),
-      ];
-      if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
-        throw new DiagnosticError("HarnessSpec is not ready to run", diagnostics);
-      }
-      return new Harnest({
-        file: absolute,
-        spec: parsed.spec,
-        diagnostics,
-        adapters,
-        components,
-        tools,
-        services,
-        environment,
-        ...(options.persistRuns === false ? {} : { runs: new FileRunStore(projectDirectory) }),
-      });
-    } catch (error) {
-      await services.close();
-      throw error;
+      yield toWireEvent({ ...raw, runId, sequence, ...(message.id ? { eventId: message.id } : {}) });
     }
   }
 
-  stream(input: unknown, options: RunOptions = {}): AsyncIterable<RunEvent> {
-    this.#assertOpen();
-    return this.#runtime().stream(input, options);
+  async snapshot(runId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const value = await this.#json(`v1/runs/${encodeURIComponent(runId)}/snapshot`, signal ? { signal } : {});
+    const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    return SnapshotResponseSchema.shape.snapshot.parse(record.snapshot);
   }
 
-  async invoke(input: unknown, options: RunOptions = {}): Promise<RunResult> {
-    this.#assertOpen();
-    return this.#runtime().invoke(input, options);
+  async snapshotState(runId: string, signal?: AbortSignal): Promise<SnapshotResponse> {
+    const value = await this.#json(`v1/runs/${encodeURIComponent(runId)}/snapshot`, signal ? { signal } : {});
+    return SnapshotResponseSchema.parse(value);
   }
 
-  test(options: Omit<HarnessTestOptions, "env" | "components" | "tools" | "services" | "eventSink"> = {}): Promise<HarnessTestReport> {
-    this.#assertOpen();
-    return runHarnessTests(this.spec, this.#adapters, {
-      ...options,
-      env: this.#environment,
-      components: this.#components,
-      tools: this.#tools,
-      services: this.#services,
-      ...(this.#runs ? { eventSink: this.#runs } : {}),
+  async command(runId: string, command: RunCommand, signal?: AbortSignal): Promise<void> {
+    await this.#json(`v1/runs/${encodeURIComponent(runId)}/commands`, {
+      method: "POST", body: JSON.stringify(RunCommandSchema.parse(command)), ...(signal ? { signal } : {}),
     });
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    await this.#services.close();
+  async respond(runId: string, response: InteractionResponse, signal?: AbortSignal): Promise<void> {
+    await this.command(runId, { type: "interaction.response", response: InteractionResponseSchema.parse(response) }, signal);
   }
 
-  #runtime(): HarnessRuntime {
-    return new HarnessRuntime(this.spec, this.#adapters, {
-      env: this.#environment,
-      components: this.#components,
-      tools: this.#tools,
-      services: this.#services,
-      ...(this.#runs ? { eventSink: this.#runs } : {}),
-    });
+  async cancel(runId: string, signal?: AbortSignal): Promise<void> {
+    await this.#json(`v1/runs/${encodeURIComponent(runId)}`, { method: "DELETE", ...(signal ? { signal } : {}) });
   }
 
-  #assertOpen(): void {
-    if (this.#closed) throw new Error("Harnest instance is closed");
+  async wait(runId: string, options: EventOptions = {}): Promise<RunEvent> {
+    for await (const envelope of this.events(runId, options)) {
+      const data = envelope.data && typeof envelope.data === "object" ? envelope.data as Record<string, unknown> : {};
+      if (envelope.type === "run.failed" || envelope.type === "run.cancelled") {
+        throw new HarnestError(
+          typeof data.message === "string" ? data.message : envelope.type === "run.cancelled" ? "Run cancelled" : "Run failed",
+          0,
+          typeof data.code === "string" ? data.code : envelope.type === "run.cancelled" ? "RUN_CANCELLED" : undefined,
+          data,
+        );
+      }
+      if (envelope.type === "run.completed") return RunEventSchema.parse(data);
+    }
+    throw new HarnestError("Event stream ended before the run completed", 0, "RUN_INCOMPLETE");
+  }
+
+  #url(path: string): URL {
+    return new URL(path, this.#baseUrl);
+  }
+
+  #requestHeaders(extra?: HeadersInit): Headers {
+    const headers = new Headers(this.#headers);
+    for (const [key, value] of new Headers(extra)) headers.set(key, value);
+    return headers;
+  }
+
+  async #json(path: string, init: RequestInit = {}): Promise<unknown> {
+    const headers = this.#requestHeaders(init.headers);
+    headers.set("accept", "application/json");
+    if (init.body !== undefined) headers.set("content-type", "application/json");
+    const response = await this.#fetch(this.#url(path), { ...init, headers });
+    if (!response.ok) throw await this.#error(response);
+    if (response.status === 204) return { ok: true };
+    const text = await response.text();
+    return text ? JSON.parse(text) as unknown : { ok: true };
+  }
+
+  async #error(response: Response): Promise<HarnestError> {
+    let details: unknown;
+    try { details = await response.json(); } catch { details = undefined; }
+    const record = details && typeof details === "object" ? details as Record<string, unknown> : {};
+    const nested = record.error && typeof record.error === "object" ? record.error as Record<string, unknown> : {};
+    const message = typeof record.error === "string" ? record.error
+      : typeof nested.message === "string" ? nested.message
+      : typeof record.message === "string" ? record.message
+      : `${response.status} ${response.statusText}`;
+    const code = typeof nested.code === "string" ? nested.code : typeof record.code === "string" ? record.code : undefined;
+    return new HarnestError(message, response.status, code, details);
   }
 }
 
-export default Harnest;
+export default HarnestClient;

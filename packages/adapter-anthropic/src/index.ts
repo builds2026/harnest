@@ -1,11 +1,12 @@
-import { AdapterError, parseSse, readBoundedResponseText } from "@harnest/core";
+import { AdapterError, parseSse, readBoundedResponseText } from "@harnestai/core";
 import type {
   AdapterContext,
   ModelAdapter,
   ModelEvent,
   ModelRequest,
+  ModelContentPart,
   TokenUsage,
-} from "@harnest/core";
+} from "@harnestai/core";
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com/";
 const DEFAULT_API_KEY = "env:ANTHROPIC_API_KEY";
@@ -18,6 +19,18 @@ export interface AnthropicAdapterOptions {
   readonly apiKey?: string;
   readonly apiVersion?: string;
 }
+
+const textContent = (content: string | readonly ModelContentPart[]): string => typeof content === "string"
+  ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+
+const anthropicContent = (content: string | readonly ModelContentPart[]): unknown[] => typeof content === "string"
+  ? (content ? [{ type: "text", text: content }] : [])
+  : content.map((part) => {
+      if (part.type === "text") return { type: "text", text: part.text };
+      return part.mimeType === "application/pdf"
+        ? { type: "document", source: { type: "base64", media_type: part.mimeType, data: part.data } }
+        : { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } };
+    });
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
@@ -83,9 +96,10 @@ async function throwHttpError(response: Response, adapterId: string): Promise<ne
     // Keep the normalized HTTP fallback.
   }
 
+  const contextOverflow = /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message);
   throw new AdapterError(message, {
     adapterId,
-    code,
+    code: contextOverflow ? "context_overflow" : code,
     status: response.status,
     retryable: response.status === 429 || response.status >= 500,
     ...(requestId === undefined ? {} : { requestId }),
@@ -100,33 +114,48 @@ function requireBody(response: Response, adapterId: string): ReadableStream<Uint
   });
 }
 
-function usage(inputTokens: number | undefined, outputTokens: number | undefined): TokenUsage | undefined {
-  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+function usage(
+  inputTokens: number | undefined,
+  outputTokens: number | undefined,
+  cachedInputTokens: number | undefined,
+  cacheWriteInputTokens: number | undefined,
+): TokenUsage | undefined {
+  if (inputTokens === undefined && outputTokens === undefined
+    && cachedInputTokens === undefined && cacheWriteInputTokens === undefined) return undefined;
+  const totalInput = inputTokens === undefined && cachedInputTokens === undefined && cacheWriteInputTokens === undefined
+    ? undefined : (inputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWriteInputTokens ?? 0);
   return {
-    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(totalInput === undefined ? {} : { inputTokens: totalInput }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
-    ...(inputTokens === undefined || outputTokens === undefined
+    ...(totalInput === undefined || outputTokens === undefined
       ? {}
-      : { totalTokens: inputTokens + outputTokens }),
+      : { totalTokens: totalInput + outputTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
   };
 }
 
-function providerMessages(request: ModelRequest): Array<{ role: "user" | "assistant"; content: unknown }> {
+function providerMessages(
+  request: ModelRequest,
+  cacheBreakpointIndex?: number,
+): Array<{ role: "user" | "assistant"; content: unknown }> {
   const nonSystem = request.messages.filter((message) => message.role !== "system");
-  if (!nonSystem.some((message) => message.role === "tool" || message.toolCalls?.length)) {
+  if (cacheBreakpointIndex === undefined
+    && !nonSystem.some((message) => message.role === "tool" || message.toolCalls?.length)) {
     return nonSystem.map((message) => ({
       role: message.role === "assistant" ? "assistant" : "user",
-      content: message.content,
+      content: typeof message.content === "string" ? message.content : anthropicContent(message.content),
     }));
   }
   const result: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
-  for (const message of request.messages) {
+  for (let index = 0; index < request.messages.length; index += 1) {
+    const message = request.messages[index]!;
     if (message.role === "system") continue;
     const role = message.role === "assistant" ? "assistant" : "user";
     const content = message.role === "tool"
-      ? [{ type: "tool_result", tool_use_id: message.toolCallId, content: message.content }]
+      ? [{ type: "tool_result", tool_use_id: message.toolCallId, content: textContent(message.content) }]
       : [
-          ...(message.content ? [{ type: "text", text: message.content }] : []),
+          ...anthropicContent(message.content),
           ...(message.role === "assistant" ? (message.toolCalls ?? []).map((call) => ({
             type: "tool_use",
             id: call.id,
@@ -134,6 +163,9 @@ function providerMessages(request: ModelRequest): Array<{ role: "user" | "assist
             input: call.input,
           })) : []),
         ];
+    if (index === cacheBreakpointIndex && content.length) {
+      content[content.length - 1] = { ...asRecord(content.at(-1)), cache_control: { type: "ephemeral" } };
+    }
     const previous = result.at(-1);
     if (previous?.role === role) previous.content.push(...content);
     else result.push({ role, content });
@@ -147,15 +179,31 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
 
   return {
     id,
-    capabilities: { streaming: true, json: false, cancellation: true, tools: true },
+    capabilities: {
+      streaming: true,
+      json: false,
+      cancellation: true,
+      tools: true,
+      inputMedia: ["image", "pdf"],
+      promptCaching: ["automatic", "explicit"],
+    },
     requiredCredentials: credential.startsWith("env:") ? [credential] : [],
     async *run(request: ModelRequest, context: AdapterContext): AsyncIterable<ModelEvent> {
       const apiKey = context.resolveSecret(request.apiKey ?? credential);
-      const system = request.messages
-        .filter((message) => message.role === "system")
-        .map((message) => message.content)
-        .join("\n\n");
-      const messages = providerMessages(request);
+      const cacheBreakpointIndex = request.promptCache?.mode === "explicit"
+        ? request.promptCache.prefixMessageCount - 1 : undefined;
+      const systemMessages = request.messages.flatMap((message, index) => message.role === "system" ? [{
+        index,
+        text: textContent(message.content),
+      }] : []);
+      const system = request.promptCache?.mode === "explicit"
+        ? systemMessages.map(({ index, text }) => ({
+            type: "text",
+            text,
+            ...(index === cacheBreakpointIndex ? { cache_control: { type: "ephemeral" } } : {}),
+          }))
+        : systemMessages.map(({ text }) => text).join("\n\n");
+      const messages = providerMessages(request, cacheBreakpointIndex);
       const body = {
         model: request.model,
         max_tokens: request.maxTokens ?? 1024,
@@ -169,6 +217,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
           })),
         } : {}),
         ...(system.length === 0 ? {} : { system }),
+        ...(request.promptCache?.mode === "automatic" ? { cache_control: { type: "ephemeral" } } : {}),
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       };
 
@@ -198,6 +247,8 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
       let model = request.model;
       let inputTokens: number | undefined;
       let outputTokens: number | undefined;
+      let cachedInputTokens: number | undefined;
+      let cacheWriteInputTokens: number | undefined;
       const toolCalls = new Map<number, {
         id: string;
         name: string;
@@ -221,9 +272,11 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
         const type = typeof root?.type === "string" ? root.type : event.event;
         if (type === "error") {
           const details = errorDetails(root);
-          throw new AdapterError(details.message ?? "Anthropic stream failed", {
+          const message = details.message ?? "Anthropic stream failed";
+          throw new AdapterError(message, {
             adapterId: id,
-            code: details.code ?? "provider_error",
+            code: /(?:maximum context|context (?:length|window)|prompt (?:is )?too long|too many tokens|(?:input|prompt|token).*(?:exceed|limit|maximum))/iu.test(message)
+              ? "context_overflow" : details.code ?? "provider_error",
           });
         }
         if (type === "message_start") {
@@ -231,6 +284,8 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
           const startUsage = asRecord(message?.usage);
           if (typeof message?.model === "string") model = message.model;
           if (typeof startUsage?.input_tokens === "number") inputTokens = startUsage.input_tokens;
+          if (typeof startUsage?.cache_read_input_tokens === "number") cachedInputTokens = startUsage.cache_read_input_tokens;
+          if (typeof startUsage?.cache_creation_input_tokens === "number") cacheWriteInputTokens = startUsage.cache_creation_input_tokens;
         } else if (type === "content_block_start") {
           const block = asRecord(root?.content_block);
           if (block?.type === "tool_use" && typeof root?.index === "number"
@@ -276,8 +331,15 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): M
         }
       }
 
-      const finalUsage = usage(inputTokens, outputTokens);
+      const finalUsage = usage(inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens);
       if (finalUsage) yield { type: "usage", usage: finalUsage };
+      if (request.promptCache) yield {
+        type: "cache",
+        status: (cachedInputTokens ?? 0) > 0 ? "hit" : (cacheWriteInputTokens ?? 0) > 0 ? "write" : "miss",
+        mode: request.promptCache.mode,
+        ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+        ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+      };
       if (!reason) throw new AdapterError("Anthropic stream ended without a finish reason", {
         adapterId: id,
         code: "invalid_stream",

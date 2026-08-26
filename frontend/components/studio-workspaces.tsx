@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { Diagnostic, HarnessIntegrationContract, RunEvent } from "@harnest/core";
+import type { Diagnostic, HarnessIntegrationContract, RunEvent } from "@harnestai/core";
 import { connectionCanRun, type ConnectionSummary } from "@/lib/connections";
 import { connectionLabel } from "@/i18n/manifest";
 import type { Translator } from "@/i18n/core";
@@ -43,6 +43,8 @@ export const eventSummary = (event: RunEvent, t: Translator) => {
     case "retry": return t("runs.event.retry", { node: String(data.nodeId), attempt: String(data.attempt ?? "") });
     case "iteration": return t("runs.event.iteration", { node: String(data.nodeId ?? "Loop"), iteration: String(data.iteration ?? "") });
     case "context-use": return t("runs.event.context", { node: String(data.nodeId), source: String(data.source ?? data.contextId ?? "context") });
+    case "context-compaction": return t("runs.event.contextCompaction", { node: String(data.nodeId), before: String(data.beforeBytes ?? 0), after: String(data.afterBytes ?? 0) });
+    case "prompt-cache": return t("runs.event.promptCache", { node: String(data.nodeId), status: String(data.status ?? "unknown") });
     case "tool-call": return [t("runs.event.toolCall", { node: String(data.nodeId), tool: String(data.tool ?? data.toolName ?? "tool") }), typeof data.turn === "number" ? t("runs.event.turn", { turn: data.turn }) : "", data.risk ? String(data.risk) : ""].filter(Boolean).join(" · ");
     case "tool-approval": return t(data.approved === false ? "runs.event.toolDenied" : "runs.event.toolApproved", { tool: String(data.tool ?? "Tool"), source: String(data.source ?? "policy") });
     case "tool-result": return [t(data.ok === false ? "runs.event.toolFailed" : "runs.event.toolReturned", { tool: String(data.tool ?? data.toolName ?? "Tool") }), typeof data.turn === "number" ? t("runs.event.turn", { turn: data.turn }) : ""].filter(Boolean).join(" · ");
@@ -54,6 +56,10 @@ export const eventSummary = (event: RunEvent, t: Translator) => {
     case "skill-use": return [t("runs.event.skillActivated", { node: String(data.nodeId ?? "Agent"), skill: String(data.skill ?? "skill") }), Array.isArray(data.resources) ? t("runs.event.resources", { count: data.resources.length }) : "", data.trusted === false ? t("runs.event.scriptsUntrusted") : ""].filter(Boolean).join(" · ");
     case "fallback": return t("runs.event.fallback", { from: String(data.from ?? "Primary provider"), to: String(data.to ?? "fallback provider"), turn: String(data.turn ?? "") });
     case "evaluation": return t(data.passed === false ? "runs.event.evaluationFailed" : "runs.event.evaluationPassed", { node: String(data.nodeId ?? "Evaluator") });
+    case "artifact": case "artifact-created": case "artifact-updated": {
+      const artifact = data.artifact as { name?: unknown; size?: unknown } | undefined;
+      return t("runs.event.artifact", { name: String(artifact?.name ?? "artifact"), size: String(artifact?.size ?? 0) });
+    }
     case "run-end": return t("runs.event.runEnd", { duration: Math.round(Number(data.durationMs ?? 0)) });
     case "error": return String(data.message ?? t("runs.event.runFailed"));
     default: return String(data.type ?? t("runs.event.unknown"));
@@ -150,6 +156,10 @@ export function RunsWorkspace({ runs, phase, selectedRunId, events, onRefresh, o
   onOpenPlayground: () => void;
 }) {
   const { t, formatDate, formatTime, formatNumber } = useI18n();
+  const terminal = events.findLast((event) => event.type === "run-end" || event.type === "error");
+  const terminalData = terminal ? eventData(terminal) : undefined;
+  const result = terminal?.type === "run-end" ? terminalData?.output : terminalData?.message;
+  const resultText = typeof result === "string" ? result : result === undefined ? "" : JSON.stringify(result, null, 2);
   return <section className={styles.runsWorkspace} aria-labelledby="runs-title">
     <header className={styles.runsHero}><div><span className="sheet-eyebrow">{t("runs.eyebrow")}</span><h1 id="runs-title">{t("runs.title")}</h1><p>{t("runs.description")}</p></div><Button loading={phase === "loading"} onClick={onRefresh}>{t("common.refresh")}</Button></header>
     <div className={styles.runsLayout}>
@@ -157,7 +167,17 @@ export function RunsWorkspace({ runs, phase, selectedRunId, events, onRefresh, o
         {runs.length ? runs.map((stored) => <button key={stored.runId} className={`run-history-item ${stored.runId === selectedRunId ? "is-active" : ""}`} onClick={() => onInspect(stored)}><span>{stored.runId.slice(0, 12)}</span><small>{stored.startedAt ? formatDate(stored.startedAt, { dateStyle: "medium", timeStyle: "short" }) : stored.status ?? t("runs.stored")}</small><em>{stored.durationMs === undefined ? "" : `${formatNumber(Math.round(stored.durationMs))} ms`}</em></button>) : phase === "error" ? <EmptyState compact title={t("runs.unavailable")} description={t("runs.empty.description")} action={<Button onClick={onRefresh}>{t("common.retry")}</Button>} /> : <EmptyState compact title={t("runs.empty.title")} description={t("runs.empty.description")} action={<Button variant="primary" onClick={onOpenPlayground}>{t("nav.openPlayground")}</Button>} />}
       </aside>
       <div className={`trace-events ${styles.runsTrace}`}>
-        {events.length ? <ul className="trace-list">{events.map((event, index) => <li key={`${event.type}:${event.timestamp}:${index}`}><details className="trace-detail"><summary><span className="trace-time">{formatTime(event.timestamp)}</span><span className="trace-message">{eventSummary(event, t)}</span><span className="trace-meta">{event.type}</span></summary><pre>{JSON.stringify(event, null, 2)}</pre>{eventNodeId(event) && <Button size="small" onClick={() => onShowComponent(eventNodeId(event)!)}>{t("runs.showComponent")}</Button>}</details></li>)}</ul> : <EmptyState title={t("runs.empty.title")} description={t("runs.empty.description")} />}
+        {terminal && <section className={`${styles.runOutcome} ${terminal.type === "error" ? styles.runOutcomeError : ""}`}>
+          <span>{t(terminal.type === "run-end" ? "runs.result.title" : "runs.result.failed")}</span>
+          <pre>{resultText || t("runs.result.empty")}</pre>
+        </section>}
+        {events.length ? <ul className="trace-list">{events.map((event, index) => {
+          const artifactEvent = event.type === "artifact" || event.type === "artifact-created" || event.type === "artifact-updated" ? event : undefined;
+          const artifactUrl = artifactEvent
+            ? `/api/artifacts?runId=${encodeURIComponent(event.runId)}&artifactId=${encodeURIComponent(artifactEvent.artifact.id)}`
+            : undefined;
+          return <li key={`${event.type}:${event.timestamp}:${index}`}><details className="trace-detail"><summary><span className="trace-time">{formatTime(event.timestamp)}</span><span className="trace-message">{eventSummary(event, t)}</span><span className="trace-meta">{event.type}</span></summary>{artifactUrl && artifactEvent ? <div className={styles.artifactPreview}>{artifactEvent.artifact.preview === "image" && <img src={artifactUrl} alt={artifactEvent.artifact.name} />}{artifactEvent.artifact.preview === "video" && <video src={artifactUrl} controls preload="metadata" />}{artifactEvent.artifact.preview === "audio" && <audio src={artifactUrl} controls preload="metadata" />}<a className="button" href={`${artifactUrl}&download=1`}>{t("common.download")}</a></div> : null}<pre>{JSON.stringify(event, null, 2)}</pre>{eventNodeId(event) && <Button size="small" onClick={() => onShowComponent(eventNodeId(event)!)}>{t("runs.showComponent")}</Button>}</details></li>;
+        })}</ul> : <EmptyState title={runs.length ? t("runs.select.title") : t("runs.empty.title")} description={runs.length ? t("runs.select.description") : t("runs.empty.description")} />}
       </div>
     </div>
   </section>;

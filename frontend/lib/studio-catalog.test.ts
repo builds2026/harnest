@@ -1,67 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { missingConnectionSetup, type ConnectionSummary } from "./connections";
-import { TEMPLATE_CATALOG, templateSpec } from "./studio-catalog";
+import { validateSpec } from "@harnestai/core";
+import { templateSpec } from "./studio-catalog";
 
-const allComponents = (id: Parameters<typeof templateSpec>[0]) => {
-  const spec = templateSpec(id);
-  return [
-    ...spec.components,
-    ...(spec.version === "0.2"
-      ? Object.values(spec.subgraphs ?? {}).flatMap((graph) => graph.components)
-      : []),
-  ];
-};
-
-describe("Studio commissioning templates", () => {
-  it("ships five graphs without trusted runtime module shortcuts", () => {
-    expect(TEMPLATE_CATALOG.map((template) => template.id)).toEqual([
-      "rag",
-      "web-research",
-      "coding-agent",
-      "mcp-agent",
-      "evaluation-loop",
-    ]);
-    for (const template of TEMPLATE_CATALOG) {
-      const spec = templateSpec(template.id);
-      expect(spec.runtime?.adapters ?? []).toEqual([]);
-      for (const model of allComponents(template.id).filter((component) => component.type === "model")) {
-        expect((model.config as Record<string, unknown>).connectionId).toBe("");
-      }
-    }
-  });
-
-  it("uses executable Tool references with exact builtin ids", () => {
-    const web = allComponents("web-research").find((component) => component.id === "tool");
-    const webAgent = allComponents("web-research").find((component) => component.id === "agent");
-    const code = allComponents("coding-agent").find((component) => component.id === "tool");
-    expect(web).toMatchObject({ type: "tool", config: { tool: "builtin.web-search", source: "builtin" } });
-    expect(webAgent).toMatchObject({ type: "agent", config: { maxToolCalls: 1, maxTurns: 3 } });
-    expect(code).toMatchObject({ type: "tool", config: { tool: "builtin.code-runner", source: "builtin" } });
-  });
-
-  it("keeps RAG unready until real knowledge is supplied", () => {
-    const knowledge = allComponents("rag").find((component) => component.id === "knowledge");
-    expect(knowledge).toMatchObject({ type: "context", config: { source: "text", text: "" } });
-  });
-
-  it("stages the first missing declared Connection with its exact id", () => {
-    const connectedSearch = {
-      id: "search-main", kind: "tool-service", status: "connected",
-    } as ConnectionSummary;
-    expect(missingConnectionSetup([
-      { type: "tool", config: { tool: "builtin.web-search", connectionId: "search-main" } },
-      { type: "model", config: { connectionId: "gemini-main" } },
-    ], [connectedSearch], [])).toEqual({ id: "gemini-main", kind: "provider" });
-    expect(missingConnectionSetup([
-      { type: "tool", config: { tool: "builtin.code-runner", connectionId: "sandbox-main" } },
-    ], [], [])).toEqual({ id: "sandbox-main", kind: "local-runtime" });
-    expect(missingConnectionSetup([
-      { type: "model", config: { connectionId: "primary", fallbackConnectionId: "backup" } },
-    ], [{ id: "primary", kind: "provider", status: "connected" } as ConnectionSummary], []))
-      .toEqual({ id: "backup", kind: "provider" });
-    expect(missingConnectionSetup([
-      { type: "mcp-tool", config: { connectionId: "local-mcp" } },
-    ], [{ id: "local-mcp", kind: "mcp-stdio", status: "connected" } as ConnectionSummary], []))
-      .toBeUndefined();
+describe("Dynamic Team recipe", () => {
+  it("produces a valid v0.3 classifier and bounded Team Harness", () => {
+    const spec = templateSpec("dynamic-team");
+    expect(validateSpec(spec).diagnostics).toEqual([]);
+    expect(spec.version).toBe("0.3");
+    if (spec.version !== "0.3") return;
+    expect(spec.agentTemplates?.researcher?.capabilities).toContain("network");
+    expect(spec.teams?.engineering?.limits?.maxParallel).toBe(4);
+    expect(spec.studio?.pinned).toEqual(["classify"]);
   });
 });

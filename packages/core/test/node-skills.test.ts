@@ -201,6 +201,35 @@ describe("NodeSkillStore", () => {
     }
   });
 
+  it("creates a portable skill directly from editor or uploaded SKILL.md text", async () => {
+    const fixture = await workspace();
+    try {
+      const store = new NodeSkillStore({ projectDirectory: fixture.project, userDirectory: fixture.user });
+      const created = await store.create(skillDocument("direct-skill", "Created in Studio"), {
+        source: "upload",
+      });
+      expect(created).toMatchObject({
+        name: "direct-skill",
+        scope: "project",
+        namespace: "harnest",
+        provenance: { kind: "local", source: "harnest-studio:upload" },
+        provenanceVerified: true,
+      });
+      await expect(readFile(join(fixture.project, ".harnest", "skills", "direct-skill", "SKILL.md"), "utf8"))
+        .resolves.toContain("Created in Studio");
+      await expect(store.activate("direct-skill")).resolves.toMatchObject({
+        descriptor: { name: "direct-skill" },
+        provenanceVerified: true,
+      });
+      await expect(store.create(skillDocument("direct-skill", "Duplicate")))
+        .rejects.toMatchObject({ code: "SKILL_INSTALL_EXISTS" });
+      await expect(store.create("not a SKILL.md"))
+        .rejects.toMatchObject({ code: "SKILL_FRONTMATTER_MISSING" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("defers bounded provenance verification until activation", async () => {
     const fixture = await workspace();
     try {

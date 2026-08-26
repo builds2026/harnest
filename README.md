@@ -90,7 +90,7 @@ npm run harnest -- mcp serve harnest.yaml -- --allow-modules
 ```
 
 ```ts
-import { Harnest } from "@harnest/sdk";
+import { Harnest } from "@harnestai/sdk/node";
 
 const harness = await Harnest.load("./harnest.yaml", { allowModuleExecution: true });
 try {
@@ -150,7 +150,7 @@ A legacy adapter module can export a default `ModelAdapter`; see [examples/custo
 One module listed in `runtime.modules` can register any combination without modifying Core:
 
 ```ts
-import type { RuntimeModuleRegistries } from "@harnest/core/node";
+import type { RuntimeModuleRegistries } from "@harnestai/core/node";
 
 export function register({ components, tools }: RuntimeModuleRegistries) {
   tools.register({

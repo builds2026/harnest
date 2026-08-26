@@ -29,6 +29,17 @@ export interface ToolBinding extends ToolManifest {
   readonly action?: string;
 }
 
+export function requiredToolCapability(
+  tool: Pick<ToolManifest, "id" | "risk" | "source">,
+): "network" | "process" | "workspace-write" | undefined {
+  if (tool.id === "builtin.shell" || tool.id === "builtin.code-runner") return "process";
+  if (tool.id === "builtin.file") return "workspace-write";
+  if (tool.source === "mcp" || tool.risk === "external") return "network";
+  if (tool.risk === "write") return "workspace-write";
+  if (tool.risk === "destructive") return "process";
+  return undefined;
+}
+
 export interface ToolApprovalRequest {
   readonly runId: string;
   readonly nodeId: string;
@@ -42,6 +53,21 @@ export interface ToolApprovalDecision {
   readonly approved: boolean;
   readonly source?: "policy" | "user";
   readonly reason?: string;
+  /** Legacy values are accepted at host boundaries and normalized before use. */
+  readonly mode?: PermissionDecision;
+}
+
+export type PermissionDecision = "allow_once" | "allow_for_run" | "allow_always" | "deny";
+export type LegacyPermissionDecision = "once" | "always" | "deny";
+
+export function normalizePermissionDecision(
+  mode: PermissionDecision | LegacyPermissionDecision | undefined,
+  approved: boolean,
+): PermissionDecision {
+  if (!approved || mode === "deny") return "deny";
+  if (mode === "always") return "allow_always";
+  if (mode === "once" || mode === undefined) return "allow_once";
+  return mode;
 }
 
 export interface ToolDefinition extends ToolManifest {

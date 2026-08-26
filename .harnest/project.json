@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "harness": "harnest.yaml",
+  "bindings": [
+    {
+      "component": "policy",
+      "graph": "planner",
+      "kind": "context",
+      "path": "context/planner-policy.md"
+    },
+    {
+      "component": "output",
+      "graph": "planner",
+      "kind": "schema",
+      "path": "schemas/planner-output.json"
+    },
+    {
+      "component": "operatingPolicy",
+      "graph": "engineeringLoop",
+      "kind": "context",
+      "path": "context/engineering-policy.md"
+    },
+    {
+      "component": "iterationState",
+      "graph": "engineeringLoop",
+      "kind": "schema",
+      "path": "schemas/iteration-state.json"
+    },
+    {
+      "component": "prompt",
+      "graph": "engineeringLoop",
+      "kind": "prompt",
+      "path": "prompts/engineering-loop.md"
+    },
+    {
+      "component": "prompt",
+      "graph": "planner",
+      "kind": "prompt",
+      "path": "prompts/planner.md"
+    }
+  ],
+  "tests": [
+    "tests/smoke.json"
+  ],
+  "studio": "studio.json"
+}

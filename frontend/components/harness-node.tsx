@@ -1,6 +1,6 @@
 "use client";
 
-import type { PortDefinition } from "@harnest/core";
+import type { PortDefinition } from "@harnestai/core";
 import { Popover } from "@base-ui/react/popover";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { memo, useMemo, useRef, useState, type CSSProperties } from "react";
@@ -130,10 +130,11 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
       <div className="node-header">
         <span className="node-glyph" aria-hidden="true">{glyphFor(label)}</span>
         <span>
-          <span className="node-label">{component.id}</span>
-          <span className="node-kind">{label}</span>
+          <span className="node-label">{data.liveTitle ?? component.id}</span>
+          <span className="node-kind">{data.liveSubtitle ?? label}</span>
         </span>
         <span className="node-signals">
+          {data.pinned && <span className="node-pinned" title={t("builder.layout.pinned")} aria-label={t("builder.layout.pinned")}>⌖</span>}
           {data.iteration !== undefined && <span className="node-iteration" title={`Iteration ${data.iteration}`}>↻{data.iteration}</span>}
           <span
             className={`node-state is-${diagnosticCount ? "error" : runState}`}
@@ -162,7 +163,7 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
             <button className="node-attachment nodrag nopan" type="button" onClick={() => data.onAddAttachment?.(component.id, "skills")}>+ {t("builder.catalog.skills")}</button>
           </div>
         )}
-        <div className="node-summary" title={componentSummary(component, manifest)}>{componentSummary(component, manifest)}</div>
+        <div className="node-summary" title={data.liveSummary ?? componentSummary(component, manifest)}>{data.liveSummary ?? componentSummary(component, manifest)}</div>
         {outputs.map(([name, definition]) => (
           <PortRow key={`output-${name}`} nodeId={component.id} direction="output" name={name} definition={definition} canInsert={data.locked ? undefined : data.canInsertAtPort} getInsertions={data.locked ? undefined : data.getPortInsertions} onInsert={data.onInsertAtPort} />
         ))}

@@ -10,9 +10,11 @@ import {
   type AdapterRegistry,
   type FinishReason,
   type ModelEvent,
+  type ModelContentPart,
   type ModelMessage,
   type ModelRequest,
   type ModelToolCall,
+  type PromptCacheStore,
   type TokenUsage,
 } from "./adapter.js";
 import type {
@@ -21,8 +23,19 @@ import type {
   GraphBody,
   PredicateSpec,
 } from "./spec.js";
+import type { AgentCheckpoint, AgentTurnCheckpoint, InteractionRequest, InteractionResponse, SideEffectCheckpoint } from "./orchestration.js";
+import type { HostProviders } from "./provider.js";
+import {
+  normalizeContextSources,
+  validateContextCitations,
+  type ContextSource,
+  type Citation,
+  type ConversationReadResult,
+  type ProviderRevision,
+} from "./provider.js";
 import { skillConnectionRequirement } from "./skill.js";
 import {
+  requiredToolCapability,
   snapshotSafeJsonSchema,
   type ToolApprovalDecision,
   type ToolApprovalRequest,
@@ -81,7 +94,11 @@ export interface ServiceExecutionContext {
   readonly runId: string;
   readonly nodeId: string;
   readonly iteration: number;
+  /** Opaque host authorization scope. Services must never log or persist it. */
+  readonly contextRef?: string;
   resolveSecret(reference: string): string | undefined;
+  /** Run-bound human interaction seam. Services must not retain this callback across calls. */
+  requestInteraction?(request: Omit<InteractionRequest, "id" | "runId" | "checkpoint" | "createdAt"> & Partial<Pick<InteractionRequest, "id">>): Promise<InteractionResponse>;
 }
 
 export interface ServiceResult {
@@ -97,6 +114,7 @@ export interface RunConversationMessage {
 
 export interface RunAttachment {
   readonly id: string;
+  readonly ref?: string;
   readonly name: string;
   readonly mimeType: string;
   readonly size: number;
@@ -105,17 +123,55 @@ export interface RunAttachment {
 }
 
 export interface RunSessionContext {
+  /** Stable caller-owned conversation id. Used only to scope cache keys, never exposed to Providers. */
+  readonly id?: string;
   readonly messages?: readonly RunConversationMessage[];
   readonly attachments?: readonly RunAttachment[];
+  /** Host-produced, bounded state for conversation turns compacted out of messages. */
+  readonly checkpoint?: Readonly<object>;
+  /** Opaque host authorization/reference handle. Never enters traces or cache identity. */
+  readonly contextRef?: string;
+  readonly revisions?: {
+    readonly conversation?: ProviderRevision;
+    readonly memory?: ProviderRevision;
+    readonly pkm?: ProviderRevision;
+  };
   readonly sandboxOutputPath?: string;
   readonly maxHistoryMessages?: number;
   readonly maxHistoryBytes?: number;
 }
 
-export interface RuntimeServices {
+export interface ArtifactReference {
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number;
+  readonly ref: string;
+  readonly preview: "image" | "video" | "audio" | "pdf" | "text" | "none";
+  readonly status: "writing" | "ready";
+  readonly sha256?: string;
+}
+
+export interface InteractionService {
+  requestInteraction?(request: InteractionRequest, context: ServiceExecutionContext): Promise<InteractionResponse>;
+}
+
+export interface RuntimeServices extends InteractionService {
+  /** Product-owned v1.5 providers. Legacy flat methods below remain supported for one compatibility release. */
+  readonly providers?: Omit<HostProviders, "runs">;
+  readonly harnessId?: string;
   /** Optional synchronous resolver for secrets that were unlocked by a service operation. */
   resolveSecret?(reference: string): string | undefined;
+  /** Provider cache resource registry. Entries contain hashes and opaque handles, never prompt content. */
+  readonly promptCache?: PromptCacheStore;
   releaseRun?(runId: string): void | Promise<void>;
+  /** Returns bounded, secret-free artifact references created by this run. */
+  listArtifacts?(runId: string): readonly ArtifactReference[] | Promise<readonly ArtifactReference[]>;
+  /** Reads a selected run attachment without exposing its host path to the component or trace. */
+  readAttachment?(
+    attachment: RunAttachment,
+    context: ServiceExecutionContext,
+  ): Uint8Array | Promise<Uint8Array>;
   fetchProvider?(
     url: string | URL,
     init: RequestInit | undefined,
@@ -164,6 +220,9 @@ export type ComponentEvent =
   | { type: "text-delta"; text: string }
   | { type: "usage"; usage: TokenUsage; costUsd?: number }
   | { type: "context-use"; source: string; metadata?: Readonly<Record<string, unknown>> }
+  | { type: "citations"; citations: readonly Citation[]; invented: readonly string[] }
+  | { type: "context-compaction"; beforeBytes: number; afterBytes: number; preserved: readonly string[]; turn: number }
+  | { type: "prompt-cache"; status: "hit" | "write" | "miss" | "bypass" | "provider-managed"; mode: "automatic" | "explicit"; cachedInputTokens?: number; cacheWriteInputTokens?: number; reason?: string }
   | { type: "tool-call"; tool: string; input: unknown; callId?: string; turn?: number; risk?: ToolRisk }
   | { type: "tool-approval"; tool: string; callId: string; turn: number; approved: boolean; source?: string; reason?: string }
   | { type: "tool-result"; tool: string; ok: boolean; output?: unknown; error?: string; durationMs: number; callId?: string; turn?: number }
@@ -194,6 +253,7 @@ export interface ComponentExecutionContext {
   readonly runId: string;
   readonly nodeId: string;
   readonly iteration: number;
+  readonly harnessDigest: string;
   readonly runInput: unknown;
   readonly session?: RunSessionContext;
   readonly state: Readonly<Record<string, unknown>>;
@@ -202,10 +262,29 @@ export interface ComponentExecutionContext {
   readonly services: RuntimeServices;
   readonly metrics: RuntimeMetrics;
   readonly responseSchema?: Readonly<Record<string, unknown>>;
+  readonly contextPolicy: {
+    readonly cacheMode: "automatic" | "explicit";
+    readonly overflow: "compact" | "error";
+  };
   resolveSecret(reference: string): string | undefined;
   redact(value: unknown): unknown;
   emit(event: ComponentEvent): void;
   runSubgraph(name: string, input: unknown, options?: SubgraphRunOptions): Promise<ComponentExecutionResult>;
+  runTeam(name: string, input: unknown): Promise<ComponentExecutionResult>;
+  requestInteraction?(request: Omit<InteractionRequest, "id" | "runId" | "checkpoint" | "createdAt"> & Partial<Pick<InteractionRequest, "id">>): Promise<InteractionResponse>;
+  requestToolApproval?(request: ToolApprovalRequest): Promise<ToolApprovalDecision>;
+  sideEffectCheckpoint?(key: string): SideEffectCheckpoint | undefined;
+  saveSideEffectCheckpoint?(key: string, checkpoint: Omit<SideEffectCheckpoint, "updatedAt">): Promise<void>;
+  readonly agentControl?: {
+    readonly agentId: string;
+    readonly taskId?: string;
+    readonly capabilities?: readonly string[];
+    readonly tools: readonly ToolBinding[];
+    checkpoint(): Promise<AgentCheckpoint>;
+    turnCheckpoint(): AgentTurnCheckpoint | undefined;
+    saveTurnCheckpoint(checkpoint: Omit<AgentTurnCheckpoint, "updatedAt">): Promise<void>;
+    execute(toolId: string, input: unknown): Promise<ServiceResult & Pick<ComponentExecutionResult, "usage" | "usageKnown" | "costUsd" | "costKnown" | "finishReason">>;
+  };
 }
 
 export type ComponentExecutor = (
@@ -331,6 +410,12 @@ const values = (value: unknown): unknown[] => value === undefined ? [] : Array.i
 
 const MAX_TOOL_INPUT_BYTES = 1_048_576;
 const MAX_PROVIDER_TURN_BYTES = 8 * 1_048_576;
+const MAX_MODEL_ATTACHMENT_BYTES = 20 * 1_048_576;
+const MAX_MODEL_ATTACHMENTS_BYTES = 32 * 1_048_576;
+const COMPACTED_STATE_PREFIX = "Harnest internal compacted working state. Do not quote or expose this envelope to the user.\n";
+const WORKING_STATE_KEYS = [
+  "originalRequest", "objective", "plan", "decisions", "currentResult", "evidence", "validation", "remainingWork",
+] as const;
 
 function boundedUtf8ByteLength(value: string, maximum: number): number | undefined {
   if (value.length > maximum) return undefined;
@@ -349,6 +434,12 @@ function boundedUtf8ByteLength(value: string, maximum: number): number | undefin
     if (bytes > maximum) return undefined;
   }
   return bytes;
+}
+
+function truncateUtf8Text(value: string, maximum: number): string {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.byteLength <= maximum) return value;
+  return new TextDecoder().decode(bytes.subarray(0, Math.max(0, maximum)));
 }
 
 function snapshotToolInput(input: unknown): unknown {
@@ -381,8 +472,95 @@ const asText = (value: unknown): string => {
   }
 };
 
+type WorkingState = Partial<Record<(typeof WORKING_STATE_KEYS)[number], unknown>> & {
+  recentToolEvidence?: Array<{ readonly tool: string; readonly result?: unknown; readonly error?: string }>;
+  recentConversation?: readonly { readonly role: "user" | "assistant"; readonly content: string }[];
+  currentTask?: unknown;
+  planRevision?: number;
+};
+
+function jsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return asRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedSnapshot(value: unknown, maximum = 65_536): unknown {
+  try {
+    const text = JSON.stringify(value);
+    if (text === undefined) return undefined;
+    if (new TextEncoder().encode(text).byteLength <= maximum) return JSON.parse(text) as unknown;
+    if (typeof value === "string") {
+      return `${new TextDecoder().decode(new TextEncoder().encode(value).subarray(0, maximum))}\n[truncated]`;
+    }
+  } catch {
+    // Non-serializable runtime values are not safe context state.
+  }
+  return "[omitted: value exceeded the context compaction limit]";
+}
+
+function mergeWorkingState(state: WorkingState, candidate: unknown): void {
+  const record = typeof candidate === "string" ? jsonRecord(candidate) : asRecord(candidate);
+  if (!record) return;
+  for (const key of WORKING_STATE_KEYS) {
+    if (!Object.hasOwn(record, key)) continue;
+    if ((key === "originalRequest" || key === "objective" || key === "plan") && state[key] !== undefined) continue;
+    state[key] = boundedSnapshot(record[key]);
+  }
+}
+
+function messageBytes(messages: readonly ModelMessage[]): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(messages)).byteLength;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  return `{${Object.keys(value as Record<string, unknown>).sort().map((key) =>
+    `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function promptCacheKey(
+  messages: readonly ModelMessage[],
+  prefixMessageCount: number,
+  tools: ModelRequest["tools"],
+  model: Readonly<Record<string, unknown>>,
+  context: ComponentExecutionContext,
+  revisions?: RunSessionContext["revisions"],
+): Promise<string> {
+  return sha256(stableJson({
+    version: 1,
+    harnessDigest: context.harnessDigest,
+    adapter: model.adapter,
+    model: model.model,
+    revisions: revisions ?? context.session?.revisions,
+    messages: messages.slice(0, prefixMessageCount),
+    tools: tools ?? [],
+  }));
+}
+
+const mediaKind = (mimeType: string): "image" | "audio" | "video" | "pdf" | undefined => {
+  if (mimeType.startsWith("image/") && mimeType !== "image/svg+xml") return "image";
+  if (mimeType.startsWith("audio/")) return "audio";
+  if (mimeType.startsWith("video/")) return "video";
+  if (mimeType === "application/pdf") return "pdf";
+  return undefined;
+};
+
 const mergedUsage = (current: TokenUsage, next: TokenUsage): TokenUsage => {
-  for (const field of ["inputTokens", "outputTokens", "totalTokens"] as const) {
+  for (const field of ["inputTokens", "outputTokens", "totalTokens", "cachedInputTokens", "cacheWriteInputTokens"] as const) {
     const value = next[field];
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new ComponentExecutionError(
@@ -404,10 +582,14 @@ const sumUsage = (current: TokenUsage, next: TokenUsage): TokenUsage => {
   const inputTokens = add(current.inputTokens, next.inputTokens);
   const outputTokens = add(current.outputTokens, next.outputTokens);
   const totalTokens = add(current.totalTokens, next.totalTokens);
+  const cachedInputTokens = add(current.cachedInputTokens, next.cachedInputTokens);
+  const cacheWriteInputTokens = add(current.cacheWriteInputTokens, next.cacheWriteInputTokens);
   return {
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
   };
 };
 
@@ -491,16 +673,27 @@ async function promiseWithSignal<T>(operation: Promise<T>, signal: AbortSignal):
   });
 }
 
-const costFor = (usage: TokenUsage, model: Record<string, unknown>): number =>
-  (usage.inputTokens ?? 0) * (typeof model.inputCostPerMillion === "number" ? model.inputCostPerMillion : 0) / 1_000_000
-  + (usage.outputTokens ?? 0) * (typeof model.outputCostPerMillion === "number" ? model.outputCostPerMillion : 0) / 1_000_000;
+const costFor = (usage: TokenUsage, model: Record<string, unknown>): number => {
+  const inputRate = typeof model.inputCostPerMillion === "number" ? model.inputCostPerMillion : 0;
+  const cachedRate = typeof model.cachedInputCostPerMillion === "number" ? model.cachedInputCostPerMillion : inputRate;
+  const writeRate = typeof model.cacheWriteCostPerMillion === "number" ? model.cacheWriteCostPerMillion : inputRate;
+  const storageRate = typeof model.cacheStorageCostPerMillionHour === "number" ? model.cacheStorageCostPerMillionHour : 0;
+  const cached = usage.cachedInputTokens ?? 0;
+  const written = usage.cacheWriteInputTokens ?? 0;
+  const uncached = Math.max(0, (usage.inputTokens ?? 0) - cached - written);
+  return (uncached * inputRate + cached * cachedRate
+    + written * (writeRate + (model.adapter === "gemini" ? storageRate : 0))
+    + (usage.outputTokens ?? 0) * (typeof model.outputCostPerMillion === "number" ? model.outputCostPerMillion : 0)) / 1_000_000;
+};
 
 const serviceContext = (context: ComponentExecutionContext): ServiceExecutionContext => ({
   signal: context.signal,
   runId: context.runId,
   nodeId: context.nodeId,
   iteration: context.iteration,
+  ...(context.session?.contextRef ? { contextRef: context.session.contextRef } : {}),
   resolveSecret: context.resolveSecret,
+  ...(context.requestInteraction ? { requestInteraction: context.requestInteraction } : {}),
 });
 
 const modelExecutor: ComponentExecutor = (component) => ({
@@ -550,6 +743,16 @@ function toolBinding(value: unknown): ToolBinding | undefined {
   };
 }
 
+function assertAgentToolCapability(context: ComponentExecutionContext, binding: ToolBinding): void {
+  const required = requiredToolCapability(binding);
+  if (required && context.agentControl?.capabilities && !context.agentControl.capabilities.includes(required)) {
+    throw new ComponentExecutionError(
+      "AGENT_CAPABILITY_DENIED",
+      `Agent '${context.agentControl.agentId}' requires capability '${required}' to use Tool '${binding.id}'`,
+    );
+  }
+}
+
 const providerToolName = (id: string): string => {
   const normalized = id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
   return normalized || "tool";
@@ -570,13 +773,34 @@ async function resolveProviderModel(
     throw new ComponentExecutionError("CONNECTION_INVALID", `Connection '${connectionId}' is not a Provider connection`);
   }
   const overrides = Object.fromEntries((primary
-    ? ["model", "temperature", "maxTokens", "inputCostPerMillion", "outputCostPerMillion"]
+    ? [
+        "model", "temperature", "maxTokens", "contextWindowTokens", "cacheDialect",
+        "inputCostPerMillion", "outputCostPerMillion", "cachedInputCostPerMillion",
+        "cacheWriteCostPerMillion", "cacheStorageCostPerMillionHour",
+      ]
     : ["temperature", "maxTokens"]
   ).flatMap((key) => configured[key] !== undefined ? [[key, configured[key]]] : []));
   return { ...resolved, ...overrides, connectionId };
 }
 
 const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
+  const restoredTurn = context.agentControl?.turnCheckpoint();
+  if (restoredTurn && (!Number.isInteger(restoredTurn.nextTurn) || restoredTurn.nextTurn < 1
+    || typeof restoredTurn.workingState !== "object" || restoredTurn.workingState === null
+    || typeof restoredTurn.costUsd !== "number" || !Number.isFinite(restoredTurn.costUsd)
+    || !Number.isInteger(restoredTurn.toolCalls) || restoredTurn.toolCalls < 0)) {
+    throw new ComponentExecutionError("AGENT_CHECKPOINT_INVALID", "Stored Agent turn checkpoint is invalid");
+  }
+  if (restoredTurn?.completed) {
+    return {
+      outputs: { response: restoredTurn.finalText ?? "" },
+      usage: restoredTurn.usage,
+      usageKnown: restoredTurn.usageKnown,
+      costUsd: restoredTurn.costUsd,
+      costKnown: restoredTurn.costKnown,
+      finishReason: restoredTurn.finishReason,
+    };
+  }
   const configuredModel = asRecord(inputs.model);
   const primaryConnectionId = typeof configuredModel?.connectionId === "string" ? configuredModel.connectionId : undefined;
   const fallbackConnectionId = typeof configuredModel?.fallbackConnectionId === "string"
@@ -594,12 +818,11 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
   const rendered = /\{\{\s*input\s*\}\}/.test(inputs.prompt)
     ? inputs.prompt.replace(/\{\{\s*input\s*\}\}/g, userInput)
     : `${inputs.prompt}\n\n${userInput}`;
-  const contextText = values(inputs.context).map(asText).filter(Boolean).join("\n\n");
+  let contextText = values(inputs.context).map(asText).filter(Boolean).join("\n\n");
   const memoryText = values(inputs.memory).map(asText).filter(Boolean).join("\n\n");
   const toolResults = values(inputs.toolResults).map(asText).filter(Boolean).join("\n\n");
   const enriched = [
     rendered,
-    contextText ? `Context:\n${contextText}` : "",
     memoryText ? `Memory:\n${memoryText}` : "",
     toolResults ? `Connected tool results:\n${toolResults}` : "",
   ].filter(Boolean).join("\n\n");
@@ -633,13 +856,116 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     typeof component.config.system === "string" ? component.config.system : "",
     ...skillInstructions,
   ].filter(Boolean).join("\n\n");
-  const maxHistoryMessages = Math.min(100, Math.max(0, Math.floor(context.session?.maxHistoryMessages ?? 20)));
-  const maxHistoryBytes = Math.min(1_048_576, Math.max(0, Math.floor(context.session?.maxHistoryBytes ?? 65_536)));
-  let historyBytes = 0;
-  const history = [...(context.session?.messages ?? [])].reverse().flatMap((message) => {
+  const requestedHistoryMessages = context.session?.maxHistoryMessages;
+  const requestedHistoryBytes = context.session?.maxHistoryBytes;
+  const contextWindowTokens = typeof model.contextWindowTokens === "number" ? Math.floor(model.contextWindowTokens) : 32_768;
+  const outputReserveTokens = typeof model.maxTokens === "number"
+    ? Math.floor(model.maxTokens) : Math.min(4_096, Math.floor(contextWindowTokens / 4));
+  const runBudgetTokens = typeof component.config.maxTokens === "number"
+    ? Math.floor(component.config.maxTokens) : contextWindowTokens;
+  const adaptiveHistoryBytes = Math.min(
+    4 * 1_048_576,
+    Math.max(4_096, (Math.min(contextWindowTokens, runBudgetTokens) - outputReserveTokens) * 4),
+  );
+  const maxHistoryMessages = requestedHistoryMessages === undefined
+    ? Number.POSITIVE_INFINITY : Math.min(100, Math.max(0, Math.floor(requestedHistoryMessages)));
+  const maxHistoryBytes = requestedHistoryBytes === undefined
+    ? adaptiveHistoryBytes : Math.min(4 * 1_048_576, Math.max(0, Math.floor(requestedHistoryBytes)));
+  let providerConversation: ConversationReadResult | undefined;
+  const contextCacheKey = context.session?.revisions && context.services.providers?.cache
+    ? await sha256(stableJson({
+      version: 1,
+      harnessDigest: context.harnessDigest,
+      model: { adapter: model.adapter, model: model.model },
+      tools: values(inputs.tools),
+      revisions: context.session.revisions,
+    })) : undefined;
+  const cachedContext = contextCacheKey ? asRecord((await context.services.providers!.cache!.get({
+    namespace: "context", key: contextCacheKey,
+  }, serviceContext(context)))?.value) : undefined;
+  if (asRecord(cachedContext?.conversation)) providerConversation = cachedContext!.conversation as unknown as ConversationReadResult;
+  if (!cachedContext && context.services.providers?.conversation && (context.session?.contextRef || context.session?.id)) {
+    const messages: RunConversationMessage[] = [];
+    const sources: Array<Omit<ContextSource, "label">> = [];
+    let cursor: string | undefined;
+    let revision = context.session.revisions?.conversation;
+    let loadedBytes = 0;
+    const seenCursors = new Set<string>();
+    do {
+      const page = await context.services.providers.conversation.read({
+        ...(!context.session.contextRef && context.session.id ? { conversationId: context.session.id } : {}),
+        ...(revision === undefined ? {} : { revision }),
+        ...(cursor ? { cursor } : {}),
+        ...(context.session.contextRef ? { contextRef: context.session.contextRef } : {}),
+      }, serviceContext(context));
+      messages.push(...page.messages);
+      sources.push(...page.sources ?? []);
+      loadedBytes += page.messages.reduce((total, message) => total + new TextEncoder().encode(message.content).byteLength, 0);
+      revision = page.revision;
+      cursor = page.cursor;
+      if (!cursor || seenCursors.has(cursor)) break;
+      seenCursors.add(cursor);
+    } while (loadedBytes < maxHistoryBytes);
+    providerConversation = { messages, sources, revision: revision ?? 0, ...(cursor ? { cursor } : {}) };
+  }
+  const memoryRevisions: Partial<Record<"user" | "conversation" | "pkm", ProviderRevision>> = {};
+  const memorySources: Array<Omit<ContextSource, "label">> = [];
+  if (cachedContext && Array.isArray(cachedContext.memorySources)) {
+    memorySources.push(...cachedContext.memorySources as Array<Omit<ContextSource, "label">>);
+    Object.assign(memoryRevisions, asRecord(cachedContext.memoryRevisions));
+  } else if (context.services.providers?.memory && context.session?.contextRef) {
+    for (const namespace of ["user", "conversation", "pkm"] as const) {
+      const revision = namespace === "pkm" ? context.session.revisions?.pkm : context.session.revisions?.memory;
+      const found = await context.services.providers.memory.search({
+        namespace,
+        query: userInput,
+        ...(revision === undefined ? {} : { revision }),
+        contextRef: context.session.contextRef,
+      }, serviceContext(context));
+      memoryRevisions[namespace] = found.revision;
+      for (const record of found.records) memorySources.push({
+        content: asText(context.redact(record.value)),
+        provenance: { ...record.provenance, revision: record.provenance.revision ?? record.revision },
+      });
+    }
+  }
+  if (!cachedContext && contextCacheKey) await context.services.providers!.cache!.put({
+    namespace: "context",
+    key: contextCacheKey,
+    value: { conversation: providerConversation, memorySources, memoryRevisions },
+    ...(context.session!.revisions?.conversation === undefined ? {} : { revision: context.session!.revisions!.conversation }),
+    ttlMs: 5 * 60_000,
+  }, serviceContext(context));
+  const normalizedProviderSources = normalizeContextSources([...(providerConversation?.sources ?? []), ...memorySources]);
+  const fixedContextBytes = new TextEncoder().encode(`${system}\n${enriched}\n${stableJson(values(inputs.tools))}`).byteLength;
+  let remainingContextBytes = Math.max(0, maxHistoryBytes - fixedContextBytes);
+  contextText = truncateUtf8Text(contextText, remainingContextBytes);
+  remainingContextBytes -= new TextEncoder().encode(contextText).byteLength;
+  const providerSources: ContextSource[] = [];
+  for (const source of normalizedProviderSources) {
+    const renderedSource = `[${source.label}] ${source.provenance.title ?? source.provenance.source}\n${source.content}`;
+    const bytes = new TextEncoder().encode(`${contextText ? "\n\n" : ""}${renderedSource}`).byteLength;
+    if (bytes > remainingContextBytes) continue;
+    contextText = `${contextText ? `${contextText}\n\n` : ""}${renderedSource}`;
+    remainingContextBytes -= bytes;
+    providerSources.push(source);
+  }
+  const effectiveRevisions: RunSessionContext["revisions"] = {
+    ...context.session?.revisions,
+    ...(providerConversation ? { conversation: providerConversation.revision } : {}),
+    ...(memoryRevisions.user === undefined && memoryRevisions.conversation === undefined ? {} : {
+      memory: stableJson({ user: memoryRevisions.user, conversation: memoryRevisions.conversation }),
+    }),
+    ...(memoryRevisions.pkm === undefined ? {} : { pkm: memoryRevisions.pkm }),
+  };
+  const validHistory = [...(providerConversation?.messages ?? []), ...(context.session?.messages ?? [])].flatMap((message) => {
     if ((message.role !== "user" && message.role !== "assistant") || typeof message.content !== "string") return [];
-    const content = asText(context.redact(message.content));
-    const bytes = boundedUtf8ByteLength(content, maxHistoryBytes - historyBytes);
+    return [{ role: message.role, content: asText(context.redact(message.content)) } satisfies ModelMessage];
+  });
+  let historyBytes = 0;
+  const history = [...validHistory].reverse().flatMap((message) => {
+    const content = asText(message.content);
+    const bytes = boundedUtf8ByteLength(content, remainingContextBytes - historyBytes);
     if (bytes === undefined) return [];
     historyBytes += bytes;
     return [{ role: message.role, content } satisfies ModelMessage];
@@ -649,29 +975,61 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       || typeof attachment.mimeType !== "string" || !Number.isFinite(attachment.size) || attachment.size < 0) return [];
     return [{
       id: attachment.id,
+      ...(typeof attachment.ref === "string" ? { ref: attachment.ref } : {}),
       name: asText(context.redact(attachment.name)).slice(0, 255),
       mimeType: attachment.mimeType.slice(0, 127),
       size: Math.floor(attachment.size),
       ...(typeof attachment.sandboxPath === "string" ? { sandboxPath: attachment.sandboxPath } : {}),
     }];
   });
+  for (const attachment of attachments) {
+    const textual = attachment.mimeType.startsWith("text/")
+      || ["application/json", "application/xml", "application/yaml", "application/x-yaml"].includes(attachment.mimeType);
+    if (!textual || attachment.sandboxPath || attachment.size > 1_048_576) continue;
+    if (!context.services.readAttachment) throw new ComponentExecutionError(
+      "ATTACHMENT_READ_UNAVAILABLE", `This runtime cannot read text attachment '${attachment.name}'`,
+    );
+    const content = await context.services.readAttachment(attachment, serviceContext(context));
+    if (content.byteLength !== attachment.size) throw new ComponentExecutionError(
+      "ATTACHMENT_CHANGED", `Attachment '${attachment.name}' changed before model invocation`,
+    );
+    let text: string;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(content); }
+    catch { throw new ComponentExecutionError("ATTACHMENT_ENCODING_INVALID", `Text attachment '${attachment.name}' is not valid UTF-8`); }
+    const rendered = `${contextText ? "\n\n" : ""}[Attachment: ${attachment.name}]\n${text}`;
+    const available = Math.max(0, remainingContextBytes - historyBytes);
+    if (boundedUtf8ByteLength(rendered, available) === undefined) continue;
+    contextText += rendered;
+    remainingContextBytes -= new TextEncoder().encode(rendered).byteLength;
+  }
   const attachmentInstruction = attachments.length ? [
-    "Files selected by the user are available for this run. Use only paths listed below and only through connected tools.",
+    "Files selected by the user are available for this run. Supported media is attached directly to the model: analyze it directly and do not call File or Code Runner merely to inspect it. Use the listed sandbox paths only when the request actually requires a file transformation or code-based operation.",
     ...attachments.map((attachment) => `- ${JSON.stringify(attachment.name)} (${attachment.mimeType}, ${attachment.size} bytes)${attachment.sandboxPath ? ` at ${attachment.sandboxPath}` : ""}`),
     ...(context.session?.sandboxOutputPath
       ? [`Save files intended for the user under ${context.session.sandboxOutputPath}.`]
       : []),
   ].join("\n") : "";
-  const messages: ModelMessage[] = [
-    ...(system ? [{ role: "system" as const, content: system }] : []),
-    ...(attachmentInstruction ? [{ role: "system" as const, content: attachmentInstruction }] : []),
-    ...history,
-    { role: "user", content: enriched },
-  ];
-  if (context.responseSchema) messages.unshift({
-    role: "system",
-    content: `Return only JSON matching this JSON Schema: ${JSON.stringify(context.responseSchema)}`,
-  });
+  const sessionCheckpoint = context.session?.checkpoint && asRecord(context.session.checkpoint)
+    ? boundedSnapshot(context.session.checkpoint) : undefined;
+  const workingState: WorkingState = {};
+  mergeWorkingState(workingState, sessionCheckpoint);
+  for (const message of history) mergeWorkingState(workingState, message.content);
+  mergeWorkingState(workingState, context.runInput);
+  if (history.length) {
+    let recentBytes = 0;
+    const recentBudget = Math.max(4_096, Math.floor(maxHistoryBytes / 4));
+    workingState.recentConversation = [...history].reverse().flatMap((message) => {
+      const content = asText(message.content);
+      const bytes = new TextEncoder().encode(content).byteLength;
+      if (recentBytes + bytes > recentBudget) return [];
+      recentBytes += bytes;
+      return [{ role: message.role as "user" | "assistant", content }];
+    }).reverse();
+  }
+  if (workingState.originalRequest === undefined && workingState.objective === undefined) {
+    workingState.originalRequest = boundedSnapshot(userInput);
+  }
+  if (restoredTurn) Object.assign(workingState, structuredClone(restoredTurn.workingState));
   const allowedTools = Array.isArray(component.config.allowTools)
     ? new Set(component.config.allowTools.filter((item): item is string => typeof item === "string"))
     : undefined;
@@ -682,6 +1040,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     .map(toolBinding)
     .filter((item): item is ToolBinding => Boolean(item))
     .filter((item) => (!allowedTools || allowedTools.has(item.id)) && !deniedTools.has(item.id));
+  for (const binding of graphBindings) assertAgentToolCapability(context, binding);
   const connectedToolIds = new Set(graphBindings.map(({ id }) => id));
   const connectedConnectionIds = new Set([
     ...(typeof model.connectionId === "string" ? [model.connectionId] : []),
@@ -703,13 +1062,23 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       ...requiredTools.filter((id) => !connectedToolIds.has(id)).map((id) => `tool:${id}`),
       ...requiredConnections.filter(({ id }) => !connectedConnectionIds.has(id))
         .map(({ requirement }) => `connection:${requirement}`),
-      ...requiredPermissions.filter((id) => !grantedPermissions.has(id)).map((id) => `permission:${id}`),
+      ...requiredPermissions.filter((id) => !grantedPermissions.has(id)
+        || (context.agentControl?.capabilities !== undefined && !context.agentControl.capabilities.includes(id)))
+        .map((id) => `permission:${id}`),
     ];
     if (missing.length) throw new ComponentExecutionError(
       "SKILL_REQUIREMENTS_MISSING",
       `Skill '${skill.id}' is missing ${missing.join(", ")}`,
     );
   }
+  if (restoredTurn?.fallbackUsed && fallbackConnectionId && configuredModel) {
+    const fallback = await resolveProviderModel(configuredModel, fallbackConnectionId, context, false);
+    if (typeof fallback.adapter !== "string" || typeof fallback.model !== "string") {
+      throw new ComponentExecutionError("AGENT_MODEL_INVALID", `Fallback Connection '${fallbackConnectionId}' has no model`);
+    }
+    model = fallback;
+  }
+  if (typeof model.adapter !== "string") throw new ComponentExecutionError("AGENT_MODEL_INVALID", "Agent model Adapter is invalid");
   let adapter = context.adapters.get(model.adapter);
   const resourceBindings: ToolBinding[] = adapter.capabilities.tools === true && context.services.loadSkillResource
     ? activeSkills.map(({ id }) => ({
@@ -727,7 +1096,9 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         action: id,
       }))
     : [];
-  const bindings = [...graphBindings, ...resourceBindings];
+  const controlBindings = context.agentControl?.tools ?? [];
+  const controlToolIds = new Set(controlBindings.map(({ id }) => id));
+  const bindings = [...graphBindings, ...resourceBindings, ...controlBindings];
   const names = new Map<string, ToolBinding>();
   const modelTools = bindings.map((binding) => {
     const base = providerToolName(binding.id);
@@ -738,25 +1109,139 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       suffix += 1;
     }
     names.set(name, binding);
+    if (controlToolIds.has(binding.id)) {
+      const alias = providerToolName(binding.id.split(".").at(-1) ?? binding.id);
+      if (!names.has(alias)) names.set(alias, binding);
+    }
     return { name, description: binding.description, inputSchema: binding.inputSchema };
   });
+  for (const [name, binding] of [...names]) {
+    const alias = name.replaceAll("-", "_");
+    if (!names.has(alias)) names.set(alias, binding);
+  }
   if (modelTools.length && adapter.capabilities.tools !== true) {
     throw new ComponentExecutionError("ADAPTER_TOOLS_UNSUPPORTED", `Adapter '${model.adapter}' does not support Tool calling`);
   }
+  const attachmentToolAvailable = graphBindings.some(({ id }) => id === "builtin.code-runner" || id === "builtin.file");
+  const directMedia: ModelContentPart[] = [];
+  let directMediaBytes = 0;
+  if (component.config.multimodal !== false && attachments.length) {
+    for (const attachment of attachments) {
+      const kind = mediaKind(attachment.mimeType);
+      if (!kind) continue;
+      if (!adapter.capabilities.inputMedia?.includes(kind)) {
+        if (!attachmentToolAvailable) throw new ComponentExecutionError(
+          "ADAPTER_MEDIA_UNSUPPORTED",
+          `Adapter '${model.adapter}' cannot receive ${kind} attachment '${attachment.name}' and no File or Code Runner Tool is connected`,
+        );
+        continue;
+      }
+      if (!context.services.readAttachment) throw new ComponentExecutionError(
+        "ATTACHMENT_READ_UNAVAILABLE",
+        `This runtime cannot provide attachment '${attachment.name}' to Adapter '${model.adapter}'`,
+      );
+      if (attachment.size > MAX_MODEL_ATTACHMENT_BYTES || directMediaBytes + attachment.size > MAX_MODEL_ATTACHMENTS_BYTES) {
+        throw new ComponentExecutionError(
+          "MODEL_ATTACHMENT_LIMIT",
+          `Direct model attachments exceed the 20 MiB per-file or 32 MiB per-run limit`,
+        );
+      }
+      const content = await context.services.readAttachment(attachment, serviceContext(context));
+      if (content.byteLength !== attachment.size || content.byteLength > MAX_MODEL_ATTACHMENT_BYTES) {
+        throw new ComponentExecutionError("ATTACHMENT_CHANGED", `Attachment '${attachment.name}' changed before model invocation`);
+      }
+      directMediaBytes += content.byteLength;
+      directMedia.push({
+        type: "media",
+        mimeType: attachment.mimeType,
+        data: Buffer.from(content).toString("base64"),
+        name: attachment.name,
+      });
+    }
+  }
+  const stableMessages: ModelMessage[] = [
+    ...(context.responseSchema ? [{
+      role: "system" as const,
+      content: `Return only JSON matching this JSON Schema: ${JSON.stringify(context.responseSchema)}`,
+    }] : []),
+    ...(system ? [{ role: "system" as const, content: system }] : []),
+    ...(contextText ? [{ role: "system" as const, content: `Reference context:\n${contextText}` }] : []),
+    ...(attachmentInstruction ? [{
+      role: directMedia.length ? "user" as const : "system" as const,
+      content: directMedia.length
+        ? [{ type: "text" as const, text: attachmentInstruction }, ...directMedia]
+        : attachmentInstruction,
+    }] : []),
+  ];
+  const cachePrefixMessageCount = stableMessages.length;
+  const messages: ModelMessage[] = [
+    ...stableMessages,
+    ...(sessionCheckpoint ? [{ role: "user" as const, content: `${COMPACTED_STATE_PREFIX}${JSON.stringify(sessionCheckpoint)}` }] : []),
+    ...history,
+    { role: "user", content: enriched },
+  ];
+  if (restoredTurn) messages.push({
+    role: "user",
+    content: `${COMPACTED_STATE_PREFIX}${JSON.stringify(restoredTurn.workingState)}\nContinue from completed model turn ${restoredTurn.nextTurn - 1}. Completed Tool evidence is authoritative; do not repeat it unless the user explicitly requests a retry.`,
+  });
+  let seenRevision = typeof workingState.planRevision === "number" ? workingState.planRevision : 0;
+  const applyControlUpdates = async (target = messages): Promise<boolean> => {
+    const checkpoint = await context.agentControl?.checkpoint();
+    if (!checkpoint) return false;
+    if (checkpoint.task) workingState.currentTask = boundedSnapshot(checkpoint.task);
+    const revisionChanged = checkpoint.revision !== seenRevision;
+    seenRevision = checkpoint.revision;
+    workingState.planRevision = checkpoint.revision;
+    if (revisionChanged) target.push({
+      role: "user",
+      content: `[Harnest plan updated]\nContinue against plan revision ${checkpoint.revision}; reconsider stale actions before using tools.`,
+    });
+    for (const message of checkpoint.messages) {
+      target.push({
+        role: "user",
+        content: `[Harnest ${message.kind} from ${message.from}${message.taskId ? ` for ${message.taskId}` : ""}]\n${message.content}`,
+      });
+    }
+    return revisionChanged || checkpoint.messages.length > 0;
+  };
   const maxTurns = typeof component.config.maxTurns === "number" ? Math.floor(component.config.maxTurns) : 8;
   const maxToolCalls = typeof component.config.maxToolCalls === "number" ? Math.floor(component.config.maxToolCalls) : 32;
   const toolTimeoutMs = typeof component.config.toolTimeoutMs === "number" ? Math.floor(component.config.toolTimeoutMs) : 30_000;
   const recoverToolErrors = component.config.toolError !== "fail";
-  let usage: TokenUsage = {};
-  let costUsd = 0;
-  let costKnown = true;
-  let finishReason: FinishReason = "unknown";
-  let toolCalls = 0;
-  let finalText = "";
+  const compactAtTokens = typeof component.config.compactAtTokens === "number"
+    ? Math.floor(component.config.compactAtTokens) : undefined;
+  let usage: TokenUsage = restoredTurn?.usage ?? {};
+  let costUsd = restoredTurn?.costUsd ?? 0;
+  let costKnown = restoredTurn?.costKnown ?? true;
+  let finishReason: FinishReason = restoredTurn?.finishReason ?? "unknown";
+  let toolCalls = restoredTurn?.toolCalls ?? 0;
+  let finalText = restoredTurn?.finalText ?? "";
   let completed = false;
-  let fallbackUsed = false;
-  let usageKnown = true;
+  let fallbackUsed = restoredTurn?.fallbackUsed ?? false;
+  let usageKnown = restoredTurn?.usageKnown ?? true;
   const seenToolCallIds = new Set<string>();
+  const compactMessages = (turn: number): boolean => {
+    const beforeBytes = messageBytes(messages);
+    const next: ModelMessage[] = [
+      ...messages.slice(0, cachePrefixMessageCount),
+      { role: "user", content: `${COMPACTED_STATE_PREFIX}${JSON.stringify(workingState)}` },
+      {
+        role: "user",
+        content: "Continue the original objective from the preserved working state. Use tools only when needed, verify the result, and return only the requested user-facing output.",
+      },
+    ];
+    const afterBytes = messageBytes(next);
+    if (afterBytes >= beforeBytes) return false;
+    messages.splice(0, messages.length, ...next);
+    context.emit({
+      type: "context-compaction",
+      beforeBytes,
+      afterBytes,
+      preserved: Object.keys(workingState).sort(),
+      turn,
+    });
+    return true;
+  };
   const commitUsage = (turnUsage: TokenUsage, turnModel: Record<string, unknown>) => {
     usage = sumUsage(usage, turnUsage);
     const turnUsageKnown = turnUsage.totalTokens !== undefined
@@ -769,13 +1254,43 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     costKnown = costKnown && turnCostKnown;
     costUsd += costFor(turnUsage, turnModel);
   };
-  for (let turn = 1; turn <= maxTurns; turn += 1) {
-    let calls: ModelToolCall[] = [];
+  const saveTurnCheckpoint = async (
+    nextTurn: number,
+    done = false,
+    pending: Pick<AgentTurnCheckpoint, "pendingCalls" | "pendingAssistantText" | "siblingResults" | "inFlightCalls"> = {},
+  ) => {
+    if (!context.agentControl) return;
+    const safeWorkingState = Object.fromEntries(Object.entries(workingState)
+      .map(([key, value]) => [key, boundedSnapshot(value, 262_144)]));
+    await context.agentControl.saveTurnCheckpoint({
+      nextTurn,
+      workingState: safeWorkingState,
+      usage,
+      usageKnown,
+      costUsd,
+      costKnown,
+      finishReason,
+      toolCalls,
+      fallbackUsed,
+      ...pending,
+      ...(done ? { completed: true, finalText } : {}),
+    });
+  };
+  for (let turn = restoredTurn?.nextTurn ?? 1; turn <= maxTurns; turn += 1) {
+    await applyControlUpdates();
+    const resumedPending = turn === restoredTurn?.nextTurn && restoredTurn.pendingCalls?.length
+      ? restoredTurn.pendingCalls.map((call) => structuredClone(call)) : undefined;
+    let calls: ModelToolCall[] = resumedPending ?? [];
     let turnUsage: TokenUsage = {};
-    let text = "";
+    let text = resumedPending ? restoredTurn?.pendingAssistantText ?? "" : "";
     let textBytes = 0;
-    let finished = false;
-    while (true) {
+    let finished = Boolean(resumedPending);
+    while (!resumedPending) {
+      const supportedCacheModes = model.cacheDialect === "none" ? [] : adapter.capabilities.promptCaching ?? [];
+      const cacheMode = supportedCacheModes.includes(context.contextPolicy.cacheMode)
+        ? context.contextPolicy.cacheMode
+        : context.contextPolicy.cacheMode === "explicit" && supportedCacheModes.includes("automatic")
+          ? "automatic" : undefined;
       const request: ModelRequest = {
         model: model.model as string,
         messages,
@@ -785,7 +1300,20 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         ...(typeof model.maxTokens === "number" ? { maxTokens: model.maxTokens } : {}),
         ...(context.responseSchema ? { responseSchema: context.responseSchema } : {}),
         ...(modelTools.length ? { tools: modelTools } : {}),
+        ...(cacheMode && cachePrefixMessageCount > 0 ? {
+          promptCache: {
+            mode: cacheMode,
+            key: await promptCacheKey(messages, cachePrefixMessageCount, modelTools, model, context, effectiveRevisions),
+            prefixMessageCount: cachePrefixMessageCount,
+          },
+        } : {}),
       };
+      if (!cacheMode && cachePrefixMessageCount > 0 && turn === 1) context.emit({
+        type: "prompt-cache",
+        status: "bypass",
+        mode: context.contextPolicy.cacheMode,
+        reason: `Adapter '${adapter.id}' does not support prompt caching`,
+      });
       let iterator: AsyncIterator<ModelEvent> | undefined;
       try {
         iterator = adapter.run(request, {
@@ -794,6 +1322,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
           ...(context.services.fetchProvider ? {
             fetch: (url, init) => context.services.fetchProvider!(url, init, serviceContext(context)),
           } : {}),
+          ...(context.services.promptCache ? { promptCache: context.services.promptCache } : {}),
         })[Symbol.asyncIterator]();
         while (true) {
           const result = await nextWithSignal<ModelEvent>(iterator, context.signal);
@@ -846,6 +1375,15 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
                 throw new ComponentExecutionError("AGENT_COST_LIMIT", `Agent exceeded $${component.config.maxCostUsd}`);
               }
             }
+          } else if (result.value.type === "cache") {
+            context.emit({
+              type: "prompt-cache",
+              status: result.value.status,
+              mode: result.value.mode,
+              ...(result.value.cachedInputTokens === undefined ? {} : { cachedInputTokens: result.value.cachedInputTokens }),
+              ...(result.value.cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens: result.value.cacheWriteInputTokens }),
+              ...(result.value.reason === undefined ? {} : { reason: asText(context.redact(result.value.reason)) }),
+            });
           } else {
             finishReason = result.value.reason;
             finished = true;
@@ -853,6 +1391,14 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         }
         break;
       } catch (cause) {
+        if (cause instanceof AdapterError && cause.code === "context_overflow"
+          && context.contextPolicy.overflow === "compact" && textBytes === 0 && calls.length === 0
+          && compactMessages(turn)) {
+          if (Object.keys(turnUsage).length) commitUsage(turnUsage, model);
+          turnUsage = {};
+          finishReason = "unknown";
+          continue;
+        }
         if (!(cause instanceof AdapterError) || !cause.retryable || !fallbackConnectionId
           || fallbackUsed || !configuredModel || context.signal.aborted) throw cause;
         commitUsage(turnUsage, model);
@@ -864,6 +1410,13 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         adapter = context.adapters.get(model.adapter);
         if (modelTools.length && adapter.capabilities.tools !== true) {
           throw new ComponentExecutionError("ADAPTER_TOOLS_UNSUPPORTED", `Fallback Adapter '${model.adapter}' does not support Tool calling`);
+        }
+        if (directMedia.length && directMedia.some((part) => part.type === "media"
+          && !adapter.capabilities.inputMedia?.includes(mediaKind(part.mimeType)!))) {
+          throw new ComponentExecutionError(
+            "ADAPTER_MEDIA_UNSUPPORTED",
+            `Fallback Adapter '${model.adapter}' does not support the selected media attachments`,
+          );
         }
         fallbackUsed = true;
         context.emit({
@@ -884,7 +1437,26 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       }
     }
     text = asText(context.redact(text));
-    if (text) context.emit({ type: "text-delta", text });
+    if (text.includes(COMPACTED_STATE_PREFIX) || text.includes("Harnest internal compacted working state")
+      || /["']?(?:pendingInteractions|pendingCalls|siblingResults|processedInteractionIds|runGrants)["']?\s*:/u.test(text)) {
+      throw new ComponentExecutionError("AGENT_INTERNAL_STATE_EXPOSED", "Provider attempted to expose internal compacted state");
+    }
+    const citations = validateContextCitations(text, providerSources);
+    if (citations.valid.length || citations.invented.length) context.emit({
+      type: "citations",
+      citations: citations.valid.flatMap((label) => {
+        const source = providerSources.find((candidate) => candidate.label === label);
+        return source ? [{ label: source.label, provenance: source.provenance }] : [];
+      }),
+      invented: citations.invented,
+    });
+    if (citations.invented.length) context.emit({
+      type: "context-use",
+      source: "citation-validation",
+      metadata: { valid: citations.valid, invented: citations.invented },
+    });
+    mergeWorkingState(workingState, text);
+    if (text && !resumedPending) context.emit({ type: "text-delta", text });
     if (!finished) throw new ComponentExecutionError("ADAPTER_STREAM_INCOMPLETE", "Adapter stream ended without a finish event");
     if (finishReason === "error") throw new ComponentExecutionError("MODEL_FINISH_ERROR", "Model stopped with an error");
     commitUsage(turnUsage, model);
@@ -893,28 +1465,83 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
     if (calls.length === 0) {
       if (finishReason === "tool") throw new ComponentExecutionError("TOOL_CALL_MISSING", "Provider stopped for a Tool call without returning one");
       completed = true;
+      await saveTurnCheckpoint(turn + 1, true);
       break;
     }
     if (modelTools.length === 0) throw new ComponentExecutionError("TOOL_NOT_CONNECTED", "Provider attempted to call a Tool but none are connected");
     if (turn === maxTurns) throw new ComponentExecutionError("AGENT_TURN_LIMIT", `Agent exceeded ${maxTurns} model turns`);
     messages.push({ role: "assistant", content: text, toolCalls: calls });
+    const deferredControlMessages: ModelMessage[] = [];
+    const siblingResults = [...(resumedPending ? restoredTurn?.siblingResults ?? [] : [])];
+    const inFlightCalls = [...(resumedPending ? restoredTurn?.inFlightCalls ?? [] : [])];
+    await saveTurnCheckpoint(turn, false, { pendingCalls: calls, pendingAssistantText: text, siblingResults, inFlightCalls });
     for (const call of calls) {
+      const completedSibling = siblingResults.find((result) => result.callId === call.id);
+      if (completedSibling) {
+        messages.push({
+          role: "tool",
+          toolCallId: call.id,
+          name: call.name,
+          content: completedSibling.ok ? asText(completedSibling.output) : JSON.stringify({ error: completedSibling.error }),
+        });
+        continue;
+      }
       toolCalls += 1;
       if (toolCalls > maxToolCalls) throw new ComponentExecutionError("AGENT_TOOL_CALL_LIMIT", `Agent exceeded ${maxToolCalls} Tool calls`);
       const binding = names.get(call.name);
       if (!binding) throw new ComponentExecutionError("TOOL_NOT_CONNECTED", `Tool '${call.name}' is not connected to this Agent`);
       const validateInput = new Ajv2020({ allErrors: true, strict: false }).compile(binding.inputSchema);
-      const inputError = validateInput(call.input) ? undefined
+      const superseded = await applyControlUpdates(deferredControlMessages);
+      const inputError = superseded ? `Tool '${binding.id}' was superseded by a newer instruction or plan revision`
+        : validateInput(call.input) ? undefined
         : `Tool '${binding.id}' input is invalid: ${new Ajv2020().errorsText(validateInput.errors)}`;
       const risk = binding.risk ?? "external";
+      let recoverySkip = false;
+      if (resumedPending && risk !== "read" && inFlightCalls.includes(call.id)) {
+        if (!context.requestInteraction) throw new ComponentExecutionError(
+          "TOOL_RECOVERY_REQUIRED",
+          `Tool '${binding.id}' may have completed before the last durable checkpoint`,
+        );
+        const recovery = await context.requestInteraction({
+          id: `recovery_${context.nodeId}_${context.iteration}_${call.id}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128),
+          nodeId: context.nodeId,
+          kind: "select",
+          requester: { kind: binding.source === "mcp" ? "mcp" : "tool", id: binding.id },
+          title: "Tool completion unknown",
+          message: `Tool '${binding.label}' may already have completed. Retry only after checking its external state.`,
+          blocking: "run",
+          schema: { type: "string", enum: ["retry", "mark_completed"] },
+          data: {
+            reason: "recovery_required",
+            toolId: binding.id,
+            callId: call.id,
+            risk,
+            input: boundedSnapshot(context.redact(call.input), 16_384),
+          },
+        });
+        if (recovery.action !== "submit") throw new ComponentExecutionError("TOOL_RECOVERY_CANCELLED", "Tool recovery was cancelled");
+        if (recovery.value === "mark_completed") recoverySkip = true;
+        else if (recovery.value !== "retry") throw new ComponentExecutionError("TOOL_RECOVERY_INVALID", "Tool recovery choice is invalid");
+      }
       context.emit({ type: "tool-call", tool: binding.id, input: call.input, callId: call.id, turn, risk });
-      const decision: ToolApprovalDecision = inputError
+      if (risk !== "read") await saveTurnCheckpoint(turn, false, { pendingCalls: calls, pendingAssistantText: text, siblingResults });
+      const decision: ToolApprovalDecision = recoverySkip
+        ? { approved: true, source: "user", reason: "User confirmed the prior Tool completion" }
+        : inputError
         ? { approved: false, source: "policy", reason: inputError }
+        : controlToolIds.has(binding.id)
+          ? { approved: true, source: "policy", reason: "Harnest orchestration control" }
         : await approveToolCall(binding, call.input, call.id, turn, context);
+      if (!inputError && decision.approved && !recoverySkip && risk !== "read" && !inFlightCalls.includes(call.id)) {
+        inFlightCalls.push(call.id);
+        await saveTurnCheckpoint(turn, false, { pendingCalls: calls, pendingAssistantText: text, siblingResults, inFlightCalls });
+      }
       const started = performance.now();
       let result: unknown;
       let error = inputError;
-      if (!error && !decision.approved) {
+      if (recoverySkip) {
+        result = "[Tool completion confirmed by user; prior output is unavailable]";
+      } else if (!error && !decision.approved) {
         error = asText(context.redact(decision.reason ?? "Tool execution was denied"));
       } else if (!error) {
         const timeoutSignal = AbortSignal.timeout(toolTimeoutMs);
@@ -922,7 +1549,16 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         const executionContext = { ...serviceContext(context), signal };
         try {
           signal.throwIfAborted();
-          if (binding.source === "skill") {
+          if (controlToolIds.has(binding.id)) {
+            if (!context.agentControl) throw new Error(`Orchestration Tool '${binding.id}' is unavailable`);
+            const controlled = await context.agentControl.execute(binding.id, call.input);
+            result = controlled.value;
+            if (controlled.usage) usage = sumUsage(usage, controlled.usage);
+            if (controlled.usageKnown === false) usageKnown = false;
+            costUsd += controlled.costUsd ?? 0;
+            if (controlled.costKnown === false) costKnown = false;
+            if (controlled.finishReason && controlled.finishReason !== "unknown") finishReason = controlled.finishReason;
+          } else if (binding.source === "skill") {
             const resourcePath = asRecord(call.input)?.path;
             if (typeof resourcePath !== "string" || !binding.action || !context.services.loadSkillResource) {
               throw new Error(`Skill resource Tool '${binding.id}' is unavailable`);
@@ -963,13 +1599,19 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         type: "tool-result",
         tool: binding.id,
         ok: error === undefined,
-        ...(error === undefined ? { output: result } : { error }),
+        ...(error === undefined ? { output: binding.id === "harnest.request_interaction" && asRecord(result)
+          ? {
+              interactionId: asRecord(result)?.interactionId,
+              action: asRecord(result)?.action,
+              ...(asRecord(result)?.permission ? { permission: asRecord(result)?.permission } : {}),
+            }
+          : result } : { error }),
         durationMs: performance.now() - started,
         callId: call.id,
         turn,
       });
       if (error && !recoverToolErrors) throw new ComponentExecutionError(
-        inputError ? "TOOL_INPUT_INVALID" : decision.approved ? "TOOL_CALL_FAILED" : "TOOL_APPROVAL_DENIED",
+        superseded ? "TOOL_CALL_SUPERSEDED" : inputError ? "TOOL_INPUT_INVALID" : decision.approved ? "TOOL_CALL_FAILED" : "TOOL_APPROVAL_DENIED",
         error,
       );
       messages.push({
@@ -978,7 +1620,28 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
         name: call.name,
         content: error === undefined ? asText(result) : JSON.stringify({ error }),
       });
+      const evidence = workingState.recentToolEvidence ??= [];
+      evidence.push(error === undefined
+        ? { tool: binding.id, result: boundedSnapshot(result, 16_384) }
+        : { tool: binding.id, error });
+      if (evidence.length > 8) evidence.splice(0, evidence.length - 8);
+      siblingResults.push({
+        callId: call.id,
+        name: call.name,
+        tool: binding.id,
+        ok: error === undefined,
+        ...(error === undefined ? { output: boundedSnapshot(result, 262_144) } : { error }),
+      });
+      const inFlightIndex = inFlightCalls.indexOf(call.id);
+      if (inFlightIndex >= 0) inFlightCalls.splice(inFlightIndex, 1);
+      await saveTurnCheckpoint(turn, false, { pendingCalls: calls, pendingAssistantText: text, siblingResults, inFlightCalls });
     }
+    messages.push(...deferredControlMessages);
+    await applyControlUpdates();
+    if (compactAtTokens !== undefined && Math.ceil(messageBytes(messages) / 4) >= compactAtTokens) {
+      compactMessages(turn);
+    }
+    await saveTurnCheckpoint(turn + 1);
   }
   if (!completed) throw new ComponentExecutionError("AGENT_TURN_LIMIT", `Agent exceeded ${maxTurns} model turns`);
   const totalTokens = usage.totalTokens ?? (usage.inputTokens !== undefined && usage.outputTokens !== undefined
@@ -1019,7 +1682,8 @@ const outputExecutor: ComponentExecutor = (component, inputs) => {
   if (component.config.format === "json" || schema) {
     if (typeof value === "string") {
       try {
-        value = JSON.parse(value) as unknown;
+        const fenced = /^\s*```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/iu.exec(value);
+        value = JSON.parse(fenced?.[1] ?? value) as unknown;
       } catch (cause) {
         throw new ComponentExecutionError("OUTPUT_JSON_INVALID", "Model output is not valid JSON", { cause });
       }
@@ -1037,7 +1701,57 @@ const outputExecutor: ComponentExecutor = (component, inputs) => {
   return { outputs: { value } };
 };
 
+const interactionExecutor: ComponentExecutor = async (component, inputs, context) => {
+  if (!context.requestInteraction) throw new ComponentExecutionError("INTERACTION_UNAVAILABLE", "This runtime cannot pause for interaction");
+  const kind = component.config.kind as InteractionRequest["kind"];
+  const configuredData = asRecord(component.config.data);
+  const response = await context.requestInteraction({
+    id: `interaction_${context.nodeId}_${context.iteration}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128),
+    kind,
+    nodeId: context.nodeId,
+    requester: { kind: "harness", id: context.nodeId },
+    title: asText(component.config.title ?? "Input required"),
+    message: asText(component.config.message ?? "Provide the requested input."),
+    blocking: component.config.blocking === "task" ? "task" : "run",
+    ...(asRecord(component.config.schema) ? { schema: component.config.schema as Readonly<Record<string, unknown>> } : {}),
+    ...((configuredData || inputs.value !== undefined) ? { data: {
+      ...configuredData,
+      ...(inputs.value === undefined ? {} : { value: boundedSnapshot(inputs.value) }),
+    } } : {}),
+  });
+  return {
+    outputs: { value: response.value, response },
+    traceOutput: {
+      interactionId: response.interactionId,
+      action: response.action,
+      ...(response.permission ? { permission: response.permission } : {}),
+    },
+  };
+};
+
 const contextExecutor: ComponentExecutor = async (component, _inputs, context) => {
+  if (component.config.source === "external") {
+    const provider = context.services.providers?.conversation;
+    const conversationId = typeof component.config.conversationId === "string"
+      ? component.config.conversationId : context.session?.id;
+    const contextRef = context.session?.contextRef;
+    if (!provider || (!contextRef && !conversationId)) throw new ComponentExecutionError(
+      "CONTEXT_SERVICE_UNAVAILABLE", "External Context requires a Conversation Provider and opaque context reference",
+    );
+    const loaded = await provider.read({
+      ...(!contextRef && conversationId ? { conversationId } : {}),
+      ...(component.config.revision === undefined ? {} : { revision: component.config.revision as ProviderRevision }),
+      ...(contextRef ? { contextRef } : {}),
+    }, serviceContext(context));
+    const sources = normalizeContextSources(loaded.sources ?? []);
+    const rendered = sources.map((source) =>
+      `[${source.label}] ${source.provenance.title ?? source.provenance.source}\n${source.content}`).join("\n\n");
+    context.emit({ type: "context-use", source: "external", metadata: {
+      revision: loaded.revision,
+      sources: sources.map(({ label, provenance }) => ({ label, provenance })),
+    } });
+    return { outputs: { context: rendered }, traceOutput: { revision: loaded.revision, sourceCount: sources.length } };
+  }
   if (!context.services.loadContext) {
     throw new ComponentExecutionError("CONTEXT_SERVICE_UNAVAILABLE", "This runtime does not provide Context loading");
   }
@@ -1055,6 +1769,32 @@ const contextExecutor: ComponentExecutor = async (component, _inputs, context) =
 };
 
 const memoryExecutor: ComponentExecutor = async (component, inputs, context) => {
+  const provider = context.services.providers?.memory;
+  if (provider) {
+    const namespace = component.config.namespace === "user" || component.config.namespace === "pkm"
+      ? component.config.namespace : "conversation";
+    const operation = component.config.operation;
+    if (operation === "read") {
+      const result = await provider.search({
+        namespace,
+        query: component.config.key,
+        ...(component.config.revision === undefined ? {} : { revision: component.config.revision as ProviderRevision }),
+        ...(context.session?.contextRef ? { contextRef: context.session.contextRef } : {}),
+      }, serviceContext(context));
+      return { outputs: { memory: result.records.map(({ value }) => value) }, traceOutput: {
+        namespace, revision: result.revision, count: result.records.length,
+      } };
+    }
+    const record = await provider.upsert({
+      namespace,
+      id: String(component.config.key),
+      value: inputs.value,
+      provenance: { source: "harnest", sourceId: context.nodeId },
+      ...(component.config.revision === undefined ? {} : { revision: component.config.revision as ProviderRevision }),
+      ...(context.session?.contextRef ? { contextRef: context.session.contextRef } : {}),
+    }, serviceContext(context));
+    return { outputs: { memory: record.value }, traceOutput: { namespace, revision: record.revision, id: record.id } };
+  }
   if (!context.services.accessMemory) {
     throw new ComponentExecutionError("MEMORY_SERVICE_UNAVAILABLE", "This runtime does not provide Memory storage");
   }
@@ -1109,8 +1849,17 @@ async function approveToolCall(
   const risk = binding.risk ?? "external";
   const decision: ToolApprovalDecision = risk === "read"
     ? { approved: true, source: "policy" }
-    : context.services.requestToolApproval
-      ? await promiseWithSignal(Promise.resolve(context.services.requestToolApproval({
+    : context.requestToolApproval
+      ? await promiseWithSignal(Promise.resolve(context.requestToolApproval({
+          runId: context.runId,
+          nodeId: context.nodeId,
+          callId,
+          turn,
+          tool: binding,
+          input,
+        })), context.signal)
+      : context.services.requestToolApproval
+        ? await promiseWithSignal(Promise.resolve(context.services.requestToolApproval({
           runId: context.runId,
           nodeId: context.nodeId,
           callId,
@@ -1118,7 +1867,7 @@ async function approveToolCall(
           tool: binding,
           input,
         }, serviceContext(context))), context.signal)
-      : { approved: false, source: "policy", reason: `Tool risk '${risk}' requires explicit approval` };
+        : { approved: false, source: "policy", reason: `Tool risk '${risk}' requires explicit approval` };
   context.signal.throwIfAborted();
   context.emit({
     type: "tool-approval",
@@ -1130,6 +1879,89 @@ async function approveToolCall(
     ...(decision.reason ? { reason: decision.reason } : {}),
   });
   return decision;
+}
+
+async function directSideEffectRecovery(
+  binding: ToolBinding,
+  input: unknown,
+  callId: string,
+  context: ComponentExecutionContext,
+): Promise<{
+  readonly key?: string;
+  readonly inputDigest?: string;
+  readonly completed?: ComponentExecutionResult;
+}> {
+  if ((binding.risk ?? "external") === "read") return {};
+  if (!context.sideEffectCheckpoint || !context.saveSideEffectCheckpoint) {
+    throw new ComponentExecutionError("TOOL_CHECKPOINT_UNAVAILABLE", `Tool '${binding.id}' requires a durable side-effect checkpoint`);
+  }
+  const key = `${context.nodeId}:${context.iteration}:${callId}`;
+  const inputDigest = await sha256(JSON.stringify(snapshotToolInput(input)) ?? "undefined");
+  const saved = context.sideEffectCheckpoint(key);
+  if (saved && saved.inputDigest !== inputDigest) {
+    throw new ComponentExecutionError("TOOL_CHECKPOINT_CONFLICT", `Tool '${binding.id}' input changed after its durable checkpoint`);
+  }
+  if (saved?.status === "completed") {
+    const result = asRecord(saved.result);
+    if (!result || !asRecord(result.outputs)) throw new ComponentExecutionError(
+      "TOOL_CHECKPOINT_INVALID", `Tool '${binding.id}' completed checkpoint is invalid`,
+    );
+    return { completed: result as unknown as ComponentExecutionResult };
+  }
+  if (saved?.status === "in_flight") {
+    if (!context.requestInteraction) throw new ComponentExecutionError(
+      "TOOL_RECOVERY_REQUIRED", `Tool '${binding.id}' may have completed before the last durable checkpoint`,
+    );
+    const recovery = await context.requestInteraction({
+      id: `recovery_${context.nodeId}_${context.iteration}_${callId}`.replace(/[^A-Za-z0-9_-]/gu, "_").slice(0, 128),
+      nodeId: context.nodeId,
+      kind: "select",
+      requester: { kind: binding.source === "mcp" ? "mcp" : "tool", id: binding.id },
+      title: "Tool completion unknown",
+      message: `Tool '${binding.label}' may already have completed. Retry only after checking its external state.`,
+      blocking: "run",
+      schema: { type: "string", enum: ["retry", "mark_completed"] },
+      data: {
+        reason: "recovery_required",
+        toolId: binding.id,
+        callId,
+        risk: binding.risk ?? "external",
+        input: boundedSnapshot(context.redact(input), 16_384),
+      },
+    });
+    if (recovery.action !== "submit") throw new ComponentExecutionError("TOOL_RECOVERY_CANCELLED", "Tool recovery was cancelled");
+    if (recovery.value === "mark_completed") {
+      const completed: ComponentExecutionResult = {
+        outputs: { result: "[Tool completion confirmed by user; prior output is unavailable]" },
+      };
+      await context.saveSideEffectCheckpoint(key, {
+        nodeId: context.nodeId, iteration: context.iteration, inputDigest, status: "completed", result: completed,
+      });
+      return { completed };
+    }
+    if (recovery.value !== "retry") throw new ComponentExecutionError("TOOL_RECOVERY_INVALID", "Tool recovery choice is invalid");
+  }
+  return { key, inputDigest };
+}
+
+async function checkpointDirectSideEffect(
+  recovery: { readonly key?: string; readonly inputDigest?: string },
+  status: "in_flight" | "completed",
+  context: ComponentExecutionContext,
+  result?: ComponentExecutionResult,
+): Promise<void> {
+  if (!recovery.key || !recovery.inputDigest || !context.saveSideEffectCheckpoint) return;
+  const savedResult = result === undefined ? undefined : boundedSnapshot(result, 1_048_576);
+  if (result !== undefined && (!asRecord(savedResult) || !asRecord(asRecord(savedResult)?.outputs))) {
+    throw new ComponentExecutionError("TOOL_RESULT_CHECKPOINT_LIMIT", "Tool result is too large or non-serializable for safe recovery");
+  }
+  await context.saveSideEffectCheckpoint(recovery.key, {
+    nodeId: context.nodeId,
+    iteration: context.iteration,
+    inputDigest: recovery.inputDigest,
+    status,
+    ...(savedResult === undefined ? {} : { result: savedResult }),
+  });
 }
 
 const localToolExecutor: ComponentExecutor = async (component, inputs, context) => {
@@ -1150,6 +1982,9 @@ const localToolExecutor: ComponentExecutor = async (component, inputs, context) 
   const started = performance.now();
   const callId = `${context.nodeId}:${context.iteration}:local`;
   const binding: ToolBinding = { ...tool, risk: tool.risk ?? "external" };
+  assertAgentToolCapability(context, binding);
+  const recovery = await directSideEffectRecovery(binding, toolInput, callId, context);
+  if (recovery.completed) return recovery.completed;
   context.emit({ type: "tool-call", tool: tool.id, input: toolInput, callId, turn: 1, risk: binding.risk ?? "external" });
   const decision = await approveToolCall(binding, toolInput, callId, 1, context);
   if (!decision.approved) {
@@ -1158,10 +1993,13 @@ const localToolExecutor: ComponentExecutor = async (component, inputs, context) 
     throw new ComponentExecutionError("TOOL_APPROVAL_DENIED", message);
   }
   try {
+    await checkpointDirectSideEffect(recovery, "in_flight", context);
     const output = await tool.execute(toolInput, serviceContext(context));
     const safeOutput = context.redact(output);
+    const completed = { outputs: { result: safeOutput } } satisfies ComponentExecutionResult;
+    await checkpointDirectSideEffect(recovery, "completed", context, completed);
     context.emit({ type: "tool-result", tool: tool.id, callId, turn: 1, ok: true, output: safeOutput, durationMs: performance.now() - started });
-    return { outputs: { result: safeOutput } };
+    return completed;
   } catch (cause) {
     const message = asText(context.redact(cause instanceof Error ? cause.message : "Tool call failed"));
     context.emit({ type: "tool-result", tool: tool.id, callId, turn: 1, ok: false, error: message, durationMs: performance.now() - started });
@@ -1188,6 +2026,9 @@ const mcpToolExecutor: ComponentExecutor = async (component, inputs, context) =>
     source: "mcp",
     ...(connectionId ? { connectionId, action } : {}),
   };
+  assertAgentToolCapability(context, binding);
+  const recovery = await directSideEffectRecovery(binding, toolInput, callId, context);
+  if (recovery.completed) return recovery.completed;
   context.emit({ type: "tool-call", tool, input: toolInput, callId, turn: 1, risk: binding.risk ?? "external" });
   const decision = await approveToolCall(binding, toolInput, callId, 1, context);
   if (!decision.approved) {
@@ -1196,14 +2037,17 @@ const mcpToolExecutor: ComponentExecutor = async (component, inputs, context) =>
     throw new ComponentExecutionError("TOOL_APPROVAL_DENIED", message);
   }
   try {
+    await checkpointDirectSideEffect(recovery, "in_flight", context);
     const result = await context.services.callMcpTool(component.config, toolInput, serviceContext(context));
     const safeValue = context.redact(result.value);
-    context.emit({ type: "tool-result", tool, callId, turn: 1, ok: true, output: safeValue, durationMs: performance.now() - started });
-    return {
+    const completed = {
       outputs: { result: safeValue },
       ...(result.state ? { state: result.state } : {}),
       traceOutput: result.metadata ?? { tool, ok: true },
-    };
+    } satisfies ComponentExecutionResult;
+    await checkpointDirectSideEffect(recovery, "completed", context, completed);
+    context.emit({ type: "tool-result", tool, callId, turn: 1, ok: true, output: safeValue, durationMs: performance.now() - started });
+    return completed;
   } catch (cause) {
     const message = asText(context.redact(cause instanceof Error ? cause.message : "MCP Tool call failed"));
     context.emit({ type: "tool-result", tool, callId, turn: 1, ok: false, error: message, durationMs: performance.now() - started });
@@ -1215,6 +2059,47 @@ const routerExecutor: ComponentExecutor = (component, inputs, context) => {
   const predicate = component.config.condition as PredicateSpec;
   const matched = evaluatePredicate(predicate, inputs.value, context.state, context.runInput);
   return { outputs: { [matched ? "true" : "false"]: inputs.value }, traceOutput: { branch: matched ? "true" : "false" } };
+};
+
+const classifierExecutor: ComponentExecutor = async (component, inputs, context) => {
+  const routes = Array.isArray(component.config.routes)
+    ? component.config.routes.filter((route): route is string => typeof route === "string") : [];
+  const fallback = typeof component.config.fallback === "string" ? component.config.fallback : routes[0];
+  if (!fallback || !routes.includes(fallback)) throw new ComponentExecutionError("CLASSIFIER_INVALID", "Classifier fallback must be one of its routes");
+  const value = inputs.value ?? context.runInput;
+  const prompt = typeof inputs.prompt === "string" && inputs.prompt.trim()
+    ? `${inputs.prompt}\n\nInput to classify:\n${asText(value)}`
+    : `Classify the user request into exactly one route: ${routes.join(", ")}. Return JSON only.\n\nInput:\n${asText(value)}`;
+  const responseSchema = {
+    type: "object",
+    properties: {
+      route: { type: "string", enum: routes },
+      confidence: { type: "number", minimum: 0, maximum: 1 },
+    },
+    required: ["route", "confidence"],
+    additionalProperties: false,
+  } as const;
+  const classified = await agentExecutor(
+    { id: component.id, type: "agent", config: { maxTurns: 1, maxToolCalls: 1, multimodal: false } },
+    { model: inputs.model, prompt },
+    { ...context, responseSchema },
+  );
+  let decision: Record<string, unknown> | undefined;
+  try {
+    decision = asRecord(JSON.parse(asText(classified.outputs.response)));
+  } catch {
+    decision = undefined;
+  }
+  const confidence = typeof decision?.confidence === "number" ? decision.confidence : 0;
+  const minimum = typeof component.config.minConfidence === "number" ? component.config.minConfidence : 0;
+  const route = typeof decision?.route === "string" && routes.includes(decision.route) && confidence >= minimum
+    ? decision.route : fallback;
+  const normalized = { route, confidence, fallback: route === fallback && decision?.route !== fallback, value };
+  return {
+    ...classified,
+    outputs: { value, route, decision: normalized },
+    traceOutput: normalized,
+  };
 };
 
 function evaluatorResult(component: ComponentSpec, value: unknown, context: ComponentExecutionContext) {
@@ -1280,6 +2165,13 @@ const subgraphExecutor: ComponentExecutor = async (component, inputs, context) =
   };
 };
 
+const teamExecutor: ComponentExecutor = async (component, inputs, context) => {
+  const name = component.config.team;
+  if (typeof name !== "string") throw new ComponentExecutionError("TEAM_INVALID", "Team requires config.team");
+  const result = await context.runTeam(name, inputs.value ?? context.runInput);
+  return { ...result, outputs: { value: result.outputs.value } };
+};
+
 const loopExecutor: ComponentExecutor = async (component, inputs, context) => {
   const name = component.config.subgraph;
   const maxIterations = component.config.maxIterations;
@@ -1289,6 +2181,12 @@ const loopExecutor: ComponentExecutor = async (component, inputs, context) => {
   const timeout = typeof component.config.timeoutMs === "number" ? AbortSignal.timeout(component.config.timeoutMs) : undefined;
   const signal = timeout ? AbortSignal.any([context.signal, timeout]) : context.signal;
   let value = inputs.value ?? context.runInput;
+  const checkpoint = component.config.checkpoint === "structured";
+  const initialCheckpoint = checkpoint ? asRecord(value) : undefined;
+  const immutableCheckpoint = initialCheckpoint ? Object.fromEntries(
+    ["originalRequest", "objective", "plan"].flatMap((key) => Object.hasOwn(initialCheckpoint, key)
+      ? [[key, structuredClone(initialCheckpoint[key])]] : []),
+  ) : {};
   let state = { ...context.state };
   let usage: TokenUsage = {};
   let usageKnown = true;
@@ -1308,7 +2206,16 @@ const loopExecutor: ComponentExecutor = async (component, inputs, context) => {
       }
       throw cause;
     }
-    value = result.outputs.value;
+    const nextValue = result.outputs.value;
+    value = component.config.carry === "merge"
+      && asRecord(value) && asRecord(nextValue)
+      ? { ...asRecord(value), ...asRecord(nextValue) }
+      : nextValue;
+    if (checkpoint) {
+      const record = asRecord(value);
+      if (!record) throw new ComponentExecutionError("LOOP_CHECKPOINT_INVALID", "Structured Loop iterations must return an object checkpoint");
+      value = { ...record, ...immutableCheckpoint };
+    }
     state = { ...state, ...result.state };
     usage = sumUsage(usage, result.usage ?? {});
     if (result.usageKnown === false
@@ -1334,6 +2241,18 @@ const loopExecutor: ComponentExecutor = async (component, inputs, context) => {
     const conditionValue = Object.hasOwn(result.outputs, "evaluation") ? result.outputs : value;
     if (component.config.until !== undefined
       && evaluatePredicate(component.config.until as PredicateSpec, conditionValue, state, context.runInput)) {
+      if (checkpoint) {
+        const completed = asRecord(value);
+        const validation = asRecord(completed?.validation);
+        if (completed?.status !== "complete" || validation?.passed !== true
+          || !Array.isArray(completed.remainingWork) || completed.remainingWork.length !== 0
+          || typeof completed.finalAnswer !== "string" || !completed.finalAnswer.trim()) {
+          throw new ComponentExecutionError(
+            "LOOP_COMPLETION_INVALID",
+            "Structured Loop completion requires status=complete, passed validation, no remaining work, and a non-empty final answer",
+          );
+        }
+      }
       exited = true;
       break;
     }
@@ -1498,6 +2417,17 @@ const validateEvaluatorComponent: NonNullable<ComponentDefinition["validate"]> =
   return diagnostics;
 };
 
+const validateClassifierComponent: NonNullable<ComponentDefinition["validate"]> = (component, context) => {
+  const routes = Array.isArray(component.config.routes)
+    ? component.config.routes.filter((route): route is string => typeof route === "string") : [];
+  return typeof component.config.fallback === "string" && routes.includes(component.config.fallback) ? [] : [componentDiagnostic(
+    "CLASSIFIER_FALLBACK_INVALID",
+    `${context.path}.config.fallback`,
+    "Classifier fallback must be one of its routes",
+    component.id,
+  )];
+};
+
 const predicateJsonSchema = {
   type: "object",
   properties: {
@@ -1519,17 +2449,30 @@ const definitions: readonly ComponentDefinition[] = [
       adapter: { type: "string", minLength: 1 }, model: { type: "string", minLength: 1 }, apiKey: { type: "string" },
       baseUrl: { type: "string", format: "uri" }, temperature: { type: "number", minimum: 0, maximum: 2 },
       maxTokens: { type: "integer", minimum: 1 }, inputCostPerMillion: { type: "number", minimum: 0 },
-      outputCostPerMillion: { type: "number", minimum: 0 },
+      outputCostPerMillion: { type: "number", minimum: 0 }, contextWindowTokens: { type: "integer", minimum: 1 },
+      cacheDialect: { enum: ["auto", "native", "none"] },
+      cachedInputCostPerMillion: { type: "number", minimum: 0 },
+      cacheWriteCostPerMillion: { type: "number", minimum: 0 },
+      cacheStorageCostPerMillionHour: { type: "number", minimum: 0 },
     }),
     inspector: [
       { path: "connectionId", label: "Provider connection", control: "text" },
+      { path: "fallbackConnectionId", label: "Fallback Provider connection", control: "text" },
       { path: "adapter", label: "Adapter", control: "text" },
       { path: "model", label: "Model", control: "text" },
       { path: "apiKey", label: "API key reference", control: "text" },
+      { path: "baseUrl", label: "Custom endpoint", control: "text" },
       { path: "temperature", label: "Temperature", control: "number" },
       { path: "maxTokens", label: "Max tokens", control: "number" },
+      { path: "contextWindowTokens", label: "Context window tokens", control: "number" },
+      { path: "cacheDialect", label: "Prompt cache dialect", control: "select", options: [
+        { label: "Automatic", value: "auto" }, { label: "Provider native", value: "native" }, { label: "Disabled", value: "none" },
+      ] },
       { path: "inputCostPerMillion", label: "Input $ / 1M", control: "number" },
       { path: "outputCostPerMillion", label: "Output $ / 1M", control: "number" },
+      { path: "cachedInputCostPerMillion", label: "Cached input $ / 1M", control: "number" },
+      { path: "cacheWriteCostPerMillion", label: "Cache write $ / 1M", control: "number" },
+      { path: "cacheStorageCostPerMillionHour", label: "Cache storage $ / 1M / hour", control: "number" },
     ],
     defaultConfig: { adapter: "ollama", model: "llama3.2" }, retrySafe: true, validate: validateModelComponent, execute: modelExecutor,
   },
@@ -1558,6 +2501,8 @@ const definitions: readonly ComponentDefinition[] = [
       system: { type: "string" }, timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
       maxTurns: { type: "integer", minimum: 1, maximum: 32 }, maxToolCalls: { type: "integer", minimum: 1, maximum: 128 },
       toolTimeoutMs: { type: "integer", minimum: 1, maximum: 600000 }, toolError: { enum: ["model", "fail"] },
+      compactAtTokens: { type: "integer", minimum: 256, maximum: 1000000 },
+      multimodal: { type: "boolean" },
       maxTokens: { type: "integer", minimum: 1 }, maxCostUsd: { type: "number", exclusiveMinimum: 0 },
       allowTools: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true },
       denyTools: { type: "array", items: { type: "string", minLength: 1 }, uniqueItems: true },
@@ -1568,6 +2513,8 @@ const definitions: readonly ComponentDefinition[] = [
       { path: "maxTurns", label: "Max model turns", control: "number" },
       { path: "maxToolCalls", label: "Max Tool calls", control: "number" },
       { path: "toolTimeoutMs", label: "Tool timeout (ms)", control: "number" },
+      { path: "compactAtTokens", label: "Compact context at tokens", control: "number" },
+      { path: "multimodal", label: "Send supported media directly to the model", control: "checkbox" },
       { path: "maxTokens", label: "Agent token limit", control: "number" },
       { path: "maxCostUsd", label: "Agent cost limit ($)", control: "number" },
       { path: "allowTools", label: "Allowed Tools", control: "json" },
@@ -1576,7 +2523,7 @@ const definitions: readonly ComponentDefinition[] = [
         { label: "Return error to model", value: "model" }, { label: "Fail run", value: "fail" },
       ] },
     ],
-    defaultConfig: { maxTurns: 8, maxToolCalls: 32, toolTimeoutMs: 30000, toolError: "model" }, retrySafe: true,
+    defaultConfig: { maxTurns: 8, maxToolCalls: 32, toolTimeoutMs: 30000, toolError: "model", multimodal: true }, retrySafe: true,
     traceInputs: (inputs) => ({
       model: asRecord(inputs.model) ? { adapter: asRecord(inputs.model)?.adapter, model: asRecord(inputs.model)?.model } : undefined,
       prompt: inputs.prompt,
@@ -1587,6 +2534,30 @@ const definitions: readonly ComponentDefinition[] = [
       toolResultCount: values(inputs.toolResults).length,
     }),
     execute: agentExecutor,
+  },
+  {
+    type: "interaction", label: "Interaction", category: "Flow", description: "Pauses for host or user input",
+    ports: { inputs: { value: { type: "any", maxConnections: 1 } }, outputs: { value: { type: "any" }, response: { type: "any" } } },
+    configSchema: objectSchema({
+      kind: { enum: ["select", "input", "form", "file", "oauth", "permission"] },
+      title: { type: "string", minLength: 1 }, message: { type: "string", minLength: 1 },
+      blocking: { enum: ["task", "run"] }, schema: { type: "object" }, data: { type: "object" },
+    }, ["kind", "title", "message"]),
+    inspector: [
+      { path: "kind", label: "Interaction kind", control: "select", required: true, options: [
+        { label: "Input", value: "input" }, { label: "Select", value: "select" }, { label: "Form", value: "form" },
+        { label: "File", value: "file" }, { label: "OAuth", value: "oauth" }, { label: "Permission", value: "permission" },
+      ] },
+      { path: "title", label: "Title", control: "text", required: true },
+      { path: "message", label: "Message", control: "textarea", required: true },
+      { path: "blocking", label: "Blocking scope", control: "select", options: [
+        { label: "Run", value: "run" }, { label: "Task", value: "task" },
+      ] },
+      { path: "schema", label: "Response schema", control: "json" },
+      { path: "data", label: "Host data", control: "json" },
+    ],
+    defaultConfig: { kind: "input", title: "Input required", message: "Provide the requested input.", blocking: "run" },
+    execute: interactionExecutor,
   },
   {
     type: "output", label: "Output", category: "Output", description: "Final text or JSON Schema boundary",
@@ -1602,16 +2573,21 @@ const definitions: readonly ComponentDefinition[] = [
     type: "context", label: "Context", category: "Knowledge", description: "Static text, file, or directory context",
     ports: { inputs: {}, outputs: { context: { type: "context" } } },
     configSchema: objectSchema({
-      source: { enum: ["text", "file", "directory"] }, text: { type: "string" }, path: { type: "string" },
+      source: { enum: ["text", "file", "directory", "external"] }, text: { type: "string" }, path: { type: "string" },
+      conversationId: { type: "string", minLength: 1 }, revision: { anyOf: [{ type: "string" }, { type: "number" }] },
       pattern: { type: "string" }, topK: { type: "integer", minimum: 1, maximum: 100 },
       maxBytes: { type: "integer", minimum: 1, maximum: 10000000 },
     }, ["source"]),
     inspector: [
       { path: "source", label: "Source", control: "select", required: true, options: [
         { label: "Static text", value: "text" }, { label: "File", value: "file" }, { label: "Directory", value: "directory" },
+        { label: "External provider", value: "external" },
       ] },
       { path: "text", label: "Text", control: "textarea" }, { path: "path", label: "Path", control: "text" },
+      { path: "conversationId", label: "Conversation id", control: "text" },
+      { path: "revision", label: "Provider revision", control: "text" },
       { path: "pattern", label: "File pattern", control: "text" }, { path: "topK", label: "Top K", control: "number" },
+      { path: "maxBytes", label: "Maximum context bytes", control: "number" },
     ],
     defaultConfig: { source: "text", text: "" }, retrySafe: true, validate: validateContextComponent, execute: contextExecutor,
   },
@@ -1620,13 +2596,18 @@ const definitions: readonly ComponentDefinition[] = [
     ports: { inputs: { value: { type: "any", maxConnections: 1 } }, outputs: { memory: { type: "memory" } } },
     configSchema: objectSchema({
       key: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_.-]*$" },
-      operation: { enum: ["read", "write", "append"] }, initial: {},
+      operation: { enum: ["read", "write", "append"] }, namespace: { enum: ["user", "conversation", "pkm"] },
+      revision: { anyOf: [{ type: "string" }, { type: "number" }] }, initial: {},
     }, ["key", "operation"]),
     inspector: [
       { path: "key", label: "Key", control: "text", required: true },
       { path: "operation", label: "Operation", control: "select", required: true, options: [
         { label: "Read", value: "read" }, { label: "Write", value: "write" }, { label: "Append", value: "append" },
       ] },
+      { path: "namespace", label: "Namespace", control: "select", options: [
+        { label: "Conversation", value: "conversation" }, { label: "User", value: "user" }, { label: "PKM", value: "pkm" },
+      ] },
+      { path: "revision", label: "Provider revision", control: "text" },
       { path: "initial", label: "Initial value", control: "json" },
     ],
     defaultConfig: { key: "conversation", operation: "read" }, execute: memoryExecutor,
@@ -1643,6 +2624,12 @@ const definitions: readonly ComponentDefinition[] = [
       { path: "tool", label: "Tool", control: "text", required: true },
       { path: "connectionId", label: "Connection", control: "text" },
       { path: "action", label: "Action", control: "text" },
+      { path: "label", label: "Display name", control: "text" },
+      { path: "description", label: "Description", control: "textarea" },
+      { path: "source", label: "Source", control: "select", options: [
+        { label: "Built-in", value: "builtin" }, { label: "Module", value: "module" },
+        { label: "Custom", value: "custom" }, { label: "MCP", value: "mcp" }, { label: "Skill", value: "skill" },
+      ] },
       { path: "risk", label: "Risk", control: "select", options: [
         { label: "Read", value: "read" }, { label: "Write", value: "write" },
         { label: "External transfer", value: "external" }, { label: "Destructive", value: "destructive" },
@@ -1698,6 +2685,31 @@ const definitions: readonly ComponentDefinition[] = [
     defaultConfig: { condition: { op: "truthy" } }, retrySafe: true, execute: routerExecutor,
   },
   {
+    type: "classifier", label: "Intent Classifier", category: "Flow", description: "Classifies a request into one structured route",
+    ports: {
+      inputs: {
+        model: { type: "model", required: true, maxConnections: 1 },
+        prompt: { type: "prompt", maxConnections: 1 },
+        value: { type: "any", maxConnections: 1 },
+      },
+      outputs: { value: { type: "any" }, route: { type: "text" }, decision: { type: "any" } },
+    },
+    configSchema: objectSchema({
+      routes: { type: "array", minItems: 1, maxItems: 32, uniqueItems: true, items: { type: "string", minLength: 1 } },
+      fallback: { type: "string", minLength: 1 },
+      minConfidence: { type: "number", minimum: 0, maximum: 1 },
+    }, ["routes", "fallback"]),
+    inspector: [
+      { path: "routes", label: "Routes", control: "json", required: true },
+      { path: "fallback", label: "Fallback route", control: "text", required: true },
+      { path: "minConfidence", label: "Minimum confidence", control: "number" },
+    ],
+    defaultConfig: { routes: ["direct", "team"], fallback: "team", minConfidence: 0.5 },
+    retrySafe: true,
+    validate: validateClassifierComponent,
+    execute: classifierExecutor,
+  },
+  {
     type: "evaluator", label: "Evaluator", category: "Evaluation", description: "Evaluates output, tools, latency, or iterations",
     ports: { inputs: { value: { type: "any", required: true, maxConnections: 1 } }, outputs: { value: { type: "any" }, evaluation: { type: "evaluation" } } },
     configSchema: objectSchema({
@@ -1715,6 +2727,8 @@ const definitions: readonly ComponentDefinition[] = [
       ] },
       { path: "value", label: "Expected value", control: "json" }, { path: "schema", label: "JSON Schema", control: "json" },
       { path: "tool", label: "Tool", control: "text" }, { path: "maxMs", label: "Max latency (ms)", control: "number" },
+      { path: "minCalls", label: "Minimum Tool calls", control: "number" },
+      { path: "maxCalls", label: "Maximum Tool calls", control: "number" },
       { path: "min", label: "Min iterations", control: "number" }, { path: "max", label: "Max iterations", control: "number" },
     ],
     defaultConfig: { type: "includes", value: "" }, retrySafe: true, validate: validateEvaluatorComponent, execute: evaluatorExecutor,
@@ -1741,16 +2755,32 @@ const definitions: readonly ComponentDefinition[] = [
     defaultConfig: { subgraph: "" }, execute: subgraphExecutor,
   },
   {
+    type: "team", label: "Agent Team", category: "Flow", description: "Runs a bounded dynamic Team from HarnessSpec v0.3",
+    ports: { inputs: { value: { type: "any", maxConnections: 1 } }, outputs: { value: { type: "any" } } },
+    configSchema: objectSchema({ team: { type: "string", minLength: 1 } }, ["team"]),
+    inspector: [{ path: "team", label: "Team", control: "text", required: true }],
+    defaultConfig: { team: "" },
+    execute: teamExecutor,
+  },
+  {
     type: "loop", label: "Loop", category: "Flow", description: "Runs a subgraph with mandatory bounds",
     ports: { inputs: { value: { type: "any", maxConnections: 1 } }, outputs: { value: { type: "any" } } },
     configSchema: objectSchema({
       subgraph: { type: "string", minLength: 1 }, maxIterations: { type: "integer", minimum: 1, maximum: 1000 },
+      carry: { enum: ["replace", "merge"] },
+      checkpoint: { enum: ["structured"] },
       until: predicateJsonSchema, timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
       maxTokens: { type: "integer", minimum: 1 }, maxCostUsd: { type: "number", exclusiveMinimum: 0 },
     }, ["subgraph", "maxIterations"]),
     inspector: [
       { path: "subgraph", label: "Subgraph", control: "text", required: true },
       { path: "maxIterations", label: "Max iterations", control: "number", required: true },
+      { path: "carry", label: "Iteration state", control: "select", options: [
+        { label: "Replace", value: "replace" }, { label: "Merge object fields", value: "merge" },
+      ] },
+      { path: "checkpoint", label: "Completion state", control: "select", options: [
+        { label: "Structured agent checkpoint", value: "structured" },
+      ] },
       { path: "until", label: "Exit condition", control: "json" }, { path: "timeoutMs", label: "Timeout (ms)", control: "number" },
       { path: "maxTokens", label: "Token limit", control: "number" }, { path: "maxCostUsd", label: "Cost limit ($)", control: "number" },
     ],

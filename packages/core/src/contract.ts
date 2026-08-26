@@ -45,7 +45,7 @@ const number = (value: unknown) => typeof value === "number" && Number.isFinite(
 export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
   const graphs = [
     { name: "root", components: spec.components, connections: spec.connections },
-    ...(spec.version === "0.2" ? Object.entries(spec.subgraphs ?? {}).map(([name, graph]) => ({ name, ...graph })) : []),
+    ...(spec.version !== "0.1" ? Object.entries(spec.subgraphs ?? {}).map(([name, graph]) => ({ name, ...graph })) : []),
   ];
   const components = graphs.flatMap((graph) => graph.components.map((component) => ({
     graph: graph.name,
@@ -95,14 +95,16 @@ export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
   }
   if (tools.some(({ tool }) => tool === "builtin.web-search")) capabilities.add("web-search");
   if (hasType("mcp-tool") || tools.some(({ source }) => source === "mcp")) capabilities.add("mcp");
+  if (hasType("classifier")) capabilities.add("intent-routing");
+  if (hasType("team")) capabilities.add("dynamic-multi-agent");
 
   const assertions = (spec.tests ?? []).flatMap((test): readonly HarnessAssertion[] =>
     "assertions" in test && test.assertions ? test.assertions : test.assertion ? [test.assertion] : []);
   const requiredConnections = [...new Set(components.flatMap(({ config }) =>
     [text(config.connectionId), text(config.fallbackConnectionId)].filter((value): value is string => Boolean(value))))].sort();
   const outputComponent = components.find(({ graph, component }) => graph === "root" && component.id === spec.entrypoint && component.type === "output");
-  const retry = spec.version === "0.2" ? spec.runtime?.retry : undefined;
-  const budget = spec.version === "0.2" ? spec.runtime?.budget : undefined;
+  const retry = spec.version !== "0.1" ? spec.runtime?.retry : undefined;
+  const budget = spec.version !== "0.1" ? spec.runtime?.budget : undefined;
   const timeoutMs = number(spec.runtime?.timeoutMs);
   const retryAttempts = number(retry?.maxAttempts);
   const maxTokens = number(budget?.maxTokens);

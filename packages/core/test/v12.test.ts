@@ -83,6 +83,178 @@ describe("v1.2 Agent Tool loop", () => {
     expect(graph).toEqual(snapshot);
   });
 
+  it("replays all retained conversation messages when callers do not opt into legacy caps", async () => {
+    const requests: ModelRequest[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run(request) {
+        requests.push(request);
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const messages = Array.from({ length: 26 }, (_, index) => ({
+      role: index % 2 ? "assistant" as const : "user" as const,
+      content: `message-${index}-${"x".repeat(3_000)}`,
+    }));
+    await new HarnessRuntime(spec(), new AdapterRegistry().register(adapter)).invoke("current", {
+      session: { id: "long-session", messages },
+    });
+
+    expect(requests[0]?.messages).toHaveLength(27);
+    expect(requests[0]?.messages[0]).toEqual(messages[0]);
+    expect(requests[0]?.messages[25]).toEqual(messages[25]);
+    expect(JSON.stringify(requests[0]?.messages).length).toBeGreaterThan(65_536);
+  });
+
+  it("uses a stable scoped prompt-cache key and invalidates it when the stable prefix changes", async () => {
+    const keys: string[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true, promptCaching: ["automatic"] },
+      async *run(request) {
+        if (request.promptCache) keys.push(request.promptCache.key);
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const graph = spec();
+    const agent = graph.components.find(({ id }) => id === "agent");
+    if (!agent) throw new Error("Agent fixture is missing");
+    agent.config = { ...agent.config, system: "stable instructions" };
+    const registry = new AdapterRegistry().register(adapter);
+    await new HarnessRuntime(graph, registry).invoke("first", { session: { id: "same-session", messages: [] } });
+    await new HarnessRuntime(graph, registry).invoke("second", {
+      session: { id: "same-session", messages: [{ role: "user", content: "first" }, { role: "assistant", content: "done" }] },
+    });
+    const changed = structuredClone(graph);
+    const changedAgent = changed.components.find(({ id }) => id === "agent");
+    if (!changedAgent) throw new Error("Agent fixture is missing");
+    changedAgent.config = { ...changedAgent.config, system: "changed instructions" };
+    await new HarnessRuntime(changed, registry).invoke("third", { session: { id: "same-session", messages: [] } });
+
+    expect(keys).toHaveLength(3);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[2]).not.toBe(keys[0]);
+    expect(keys.every((key) => /^[a-f0-9]{64}$/u.test(key))).toBe(true);
+  });
+
+  it("compacts and retries a Provider context overflow only before streamed output", async () => {
+    const requests: ModelRequest[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run(request) {
+        requests.push(structuredClone(request));
+        if (requests.length === 1) throw new AdapterError("context is too long", {
+          adapterId: "scripted",
+          code: "context_overflow",
+        });
+        yield { type: "text-delta", text: "recovered" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const result = await new HarnessRuntime(spec(), new AdapterRegistry().register(adapter)).invoke("finish", {
+      session: {
+        messages: Array.from({ length: 24 }, (_, index) => ({
+          role: index % 2 ? "assistant" as const : "user" as const,
+          content: `${index}-${"large".repeat(1_000)}`,
+        })),
+      },
+    });
+    expect(result.output).toBe("recovered");
+    expect(requests).toHaveLength(2);
+    expect(result.trace).toContainEqual(expect.objectContaining({ type: "context-compaction", turn: 1 }));
+
+    let streamedAttempts = 0;
+    const partial: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run() {
+        streamedAttempts += 1;
+        yield { type: "text-delta", text: "partial" };
+        throw new AdapterError("context is too long", { adapterId: "scripted", code: "context_overflow" });
+      },
+    };
+    await expect(new HarnessRuntime(spec(), new AdapterRegistry().register(partial)).invoke("finish"))
+      .rejects.toMatchObject({ code: "context_overflow" });
+    expect(streamedAttempts).toBe(1);
+  });
+
+  it("negotiates supported media and reads selected bytes only through RuntimeServices", async () => {
+    const requests: ModelRequest[] = [];
+    let reads = 0;
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true, inputMedia: ["image"] },
+      async *run(request) {
+        requests.push(request);
+        yield { type: "text-delta", text: "image read" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const services: RuntimeServices = {
+      readAttachment(attachment) {
+        reads += 1;
+        expect(attachment.sandboxPath).toBe("/mnt/data/image.png");
+        return new Uint8Array([1, 2, 3]);
+      },
+    };
+    const result = await new HarnessRuntime(spec(), new AdapterRegistry().register(adapter), { services }).invoke("describe", {
+      session: { attachments: [{ id: "image_1", name: "image.png", mimeType: "image/png", size: 3, sandboxPath: "/mnt/data/image.png" }] },
+    });
+    expect(result.output).toBe("image read");
+    expect(reads).toBe(1);
+    expect(requests[0]?.messages.find((message) => Array.isArray(message.content)
+      && message.content.some((part) => part.type === "media"))).toMatchObject({
+      role: "user",
+      content: [
+        { type: "text", text: expect.stringMatching(/analyze it directly.*do not call File or Code Runner/) },
+        { type: "media", mimeType: "image/png", data: "AQID", name: "image.png" },
+      ],
+    });
+  });
+
+  it("includes external UTF-8 text attachments directly in model context", async () => {
+    const requests: ModelRequest[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run(request) {
+        requests.push(request);
+        yield { type: "text-delta", text: "ORBIT-742" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    await new HarnessRuntime(spec(), new AdapterRegistry().register(adapter), {
+      services: { readAttachment: () => new TextEncoder().encode("ORBIT-742") },
+    }).invoke("read it", {
+      session: { attachments: [{ id: "file_1", ref: "external", name: "context.txt", mimeType: "text/plain", size: 9 }] },
+    });
+    expect(requests[0]?.messages).toContainEqual(expect.objectContaining({
+      role: "system", content: expect.stringContaining("[Attachment: context.txt]\nORBIT-742"),
+    }));
+  });
+
+  it("rejects unsupported direct media before invoking a model when no file Tool is connected", async () => {
+    let invoked = false;
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true },
+      async *run() {
+        invoked = true;
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    await expect(new HarnessRuntime(spec(), new AdapterRegistry().register(adapter), {
+      services: { readAttachment: () => new Uint8Array([1]) },
+    }).invoke("describe", {
+      session: { attachments: [{ id: "image_1", name: "image.png", mimeType: "image/png", size: 1, sandboxPath: "/mnt/data/image.png" }] },
+    })).rejects.toThrow("cannot receive image attachment");
+    expect(invoked).toBe(false);
+  });
+
   it("routes provider requests through the host outbound boundary", async () => {
     let fetchCalls = 0;
     const adapter: ModelAdapter = {
@@ -353,6 +525,59 @@ describe("v1.2 Agent Tool loop", () => {
       expect.objectContaining({ type: "tool-approval", tool: "sum", approved: true, source: "policy" }),
       expect.objectContaining({ type: "tool-result", tool: "sum", ok: true, output: 5, callId: "call-1", turn: 1 }),
     ]));
+  });
+
+  it("compacts long Tool conversations while preserving structured working state", async () => {
+    const requests: ModelRequest[] = [];
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true, tools: true },
+      async *run(request) {
+        requests.push(structuredClone(request));
+        if (requests.length === 1) {
+          yield { type: "tool-call", call: { id: "large-1", name: "large", input: {} } };
+          yield { type: "finish", reason: "tool" };
+          return;
+        }
+        const internal = request.messages.find((message) => message.role === "user"
+          && typeof message.content === "string"
+          && message.content.startsWith("Harnest internal compacted working state"));
+        expect(internal?.content).toContain('"originalRequest":"preserve this goal"');
+        expect(internal?.content).toContain('"plan":["inspect","verify"]');
+        expect(request.messages.some((message) => message.role === "tool")).toBe(false);
+        yield { type: "text-delta", text: "user-facing answer" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const tools = new ToolRegistry().register({
+      id: "large", label: "Large evidence", description: "Returns bounded evidence", risk: "read",
+      inputSchema: { type: "object", additionalProperties: false }, execute: () => "e".repeat(100_000),
+    });
+    const graph = spec(
+      [{ id: "largeTool", type: "tool", config: { tool: "large" } }],
+      [{ from: { component: "largeTool", port: "tool" }, to: { component: "agent", port: "tools" } }],
+    );
+    const agent = graph.components.find(({ id }) => id === "agent");
+    if (!agent) throw new Error("Agent fixture is missing");
+    agent.config = { ...agent.config, compactAtTokens: 256 };
+
+    const result = await new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools }).invoke({
+      originalRequest: "preserve this goal",
+      plan: ["inspect", "verify"],
+      currentResult: "",
+      validation: { passed: false },
+      remainingWork: ["verify"],
+    });
+    expect(result.output).toBe("user-facing answer");
+    expect(JSON.stringify(result.output)).not.toContain("compacted working state");
+    expect(result.trace).toContainEqual(expect.objectContaining({
+      type: "context-compaction",
+      preserved: expect.arrayContaining(["originalRequest", "plan", "remainingWork", "recentToolEvidence"]),
+      turn: 1,
+    }));
+    const compaction = result.trace.find((event) => event.type === "context-compaction");
+    if (!compaction || compaction.type !== "context-compaction") throw new Error("Context was not compacted");
+    expect(compaction.afterBytes).toBeLessThan(compaction.beforeBytes);
   });
 
   it("returns invalid Tool input to the Provider so the next turn can repair it", async () => {
@@ -658,6 +883,35 @@ describe("v1.2 Agent Tool loop", () => {
     await expect(new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools }).invoke("run"))
       .resolves.toMatchObject({ output: "done" });
     expect(called).toEqual(["foo.bar"]);
+  });
+
+  it("accepts a provider-normalized alias for one connected hyphenated Tool", async () => {
+    let called = 0;
+    const tools = new ToolRegistry().register({
+      id: "dash-tool", label: "Dash", description: "Dash tool", risk: "read",
+      inputSchema: { type: "object", additionalProperties: false },
+      execute() { called += 1; return "ok"; },
+    });
+    let turn = 0;
+    const adapter: ModelAdapter = {
+      id: "scripted", capabilities: { streaming: true, json: false, cancellation: true, tools: true },
+      async *run() {
+        if (turn++ === 0) {
+          yield { type: "tool-call", call: { id: "alias", name: "dash_tool", input: {} } };
+          yield { type: "finish", reason: "tool" };
+          return;
+        }
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const graph = spec(
+      [{ id: "dash", type: "tool", config: { tool: "dash-tool" } }],
+      [{ from: { component: "dash", port: "tool" }, to: { component: "agent", port: "tools" } }],
+    );
+    await expect(new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools }).invoke("run"))
+      .resolves.toMatchObject({ output: "done" });
+    expect(called).toBe(1);
   });
 
   it("rejects a provider call outside the connected allowlist", async () => {

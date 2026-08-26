@@ -1,5 +1,5 @@
-import type { Diagnostic, HarnessSpec } from "@harnest/core";
-import type { NodeRuntimeServiceOptions } from "@harnest/core/node";
+import type { Diagnostic, HarnessSpec } from "@harnestai/core";
+import type { NodeRuntimeServiceOptions } from "@harnestai/core/node";
 
 export interface StudioCapabilityPolicy {
   readonly allowModules: boolean;
@@ -27,12 +27,12 @@ export function studioCapabilityPolicy(
 
 const allComponents = (spec: HarnessSpec) => [
   ...spec.components,
-  ...(spec.version === "0.2" ? Object.values(spec.subgraphs ?? {}).flatMap((graph) => graph.components) : []),
+  ...(spec.version !== "0.1" ? Object.values(spec.subgraphs ?? {}).flatMap((graph) => graph.components) : []),
 ];
 
 const configuredComponents = (spec: HarnessSpec) => [
   ...spec.components.map((component, index) => ({ component, path: `$.components[${index}]` })),
-  ...(spec.version === "0.2" ? Object.entries(spec.subgraphs ?? {}).flatMap(([name, graph]) =>
+  ...(spec.version !== "0.1" ? Object.entries(spec.subgraphs ?? {}).flatMap(([name, graph]) =>
     graph.components.map((component, index) => ({ component, path: `$.subgraphs.${name}.components[${index}]` }))) : []),
 ];
 
@@ -78,7 +78,7 @@ export function hostCapabilityDiagnosticsFor(
     "Studio host module execution is disabled",
     "Restart the Studio host with HARNEST_ALLOW_MODULES=1 after reviewing the project",
   ));
-  if (spec.version === "0.2" && (spec.runtime?.modules?.length ?? 0) > 0 && !policy.allowModules) diagnostics.push(capabilityDiagnostic(
+  if (spec.version !== "0.1" && (spec.runtime?.modules?.length ?? 0) > 0 && !policy.allowModules) diagnostics.push(capabilityDiagnostic(
     "RUNTIME_MODULE_EXECUTION_DISABLED",
     "$.runtime.modules",
     "Studio host runtime module execution is disabled",
