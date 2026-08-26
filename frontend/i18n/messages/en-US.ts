@@ -201,6 +201,7 @@ export const enUS = {
   "builder.status.new": "New harness — add a component to begin",
   "builder.status.hostIssues": "{count} host capability or module issues",
   "builder.status.valid": "Runtime valid — ready to run",
+  "builder.status.compiled": "Runtime compiled — {nodeCount} node(s), {layerCount} layer(s), entrypoint {entrypoint}",
   "builder.status.validating": "Validating harness and installed adapters…",
   "builder.status.saving": "Saving harnest.yaml…",
   "builder.status.saved": "Saved harnest.yaml",

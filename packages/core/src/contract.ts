@@ -5,7 +5,7 @@ export type HarnessPlanSummary = {
   readonly edgeCount: number;
   readonly layerCount: number;
   readonly entrypoint: string;
-  readonly sourceVersion: "0.1" | "0.2";
+  readonly sourceVersion: "0.1" | "0.2" | "0.3";
   readonly timeoutMs?: number;
 };
 

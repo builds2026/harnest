@@ -1592,7 +1592,7 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
     dispatch({ type: "validation-start" });
     setStatusNote(t("builder.status.validating"));
     try {
-      const payload = await requestJson<{ ok: boolean; diagnostics: Diagnostic[]; catalog?: ComponentManifest[] }>("/api/validate", {
+      const payload = await requestJson<{ ok: boolean; diagnostics: Diagnostic[]; catalog?: ComponentManifest[]; plan?: { nodeCount: number; layerCount: number; entrypoint: string } }>("/api/validate", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ yaml: stringifySpec(draftToSpec(document.draft)) }),
@@ -1603,7 +1603,9 @@ function StudioReady({ initial }: { initial: SpecPayload }) {
         dispatch({ type: "set-catalog", catalog: payload.catalog });
       }
       if (!payload.ok) setActiveDock("problems");
-      setStatusNote(payload.ok ? t("builder.status.valid") : t("save.issues", { count: payload.diagnostics.length }));
+      setStatusNote(payload.ok && payload.plan
+        ? t("builder.status.compiled", payload.plan)
+        : payload.ok ? t("builder.status.valid") : t("save.issues", { count: payload.diagnostics.length }));
     } catch (error) {
       const diagnostic: Diagnostic = { code: "VALIDATE_REQUEST", path: "$", message: apiErrorMessage(error, t("builder.validationFailed"), t), severity: "error" };
       dispatch({ type: "validation-result", semanticRevision, diagnostics: [diagnostic] });

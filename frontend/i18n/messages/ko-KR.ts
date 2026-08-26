@@ -203,6 +203,7 @@ export const koKR = {
   "builder.status.new": "새 하네스 — 첫 컴포넌트를 추가하세요",
   "builder.status.hostIssues": "호스트 기능 또는 모듈 문제 {count}개",
   "builder.status.valid": "런타임 검증 완료 — 실행할 수 있습니다",
+  "builder.status.compiled": "런타임 컴파일 완료 — 노드 {nodeCount}개, 레이어 {layerCount}개, 진입점 {entrypoint}",
   "builder.status.validating": "하네스와 설치된 어댑터를 검증하는 중…",
   "builder.status.saving": "harnest.yaml 저장 중…",
   "builder.status.saved": "harnest.yaml 저장됨",
