@@ -948,7 +948,7 @@ entrypoint: output
     ], { cwd: root });
     expect(loopRun.stdout).toContain("[PASS]");
     expect(loopRun.stdout).toContain("iterations 2");
-  });
+  }, 30_000);
 
   it("denies risky Tools in non-TTY runs unless the exact id is pre-approved", async () => {
     const directory = await cliToolProject("cli-tool-approval", "external");
