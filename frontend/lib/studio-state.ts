@@ -7,6 +7,8 @@ import {
   type Diagnostic,
   type GraphBody,
   type HarnessSpec,
+  type AgentTemplateSpec,
+  type TeamSpec,
 } from "@harnestai/core/browser";
 import type { Edge, Node } from "@xyflow/react";
 import { catalogMap, validationRegistryFor } from "./component-catalog";
@@ -94,6 +96,34 @@ export interface HarnessDraft {
   layout?: HarnessGraphLayout;
 }
 
+export function replaceConnectionReferences(draft: HarnessDraft, fromId: string, toId: string): HarnessDraft {
+  const replaceNode = (node: HarnessNode): HarnessNode => {
+    const config = node.data.component.config as Record<string, unknown>;
+    if (config.connectionId !== fromId && config.fallbackConnectionId !== fromId) return node;
+    const nextConfig = {
+      ...config,
+      connectionId: config.connectionId === fromId ? toId : config.connectionId,
+      fallbackConnectionId: config.fallbackConnectionId === fromId ? toId : config.fallbackConnectionId,
+    };
+    if (nextConfig.fallbackConnectionId === nextConfig.connectionId) delete nextConfig.fallbackConnectionId;
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        component: { ...node.data.component, config: nextConfig } as HarnessComponent,
+      },
+    };
+  };
+  return {
+    ...draft,
+    nodes: draft.nodes.map(replaceNode),
+    subgraphs: Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [name, {
+      ...graph,
+      nodes: graph.nodes.map(replaceNode),
+    }])),
+  };
+}
+
 export type ValidationPhase =
   | "local-valid"
   | "local-invalid"
@@ -149,6 +179,311 @@ const MAX_HISTORY = 100;
 const edgeId = (connection: HarnessConnection, index: number) =>
   connection.id ??
   `${connection.from.component}:${connection.from.port}->${connection.to.component}:${connection.to.port}:${index}`;
+
+const draftId = /^[A-Za-z][A-Za-z0-9_-]*$/u;
+const recordValue = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+
+const assertDraftId = (value: string) => {
+  if (!draftId.test(value) || value.length > 64) throw new Error("INVALID_DRAFT_ID");
+};
+
+export function renameDraftComponent(draft: HarnessDraft, fromId: string, toId: string): HarnessDraft {
+  assertDraftId(toId);
+  if (!draft.nodes.some(({ id }) => id === fromId)) throw new Error("COMPONENT_NOT_FOUND");
+  if (fromId !== toId && draft.nodes.some(({ id }) => id === toId)) throw new Error("COMPONENT_ID_COLLISION");
+  if (fromId === toId) return draft;
+  const nodes = draft.nodes.map((node) => node.id === fromId ? {
+    ...node,
+    id: toId,
+    data: { ...node.data, component: { ...node.data.component, id: toId } as HarnessComponent },
+  } : node);
+  const edges = draft.edges.map((edge, index) => {
+    const connection = edge.data?.connection;
+    const nextConnection = connection ? {
+      ...connection,
+      from: { ...connection.from, component: connection.from.component === fromId ? toId : connection.from.component },
+      to: { ...connection.to, component: connection.to.component === fromId ? toId : connection.to.component },
+    } as HarnessConnection : undefined;
+    return {
+      ...edge,
+      id: nextConnection && !nextConnection.id ? edgeId(nextConnection, index) : edge.id,
+      source: edge.source === fromId ? toId : edge.source,
+      target: edge.target === fromId ? toId : edge.target,
+      ...(nextConnection ? { data: { ...edge.data, connection: nextConnection } } : {}),
+    };
+  });
+  const pinned = draft.layout?.pinned?.map((id) => id === fromId ? toId : id);
+  return {
+    ...draft,
+    root: { ...draft.root, entrypoint: draft.root.entrypoint === fromId ? toId : draft.root.entrypoint },
+    nodes,
+    edges,
+    ...(draft.layout ? { layout: { ...draft.layout, ...(pinned ? { pinned: [...new Set(pinned)] } : {}) } } : {}),
+  };
+}
+
+const mapSubgraphReference = (node: HarnessNode, fromName: string, toName: string): HarnessNode => {
+  if (node.data.component.type !== "subgraph" && node.data.component.type !== "loop") return node;
+  const config = node.data.component.config as Record<string, unknown>;
+  const keys = ["subgraph", "ref", "name"].filter((key) => config[key] === fromName);
+  if (!keys.length) return node;
+  const nextConfig = { ...config };
+  for (const key of keys) nextConfig[key] = toName;
+  return { ...node, data: { ...node.data, component: { ...node.data.component, config: nextConfig } as HarnessComponent } };
+};
+
+const renameAgentTemplateReferences = (root: HarnessRoot, fromName: string, toName: string): HarnessRoot => {
+  const templates = recordValue(root.agentTemplates);
+  if (!templates) return root;
+  let changed = false;
+  const next = Object.fromEntries(Object.entries(templates).map(([id, value]) => {
+    const template = recordValue(value);
+    const runner = recordValue(template?.runner);
+    if (!template || !runner || runner.subgraph !== fromName) return [id, value];
+    changed = true;
+    return [id, { ...template, runner: { ...runner, subgraph: toName } }];
+  }));
+  return changed ? { ...root, agentTemplates: next } : root;
+};
+
+export interface SubgraphReferenceSummary {
+  readonly components: number;
+  readonly agentTemplates: number;
+  readonly teams: number;
+}
+
+export function subgraphReferenceSummary(draft: HarnessDraft, name: string): SubgraphReferenceSummary {
+  const nodes = [draft.nodes, ...Object.values(draft.subgraphs).map(({ nodes: graphNodes }) => graphNodes)].flat();
+  const components = nodes.filter((node) => (node.data.component.type === "subgraph" || node.data.component.type === "loop")
+    && ["subgraph", "ref", "name"].some((key) => (node.data.component.config as Record<string, unknown>)[key] === name)).length;
+  const templates = recordValue(draft.root.agentTemplates) ?? {};
+  const removedTemplates = new Set(Object.entries(templates).flatMap(([id, value]) =>
+    recordValue(recordValue(value)?.runner)?.subgraph === name ? [id] : []));
+  const teams = recordValue(draft.root.teams) ?? {};
+  const affectedTeams = Object.values(teams).filter((value) => {
+    const team = recordValue(value);
+    return Boolean(team && (removedTemplates.has(String(team.orchestrator))
+      || (Array.isArray(team.members) && team.members.some((id) => removedTemplates.has(String(id))))));
+  }).length;
+  return { components, agentTemplates: removedTemplates.size, teams: affectedTeams };
+}
+
+export function renameDraftSubgraph(draft: HarnessDraft, fromName: string, toName: string): HarnessDraft {
+  assertDraftId(toName);
+  if (!draft.subgraphs[fromName]) throw new Error("SUBGRAPH_NOT_FOUND");
+  if (fromName !== toName && draft.subgraphs[toName]) throw new Error("SUBGRAPH_ID_COLLISION");
+  if (fromName === toName) return draft;
+  const renameNodes = (nodes: HarnessNode[]) => nodes.map((node) => mapSubgraphReference(node, fromName, toName));
+  const subgraphs = Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [
+    name === fromName ? toName : name,
+    { ...graph, nodes: renameNodes(graph.nodes) },
+  ]));
+  return {
+    ...draft,
+    root: renameAgentTemplateReferences(draft.root, fromName, toName),
+    nodes: renameNodes(draft.nodes),
+    subgraphs,
+  };
+}
+
+const removeSubgraphComponents = <Graph extends { entrypoint: string; nodes: HarnessNode[]; edges: HarnessEdge[]; layout?: HarnessGraphLayout }>(
+  graph: Graph,
+  name: string,
+): Graph => {
+  const removed = new Set(graph.nodes.filter((node) => (node.data.component.type === "subgraph" || node.data.component.type === "loop")
+    && ["subgraph", "ref", "name"].some((key) => (node.data.component.config as Record<string, unknown>)[key] === name)).map(({ id }) => id));
+  if (!removed.size) return graph;
+  const nodes = graph.nodes.filter(({ id }) => !removed.has(id));
+  const pinned = graph.layout?.pinned?.filter((id) => !removed.has(id));
+  return {
+    ...graph,
+    entrypoint: removed.has(graph.entrypoint) ? nodes[0]?.id ?? "" : graph.entrypoint,
+    nodes,
+    edges: graph.edges.filter((edge) => !removed.has(edge.source) && !removed.has(edge.target)),
+    ...(graph.layout ? { layout: { ...graph.layout, ...(pinned?.length ? { pinned } : { pinned: undefined }) } } : {}),
+  };
+};
+
+const removeAgentTemplateReferences = (root: HarnessRoot, subgraphName: string): HarnessRoot => {
+  const templates = recordValue(root.agentTemplates);
+  if (!templates) return root;
+  const removed = new Set(Object.entries(templates).flatMap(([id, value]) =>
+    recordValue(recordValue(value)?.runner)?.subgraph === subgraphName ? [id] : []));
+  if (!removed.size) return root;
+  const nextTemplates = Object.fromEntries(Object.entries(templates).filter(([id]) => !removed.has(id)));
+  const teams = recordValue(root.teams);
+  const nextTeams = teams ? Object.fromEntries(Object.entries(teams).flatMap(([id, value]) => {
+    const team = recordValue(value);
+    if (!team || removed.has(String(team.orchestrator))) return [];
+    const members = Array.isArray(team.members) ? team.members.filter((member) => !removed.has(String(member))) : [];
+    return members.length ? [[id, { ...team, members }]] : [];
+  })) : undefined;
+  return {
+    ...root,
+    ...(Object.keys(nextTemplates).length ? { agentTemplates: nextTemplates } : { agentTemplates: undefined }),
+    ...(nextTeams && Object.keys(nextTeams).length ? { teams: nextTeams } : teams ? { teams: undefined } : {}),
+  };
+};
+
+export function deleteDraftSubgraph(draft: HarnessDraft, name: string): HarnessDraft {
+  if (!draft.subgraphs[name]) throw new Error("SUBGRAPH_NOT_FOUND");
+  const rootGraph = removeSubgraphComponents({
+    entrypoint: draft.root.entrypoint,
+    nodes: draft.nodes,
+    edges: draft.edges,
+    layout: draft.layout,
+  }, name);
+  return {
+    ...draft,
+    root: { ...removeAgentTemplateReferences(draft.root, name), entrypoint: rootGraph.entrypoint },
+    nodes: rootGraph.nodes,
+    edges: rootGraph.edges,
+    ...(rootGraph.layout ? { layout: rootGraph.layout } : {}),
+    subgraphs: Object.fromEntries(Object.entries(draft.subgraphs).flatMap(([graphName, graph]) => graphName === name
+      ? []
+      : [[graphName, removeSubgraphComponents(graph, name)]])),
+  };
+}
+
+const definitions = <Value>(value: unknown) => recordValue(value) as Record<string, Value> | undefined;
+
+const validateAgentTemplate = (draft: HarnessDraft, template: AgentTemplateSpec) => {
+  if (!template.description.trim() || template.description.length > 2_000) throw new Error("AGENT_TEMPLATE_INVALID");
+  if (template.capabilities && (template.capabilities.length > 32 || template.capabilities.some((value) => !value || value.length > 128))) {
+    throw new Error("AGENT_TEMPLATE_INVALID");
+  }
+  if ("subgraph" in template.runner && !draft.subgraphs[template.runner.subgraph]) throw new Error("AGENT_TEMPLATE_SUBGRAPH_MISSING");
+  if ("a2a" in template.runner && (!template.runner.a2a.connection || template.runner.a2a.connection.length > 128)) throw new Error("AGENT_TEMPLATE_INVALID");
+};
+
+export function upsertAgentTemplate(
+  draft: HarnessDraft,
+  previousId: string | undefined,
+  id: string,
+  template: AgentTemplateSpec,
+): HarnessDraft {
+  if (draft.root.version !== "0.3") throw new Error("DEFINITIONS_REQUIRE_V03");
+  assertDraftId(id);
+  validateAgentTemplate(draft, template);
+  const current = definitions<AgentTemplateSpec>(draft.root.agentTemplates) ?? {};
+  if (id !== previousId && current[id]) throw new Error("AGENT_TEMPLATE_ID_COLLISION");
+  if (previousId && !current[previousId]) throw new Error("AGENT_TEMPLATE_NOT_FOUND");
+  const next = { ...current };
+  if (previousId && previousId !== id) delete next[previousId];
+  next[id] = {
+    ...template,
+    description: template.description.trim(),
+    ...(template.capabilities?.length ? { capabilities: [...new Set(template.capabilities.map((value) => value.trim()).filter(Boolean))] } : { capabilities: undefined }),
+  };
+  const teams = definitions<TeamSpec>(draft.root.teams);
+  const renamedTeams = previousId && previousId !== id && teams ? Object.fromEntries(Object.entries(teams).map(([name, team]) => [name, {
+    ...team,
+    orchestrator: team.orchestrator === previousId ? id : team.orchestrator,
+    members: team.members.map((member) => member === previousId ? id : member),
+  }])) : teams;
+  return { ...draft, root: { ...draft.root, agentTemplates: next, ...(renamedTeams ? { teams: renamedTeams } : {}) } };
+}
+
+const removeTeamComponents = (draft: HarnessDraft, removedTeams: ReadonlySet<string>): HarnessDraft => {
+  const remove = <Graph extends { entrypoint: string; nodes: HarnessNode[]; edges: HarnessEdge[]; layout?: HarnessGraphLayout }>(graph: Graph): Graph => {
+    const removed = new Set(graph.nodes.filter((node) => node.data.component.type === "team"
+      && removedTeams.has(String((node.data.component.config as Record<string, unknown>).team))).map(({ id }) => id));
+    if (!removed.size) return graph;
+    const nodes = graph.nodes.filter(({ id }) => !removed.has(id));
+    const pinned = graph.layout?.pinned?.filter((id) => !removed.has(id));
+    return {
+      ...graph,
+      entrypoint: removed.has(graph.entrypoint) ? nodes[0]?.id ?? "" : graph.entrypoint,
+      nodes,
+      edges: graph.edges.filter((edge) => !removed.has(edge.source) && !removed.has(edge.target)),
+      ...(graph.layout ? { layout: { ...graph.layout, ...(pinned?.length ? { pinned } : { pinned: undefined }) } } : {}),
+    };
+  };
+  const root = remove({ entrypoint: draft.root.entrypoint, nodes: draft.nodes, edges: draft.edges, layout: draft.layout });
+  return {
+    ...draft,
+    root: { ...draft.root, entrypoint: root.entrypoint },
+    nodes: root.nodes,
+    edges: root.edges,
+    ...(root.layout ? { layout: root.layout } : {}),
+    subgraphs: Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [name, remove(graph)])),
+  };
+};
+
+export function deleteAgentTemplate(draft: HarnessDraft, id: string): HarnessDraft {
+  const templates = definitions<AgentTemplateSpec>(draft.root.agentTemplates) ?? {};
+  if (!templates[id]) throw new Error("AGENT_TEMPLATE_NOT_FOUND");
+  const nextTemplates = Object.fromEntries(Object.entries(templates).filter(([name]) => name !== id));
+  const teams = definitions<TeamSpec>(draft.root.teams) ?? {};
+  const removedTeams = new Set<string>();
+  const nextTeams = Object.fromEntries(Object.entries(teams).flatMap(([name, team]) => {
+    if (team.orchestrator === id) {
+      removedTeams.add(name);
+      return [];
+    }
+    const members = team.members.filter((member) => member !== id);
+    if (!members.length) {
+      removedTeams.add(name);
+      return [];
+    }
+    return [[name, { ...team, members }]];
+  }));
+  return removeTeamComponents({
+    ...draft,
+    root: {
+      ...draft.root,
+      ...(Object.keys(nextTemplates).length ? { agentTemplates: nextTemplates } : { agentTemplates: undefined }),
+      ...(Object.keys(nextTeams).length ? { teams: nextTeams } : { teams: undefined }),
+    },
+  }, removedTeams);
+}
+
+const limitRanges: Readonly<Record<string, readonly [number, number]>> = {
+  maxInstances: [1, 64], maxDepth: [1, 8], maxParallel: [1, 16], maxMessages: [1, 1_000], maxPlanRevisions: [1, 100],
+};
+
+const validateTeam = (draft: HarnessDraft, team: TeamSpec) => {
+  const templates = definitions<AgentTemplateSpec>(draft.root.agentTemplates) ?? {};
+  if (!templates[team.orchestrator] || !team.members.length || team.members.length > 32
+    || team.members.some((member) => !templates[member]) || new Set(team.members).size !== team.members.length) throw new Error("TEAM_REFERENCE_INVALID");
+  for (const [key, value] of Object.entries(team.limits ?? {})) {
+    const range = limitRanges[key];
+    if (!range || !Number.isInteger(value) || value < range[0] || value > range[1]) throw new Error("TEAM_LIMIT_INVALID");
+  }
+};
+
+export function upsertTeam(draft: HarnessDraft, previousId: string | undefined, id: string, team: TeamSpec): HarnessDraft {
+  if (draft.root.version !== "0.3") throw new Error("DEFINITIONS_REQUIRE_V03");
+  assertDraftId(id);
+  validateTeam(draft, team);
+  const current = definitions<TeamSpec>(draft.root.teams) ?? {};
+  if (id !== previousId && current[id]) throw new Error("TEAM_ID_COLLISION");
+  if (previousId && !current[previousId]) throw new Error("TEAM_NOT_FOUND");
+  const next = { ...current };
+  if (previousId && previousId !== id) delete next[previousId];
+  next[id] = team;
+  const renameNodes = (nodes: HarnessNode[]) => previousId && previousId !== id ? nodes.map((node) => {
+    if (node.data.component.type !== "team" || (node.data.component.config as Record<string, unknown>).team !== previousId) return node;
+    return { ...node, data: { ...node.data, component: { ...node.data.component, config: { ...node.data.component.config, team: id } } as HarnessComponent } };
+  }) : nodes;
+  return {
+    ...draft,
+    root: { ...draft.root, teams: next },
+    nodes: renameNodes(draft.nodes),
+    subgraphs: Object.fromEntries(Object.entries(draft.subgraphs).map(([name, graph]) => [name, { ...graph, nodes: renameNodes(graph.nodes) }])),
+  };
+}
+
+export function deleteTeam(draft: HarnessDraft, id: string): HarnessDraft {
+  const teams = definitions<TeamSpec>(draft.root.teams) ?? {};
+  if (!teams[id]) throw new Error("TEAM_NOT_FOUND");
+  const next = Object.fromEntries(Object.entries(teams).filter(([name]) => name !== id));
+  return removeTeamComponents({
+    ...draft,
+    root: { ...draft.root, ...(Object.keys(next).length ? { teams: next } : { teams: undefined }) },
+  }, new Set([id]));
+}
 
 const unknownManifest = (type: string): ComponentManifest => ({
   type,

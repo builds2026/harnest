@@ -1,13 +1,48 @@
 "use client";
 
 import type { PortDefinition } from "@harnestai/core";
+import { Menu } from "@base-ui/react/menu";
 import { Popover } from "@base-ui/react/popover";
+import { Tooltip } from "@base-ui/react/tooltip";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { memo, useMemo, useRef, useState, type CSSProperties } from "react";
 import { colorFor, componentSummary, glyphFor } from "@/lib/component-catalog";
 import type { CanvasPortAnchor, CanvasPortInsertion, HarnessNode } from "@/lib/studio-state";
 import { componentLabel } from "@/i18n/manifest";
 import { useI18n } from "./i18n-provider";
+
+export type HarnessNodeAction = "configure" | "rename" | "pin" | "unpin" | "delete";
+export type HarnessNodeActionHandler = (nodeId: string, action: HarnessNodeAction) => void;
+
+function NodeMoreMenu({ nodeId, pinned, locked, pinningAvailable, onAction }: {
+  nodeId: string;
+  pinned: boolean;
+  locked: boolean;
+  pinningAvailable: boolean;
+  onAction: HarnessNodeActionHandler;
+}) {
+  const { t } = useI18n();
+  const label = `${t("common.manage")} ${nodeId}`;
+  const item = (action: HarnessNodeAction) => () => onAction(nodeId, action);
+
+  return <Menu.Root>
+    <Tooltip.Root>
+      <Tooltip.Trigger render={<Menu.Trigger className="node-more-trigger nodrag nopan" aria-label={label}>•••</Menu.Trigger>} />
+      <Tooltip.Portal><Tooltip.Positioner className="studio-tooltip-positioner" sideOffset={7}><Tooltip.Popup className="studio-tooltip" role="tooltip">{label}</Tooltip.Popup></Tooltip.Positioner></Tooltip.Portal>
+    </Tooltip.Root>
+    <Menu.Portal>
+      <Menu.Positioner className="studio-menu-positioner" side="bottom" align="end" sideOffset={6} collisionPadding={10}>
+        <Menu.Popup className="studio-menu-popup node-more-popup" aria-label={label}>
+          <Menu.Item className="studio-menu-item node-more-item" onClick={item("configure")}><span aria-hidden="true">⚙</span><strong>{t("builder.inspector")}</strong></Menu.Item>
+          <Menu.Item className="studio-menu-item node-more-item" disabled={locked} onClick={item("rename")}><span aria-hidden="true">✎</span><strong>{t("inspector.rename")}</strong></Menu.Item>
+          {pinningAvailable && <Menu.Item className="studio-menu-item node-more-item" disabled={locked} onClick={item(pinned ? "unpin" : "pin")}><span aria-hidden="true">⌖</span><strong>{t(pinned ? "inspector.unpin" : "inspector.pin")}</strong></Menu.Item>}
+          <Menu.Separator className="node-more-separator" />
+          <Menu.Item className="studio-menu-item node-more-item is-danger" disabled={locked} onClick={item("delete")}><span aria-hidden="true">×</span><strong>{t("inspector.deleteComponent")}</strong></Menu.Item>
+        </Menu.Popup>
+      </Menu.Positioner>
+    </Menu.Portal>
+  </Menu.Root>;
+}
 
 function PortInsertMenu({
   anchor,
@@ -124,6 +159,7 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
   const diagnosticCount = data.diagnostics?.filter((item) => item.severity === "error").length ?? 0;
   const style = { "--node-color": color } as CSSProperties;
   const stateLabel = diagnosticCount ? `${diagnosticCount} validation issue(s)` : runState;
+  const onAction = data.onAction as HarnessNodeActionHandler | undefined;
 
   return (
     <div className={`h-node is-${runState}`} style={style}>
@@ -142,6 +178,7 @@ function HarnessNodeView({ data }: NodeProps<HarnessNode>) {
             role="status"
             aria-label={`${component.id}: ${stateLabel}`}
           />
+          {onAction && <NodeMoreMenu nodeId={component.id} pinned={Boolean(data.pinned)} locked={Boolean(data.locked)} pinningAvailable={data.pinningAvailable === true} onAction={onAction} />}
         </span>
       </div>
       <div className="node-body">

@@ -240,17 +240,17 @@ Tests | Experiments | Trace | Cost | Logs
 
 ### MCP
 
-- `stdio`
-- Streamable HTTP
-- Tool 조회·호출
-- Timeout·재연결
-- Tool별 Agent 권한
+- 외부 Tool 연결을 위한 MCP Client: `stdio`, Streamable HTTP, Tool 조회·호출, Timeout·재연결, Tool별 Agent 권한
+- Harness 설계를 위한 Authoring MCP Server: 문서·Schema·Component/Tool Catalog와 정적 검증 Tool 제공
+- 로컬 Client는 `stdio`, 원격 Client는 `/mcp` Streamable HTTP 사용
 
-완성된 Harness는 MCP Tool로 제공할 수 있다.
+`harnest mcp serve [workspace]`는 Authoring과 정적 검증 전용이다. 완성된 Harness를 runtime MCP Tool로 제공하거나 Model·Tool·Module을 실행하지 않는다. Harness 실행은 CLI `run`, SDK 또는 loopback HTTP `serve`를 사용한다.
 
 ```bash
-harnest mcp serve harnest.yaml
+harnest mcp serve /path/to/workspace
 ```
+
+Authoring 검증 결과의 `setupRequired`에는 사용자가 나중에 설정할 환경 변수명, Connection ID, Adapter, Module이 포함된다. Secret 입력, 원격 HTTPS 배포, TLS, 인증·인가와 tenant 격리는 Host/운영자 책임이다.
 
 ### CLI
 
@@ -318,7 +318,7 @@ support-agent.harnest
 - 비교 실험
 - HTTP API
 - TypeScript SDK
-- Harness MCP Server
+- Authoring MCP Server (문서·Schema·Catalog·정적 검증 전용)
 - OAuth Provider
 
 ### 후순위

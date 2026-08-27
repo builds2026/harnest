@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -123,6 +123,55 @@ describe("Harnest project source model", () => {
     expect(linked).toMatchObject({ ok: false, diagnostics: [expect.objectContaining({ code: "PROJECT_ASSET_LINK" })] });
   });
 
+  it("bounds Harness YAML reads and rejects a symbolic-link Harness file", async () => {
+    const { directory, file } = await project();
+    await writeFile(file, "#".repeat(1_048_577));
+    await expect(loadHarnestProjectSpec(file)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({ code: "FILE_READ", message: expect.stringContaining("exceeds 1048576 bytes") })],
+    });
+
+    const outside = join(await mkdtemp(join(tmpdir(), "harnest-project-outside-")), "harnest.yaml");
+    await saveSpecFile(outside, spec());
+    await rm(file);
+    await symlink(outside, file);
+    await expect(loadHarnestProjectSpec(directory)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({ code: "FILE_READ" })],
+    });
+  });
+
+  it("bounds aggregate project assets before materializing the Harness", async () => {
+    const { directory, file } = await project();
+    const schemas = Array.from({ length: 5 }, (_, index) => `schemas/large-${index}.json`);
+    await mkdir(join(directory, ".harnest", "schemas"), { recursive: true });
+    await writeFile(join(directory, ".harnest", "project.json"), JSON.stringify({
+      version: 1,
+      harness: "harnest.yaml",
+      bindings: schemas.map((path) => ({ kind: "schema", component: "output", path })),
+    }));
+    const largeSchema = JSON.stringify({ description: "x".repeat(3_999_950) });
+    await Promise.all(schemas.map((path) => writeFile(join(directory, ".harnest", path), largeSchema)));
+
+    await expect(loadHarnestProjectSpec(file)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({ code: "PROJECT_MATERIALIZATION_LIMIT" })],
+    });
+  });
+
+  it("rejects a Harness file hard-linked outside its project", async () => {
+    const { directory, file } = await project();
+    const outside = join(await mkdtemp(join(tmpdir(), "harnest-project-outside-")), "harnest.yaml");
+    await rm(file);
+    await saveSpecFile(outside, spec());
+    await link(outside, file);
+
+    await expect(loadHarnestProjectSpec(directory)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({ code: "FILE_READ" })],
+    });
+  });
+
   it("keeps portable sources separate from credentials and runtime state", async () => {
     expect(HarnestProjectManifestSchema.safeParse({
       version: 1,
@@ -140,19 +189,55 @@ describe("Harnest project source model", () => {
     }, { "tool-permissions.json": "{}" })).rejects.toThrow("invalid path");
   });
 
+  it("validates every declared portable include and its descendants", async () => {
+    const { directory, file } = await project();
+    await initializeHarnestProject(file, {
+      version: 1,
+      harness: "harnest.yaml",
+      portable: { include: ["tools", "tools/missing.mjs"] },
+    });
+    await expect(loadHarnestProjectSpec(file)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({
+        code: "PROJECT_ASSET_MISSING",
+        path: "$..harnest.tools/missing.mjs",
+      })],
+    });
+
+    await mkdir(join(directory, ".harnest", "tools", "nested"));
+    await symlink(file, join(directory, ".harnest", "tools", "nested", "linked.yaml"));
+    await writeFile(join(directory, ".harnest", "project.json"), JSON.stringify({
+      version: 1,
+      harness: "harnest.yaml",
+      portable: { include: ["tools"] },
+    }));
+    await expect(loadHarnestProjectSpec(file)).resolves.toMatchObject({
+      ok: false,
+      diagnostics: [expect.objectContaining({ code: "PROJECT_ASSET_LINK" })],
+    });
+  });
+
   it("discovers env references and creates a non-secret example once", async () => {
     const { directory, file } = await project();
     const configured = spec();
     configured.components[0]!.config = {
-      template: "Use env:SEARCH_TOKEN and env:MODEL_KEY without copying their values.",
+      template: "Explain env:NAME and env:SEARCH_TOKEN without treating them as configured values.",
     };
-    expect(projectEnvironmentReferences(configured)).toEqual(["MODEL_KEY", "SEARCH_TOKEN"]);
+    configured.components[1]!.config = {
+      source: "text",
+      text: "Context prose may also explain env:CONTEXT_TOKEN without declaring it.",
+    };
+    configured.components.push({
+      id: "model",
+      type: "model",
+      config: { adapter: "openai", model: "test", apiKey: "env:MODEL_KEY" },
+    });
+    expect(projectEnvironmentReferences(configured)).toEqual(["MODEL_KEY"]);
     expect(await writeProjectEnvExample(file, configured)).toBe(true);
     expect(await writeProjectEnvExample(file, configured)).toBe(false);
     expect(await readFile(join(directory, ".env.example"), "utf8")).toBe([
       "# Copy this file to .env and provide values locally. Never commit .env.",
       "MODEL_KEY=",
-      "SEARCH_TOKEN=",
       "",
     ].join("\n"));
   });

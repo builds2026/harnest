@@ -38,15 +38,14 @@ connections:
       port: value
     select: /finalAnswer
 entrypoint: finalAnswer
-version: "0.2"
+version: "0.3"
 subgraphs:
   planner:
     components:
       - id: model
         type: model
         config:
-          connectionId: connection_246982bec2204792bbcdcab179d0c693
-          fallbackConnectionId: connection_b95c7dbc9bab4f83a37e289f058e0b75
+          connectionId: connection_10e2a78a953a436abb264b8128e4e8cb
           temperature: 0.1
           maxTokens: 2500
       - id: prompt
@@ -79,6 +78,7 @@ subgraphs:
             status는 continue, currentResult와 finalAnswer는 빈 문자열, validation.passed는 false로 초기화한다.
           maxTurns: 2
           maxTokens: 3000
+          multimodal: false
       - id: output
         type: output
         config:
@@ -125,10 +125,9 @@ subgraphs:
       - id: model
         type: model
         config:
-          connectionId: connection_2731128fcaa842d2ad52a278398815f9
-          fallbackConnectionId: connection_b95c7dbc9bab4f83a37e289f058e0b75
           temperature: 0.2
           maxTokens: 6000
+          connectionId: connection_10e2a78a953a436abb264b8128e4e8cb
       - id: prompt
         type: prompt
         config:
@@ -206,7 +205,7 @@ subgraphs:
           toolTimeoutMs: 60000
           timeoutMs: 180000
           maxTokens: 1000000
-          toolError: model
+          toolError: fail
           allowTools:
             - builtin.web-search
             - builtin.web-scrape

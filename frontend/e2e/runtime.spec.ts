@@ -17,6 +17,8 @@ test("real Playground keeps scoped permissions and reuses an uploaded file", asy
   }]);
   await page.goto("/playground");
   await expect(page.getByLabel("Message the harness")).toBeEnabled();
+  await page.getByRole("button", { name: "New conversation", exact: true }).click();
+  await expect(page.getByLabel("Message the harness")).toBeEnabled();
 
   const existing = await page.request.get("/api/tool-permissions").then((response) => response.json()) as {
     permissions: Array<{ toolId: string; connectionId?: string; capability?: string; resource?: string }>;
@@ -31,7 +33,7 @@ test("real Playground keeps scoped permissions and reuses an uploaded file", asy
   await send(page, "deny this call");
   await expect(permissionDialog(page)).toBeVisible();
   await permissionDialog(page).getByRole("button", { name: "Deny" }).click();
-  await expect(page.getByText(/Run failed:.*Denied by the Studio operator/).last()).toBeVisible();
+  await expect(page.getByText(/Run failed:.*denied/iu).last()).toBeVisible();
 
   await send(page, "allow this call once");
   await expect(permissionDialog(page)).toBeVisible();

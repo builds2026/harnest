@@ -13,6 +13,8 @@ export const metadata: Metadata = {
   description: "Design, validate, and run an AI agent harness.",
 };
 
+const themeInitialization = `try{const stored=localStorage.getItem("harnest.studio.theme");document.documentElement.dataset.theme=stored==="light"||stored==="dark"?stored:matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}catch{}`;
+
 export default async function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   const [cookieStore, requestHeaders] = await Promise.all([cookies(), headers()]);
   const locale = resolveLocale(
@@ -21,6 +23,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
   );
   return (
     <html lang={locale} suppressHydrationWarning>
+      <head><script dangerouslySetInnerHTML={{ __html: themeInitialization }} /></head>
       <body><I18nProvider initialLocale={locale}>{children}</I18nProvider></body>
     </html>
   );

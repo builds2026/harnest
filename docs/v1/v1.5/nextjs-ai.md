@@ -1,6 +1,6 @@
 # `nextjs_ai` reference service
 
-The independent app at `/home/louis/Documents/nextjs_ai` demonstrates the production ownership boundary. Next.js authenticates and authorizes every browser request; Supabase owns all product data; a separate Node worker runs Harnest through the protocol and provider bridge.
+The independent app at `/home/louis/Documents/Harnest_root/nextjs_ai` demonstrates the production ownership boundary. Next.js authenticates and authorizes every browser request; Supabase owns all product data; a separate Node worker runs Harnest through the protocol and provider bridge.
 
 ## UI
 

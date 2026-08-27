@@ -4,10 +4,19 @@ import { describe, expect, it } from "vitest";
 import {
   compatiblePortInsertions,
   createDocumentState,
+  deleteAgentTemplate,
+  deleteDraftSubgraph,
+  deleteTeam,
   draftToSpec,
   isEntrypointCandidate,
   parseYamlDraft,
+  renameDraftComponent,
+  renameDraftSubgraph,
+  replaceConnectionReferences,
+  subgraphReferenceSummary,
   studioDocumentReducer,
+  upsertAgentTemplate,
+  upsertTeam,
 } from "./studio-state";
 
 const spec: HarnessSpec = {
@@ -28,6 +37,159 @@ const spec: HarnessSpec = {
 };
 
 describe("Studio document state", () => {
+  it("renames a component and every graph/layout reference without crossing graph scopes", () => {
+    const draft = createDocumentState({
+      version: "0.3",
+      components: [
+        { id: "source", type: "prompt", config: { template: "{{input}}" } },
+        { id: "sink", type: "output", config: {} },
+      ],
+      connections: [{ from: { component: "source", port: "prompt" }, to: { component: "sink", port: "value" } }],
+      entrypoint: "source",
+      subgraphs: {
+        nested: { components: [{ id: "source", type: "prompt", config: { template: "nested" } }], connections: [], entrypoint: "source" },
+      },
+      studio: {
+        positions: { source: { x: 10, y: 20 }, sink: { x: 300, y: 20 } },
+        pinned: ["source"],
+        subgraphs: { nested: { positions: { source: { x: 30, y: 40 } } } },
+      },
+    }, BUILTIN_COMPONENT_MANIFESTS).draft;
+
+    const renamed = renameDraftComponent(draft, "source", "request");
+    expect(renamed.root.entrypoint).toBe("request");
+    expect(renamed.nodes.map(({ id }) => id)).toEqual(["request", "sink"]);
+    expect(renamed.nodes[0]?.data.component.id).toBe("request");
+    expect(renamed.edges[0]).toMatchObject({ source: "request", target: "sink", data: {
+      connection: { from: { component: "request" }, to: { component: "sink" } },
+    } });
+    expect(renamed.layout?.pinned).toEqual(["request"]);
+    expect(renamed.subgraphs.nested.nodes[0]?.id).toBe("source");
+    expect(() => renameDraftComponent(draft, "source", "sink")).toThrow("COMPONENT_ID_COLLISION");
+    expect(() => renameDraftComponent(draft, "source", "bad id")).toThrow("INVALID_DRAFT_ID");
+  });
+
+  it("renames and deletes subgraphs with callers, templates, teams, and layouts kept consistent", () => {
+    const draft = createDocumentState({
+      version: "0.3",
+      components: [
+        { id: "call", type: "subgraph", config: { subgraph: "worker" } },
+        { id: "output", type: "output", config: {} },
+      ],
+      connections: [{ from: { component: "call", port: "value" }, to: { component: "output", port: "value" } }],
+      entrypoint: "call",
+      subgraphs: {
+        worker: { components: [{ id: "workerOutput", type: "output", config: {} }], connections: [], entrypoint: "workerOutput" },
+        nested: {
+          components: [
+            { id: "loop", type: "loop", config: { subgraph: "worker", maxIterations: 2 } },
+            { id: "nestedOutput", type: "output", config: {} },
+          ],
+          connections: [{ from: { component: "loop", port: "value" }, to: { component: "nestedOutput", port: "value" } }],
+          entrypoint: "loop",
+        },
+      },
+      agentTemplates: {
+        workerTemplate: { description: "Worker", runner: { subgraph: "worker" } },
+      },
+      teams: {
+        workerTeam: { orchestrator: "workerTemplate", members: ["workerTemplate"] },
+      },
+      studio: {
+        positions: { call: { x: 10, y: 20 }, output: { x: 300, y: 20 } },
+        pinned: ["call"],
+        subgraphs: {
+          worker: { positions: { workerOutput: { x: 10, y: 20 } }, direction: "DOWN" },
+          nested: { positions: { loop: { x: 10, y: 20 }, nestedOutput: { x: 300, y: 20 } }, pinned: ["loop"] },
+        },
+      },
+    }, BUILTIN_COMPONENT_MANIFESTS).draft;
+
+    expect(subgraphReferenceSummary(draft, "worker")).toEqual({ components: 2, agentTemplates: 1, teams: 1 });
+    const renamed = renameDraftSubgraph(draft, "worker", "review");
+    expect(renamed.subgraphs.review.layout).toMatchObject({ direction: "DOWN" });
+    expect(renamed.subgraphs.worker).toBeUndefined();
+    expect(renamed.nodes[0]?.data.component.config).toMatchObject({ subgraph: "review" });
+    expect(renamed.subgraphs.nested.nodes[0]?.data.component.config).toMatchObject({ subgraph: "review" });
+    expect((renamed.root.agentTemplates as Record<string, { runner: { subgraph: string } }>).workerTemplate.runner.subgraph).toBe("review");
+    expect(() => renameDraftSubgraph(draft, "worker", "nested")).toThrow("SUBGRAPH_ID_COLLISION");
+
+    const deleted = deleteDraftSubgraph(draft, "worker");
+    expect(deleted.subgraphs.worker).toBeUndefined();
+    expect(deleted.nodes.map(({ id }) => id)).toEqual(["output"]);
+    expect(deleted.root.entrypoint).toBe("output");
+    expect(deleted.edges).toEqual([]);
+    expect(deleted.layout?.pinned).toBeUndefined();
+    expect(deleted.subgraphs.nested.nodes.map(({ id }) => id)).toEqual(["nestedOutput"]);
+    expect(deleted.subgraphs.nested.entrypoint).toBe("nestedOutput");
+    expect(deleted.root.agentTemplates).toBeUndefined();
+    expect(deleted.root.teams).toBeUndefined();
+  });
+
+  it("authors v0.3 definitions while keeping team and graph references valid", () => {
+    const draft = createDocumentState({
+      version: "0.3",
+      components: [
+        { id: "teamCall", type: "team", config: { team: "engineering" } },
+        { id: "output", type: "output", config: {} },
+      ],
+      connections: [{ from: { component: "teamCall", port: "value" }, to: { component: "output", port: "value" } }],
+      entrypoint: "teamCall",
+      subgraphs: { runner: { components: [{ id: "runnerOutput", type: "output", config: {} }], connections: [], entrypoint: "runnerOutput" } },
+      agentTemplates: {
+        chief: { description: "Plans", runner: { subgraph: "runner" } },
+        worker: { description: "Works", runner: { subgraph: "runner" } },
+      },
+      teams: { engineering: { orchestrator: "chief", members: ["worker"], limits: { maxParallel: 2 } } },
+      studio: { positions: { teamCall: { x: 10, y: 20 }, output: { x: 300, y: 20 } }, pinned: ["teamCall"] },
+    }, BUILTIN_COMPONENT_MANIFESTS).draft;
+
+    const renamedTemplate = upsertAgentTemplate(draft, "worker", "reviewer", {
+      description: "Reviews", capabilities: ["network", "network"], runner: { subgraph: "runner" },
+    });
+    expect((renamedTemplate.root.teams as Record<string, { members: string[] }>).engineering.members).toEqual(["reviewer"]);
+    expect((renamedTemplate.root.agentTemplates as Record<string, { capabilities: string[] }>).reviewer.capabilities).toEqual(["network"]);
+    expect(() => upsertAgentTemplate(draft, undefined, "chief", { description: "Duplicate", runner: { subgraph: "runner" } }))
+      .toThrow("AGENT_TEMPLATE_ID_COLLISION");
+
+    const renamedTeam = upsertTeam(renamedTemplate, "engineering", "review", {
+      orchestrator: "chief", members: ["reviewer"], limits: { maxParallel: 4, maxDepth: 2 },
+    });
+    expect(renamedTeam.nodes[0]?.data.component.config).toMatchObject({ team: "review" });
+    expect(() => upsertTeam(renamedTemplate, undefined, "invalid", { orchestrator: "missing", members: ["reviewer"] }))
+      .toThrow("TEAM_REFERENCE_INVALID");
+
+    const deletedTemplate = deleteAgentTemplate(renamedTeam, "chief");
+    expect(deletedTemplate.root.teams).toBeUndefined();
+    expect(deletedTemplate.nodes.map(({ id }) => id)).toEqual(["output"]);
+    expect(deletedTemplate.root.entrypoint).toBe("output");
+    expect(deletedTemplate.layout?.pinned).toBeUndefined();
+    expect(deleteTeam(renamedTeam, "review").nodes.map(({ id }) => id)).toEqual(["output"]);
+  });
+
+  it("replaces stale Connection references in root and subgraphs", () => {
+    const draft = createDocumentState({
+      ...spec,
+      version: "0.2",
+      components: spec.components.map((component) => component.type === "model"
+        ? { ...component, config: { connectionId: "missing" } }
+        : component),
+      subgraphs: {
+        nested: {
+          components: [{ id: "nestedModel", type: "model", config: { connectionId: "fallback", fallbackConnectionId: "missing" } }],
+          connections: [],
+          entrypoint: "nestedModel",
+        },
+      },
+    }, BUILTIN_COMPONENT_MANIFESTS).draft;
+
+    const replaced = replaceConnectionReferences(draft, "missing", "ready");
+    expect((replaced.nodes.find(({ id }) => id === "model")?.data.component.config as Record<string, unknown>).connectionId).toBe("ready");
+    expect(replaced.subgraphs.nested.nodes[0]?.data.component.config).toEqual({ connectionId: "fallback", fallbackConnectionId: "ready" });
+    expect(replaceConnectionReferences(replaced, "ready", "fallback").subgraphs.nested.nodes[0]?.data.component.config)
+      .toEqual({ connectionId: "fallback" });
+  });
+
   it("keeps the last valid canvas while YAML is invalid", () => {
     const initial = createDocumentState(spec, BUILTIN_COMPONENT_MANIFESTS);
     const parsed = parseYamlDraft("version: [", BUILTIN_COMPONENT_MANIFESTS);

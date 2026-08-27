@@ -147,6 +147,15 @@ describe("HarnessSpec", () => {
     connectedModel.config.connectionId = "saved-provider";
     expect(validateSpec(connected, { registry: credentials, env: {} }).diagnostics.map(({ code }) => code))
       .not.toContain("ENV_MISSING");
+    connectedModel.config.apiKey = "sk-connected-secret";
+    expect(validateSpec(connected, { registry: credentials, env: {} }).diagnostics.map(({ code }) => code))
+      .toContain("SECRET_LITERAL");
+    connectedModel.config.apiKey = "env:CONNECTED_API_KEY";
+    expect(validateSpec(connected, { registry: credentials, env: {} }).diagnostics.map(({ code }) => code))
+      .not.toContain("ENV_MISSING");
+    connectedModel.config.baseUrl = "https://user:password@example.test/v1?access_token=secret";
+    expect(validateSpec(connected, { registry: credentials, env: {} }).diagnostics)
+      .toContainEqual(expect.objectContaining({ code: "SECRET_LITERAL", path: "$.components[0].config.baseUrl" }));
     output.config.schema = { $schema: "https://example.invalid/schema" };
     expect(validateSpec(spec).diagnostics.map(({ code }) => code)).toContain("OUTPUT_SCHEMA_DEFINITION_INVALID");
   });

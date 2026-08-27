@@ -34,7 +34,7 @@
   place-items: center;
   border: 1px solid color-mix(in srgb, var(--header-text) 28%, transparent);
   border-radius: 50%;
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .trail li strong { font-weight: 650; white-space: nowrap; }
@@ -60,17 +60,17 @@
 }
 
 .journey > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 17px 17px 12px; }
-.journey header span { color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.journey header span { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
 .journey header strong { display: block; margin-top: 5px; color: var(--text-primary); font-size: 14px; }
 .journey header p { margin: 5px 0 0; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
 .journey header > button { width: 26px; height: 26px; flex: 0 0 auto; border: 0; border-radius: 7px; color: var(--text-secondary); background: transparent; font-size: 18px; }
 .journey header > button:hover { background: var(--surface-hover); }
 .progress { position: relative; height: 4px; background: var(--surface-muted); }
 .progress > span { display: block; height: 100%; background: var(--accent); transition: width 180ms ease; }
-.progress small { position: absolute; top: -21px; right: 17px; color: var(--text-tertiary); font-size: 9px; }
+.progress small { position: absolute; top: -21px; right: 17px; color: var(--text-tertiary); font-size: 10px; }
 .journey ol { display: grid; gap: 0; margin: 0; padding: 8px 17px 14px; list-style: none; }
 .journey li { display: grid; grid-template-columns: 24px 1fr; gap: 9px; padding: 8px 0; color: var(--text-tertiary); }
-.journey li > span { display: grid; width: 20px; height: 20px; place-items: center; border: 1px solid var(--border); border-radius: 50%; font-size: 9px; font-weight: 750; }
+.journey li > span { display: grid; width: 20px; height: 20px; place-items: center; border: 1px solid var(--border); border-radius: 50%; font-size: 10px; font-weight: 750; }
 .journey li strong { color: var(--text-secondary); font-size: 11px; }
 .journey li p { margin: 3px 0 7px; font-size: 10px; line-height: 1.4; }
 .journey .stepComplete > span { border-color: var(--success); color: var(--success); background: var(--success-soft); }

@@ -36,10 +36,10 @@ const projectDirectory = () => dirname(harnessFile());
 
 const store = () => new NodeSkillStore({ projectDirectory: projectDirectory() });
 
-export async function GET(request?: Request) {
+export async function GET(request: Request) {
   try {
     const skillStore = store();
-    const review = request ? new URL(request.url).searchParams.get("review") : null;
+    const review = new URL(request.url).searchParams.get("review");
     if (review) return Response.json({ scripts: await skillStore.reviewScripts(review) }, {
       headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
     });

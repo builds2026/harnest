@@ -4,12 +4,17 @@ export interface ExperimentVariant {
   readonly id: string;
   readonly label: string;
   readonly componentId: string;
+  readonly graph?: string;
   readonly config: Readonly<Record<string, unknown>>;
 }
 
 export function applyExperimentVariant(spec: HarnessSpec, variant: ExperimentVariant): HarnessSpec {
   const copy = structuredClone(spec);
-  const component = copy.components.find(({ id }) => id === variant.componentId);
+  const graph = variant.graph === undefined
+    ? copy
+    : copy.version === "0.1" ? undefined : copy.subgraphs?.[variant.graph];
+  if (!graph) throw new Error(`Graph '${variant.graph}' does not exist`);
+  const component = graph.components.find(({ id }) => id === variant.componentId);
   if (!component) throw new Error(`Component '${variant.componentId}' does not exist`);
   component.config = { ...component.config, ...variant.config };
   return copy;

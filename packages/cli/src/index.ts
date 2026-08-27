@@ -12,13 +12,8 @@ import { createInterface } from "node:readline/promises";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
 import { crc32 } from "node:zlib";
-import { anthropicAdapter } from "@harnestai/adapter-anthropic";
-import { geminiAdapter } from "@harnestai/adapter-gemini";
-import { ollamaAdapter } from "@harnestai/adapter-local";
-import { openAIAdapter } from "@harnestai/adapter-openai";
 import { Harnest } from "@harnestai/sdk/node";
 import {
-  CreateRunContextSchema,
   CreateRunRequestSchema,
   PROTOCOL_VERSION,
   RunCommandSchema,
@@ -27,9 +22,6 @@ import {
   type InternalEvent,
   type RunCommand as WireRunCommand,
 } from "@harnestai/protocol";
-import { McpServer } from "@modelcontextprotocol/server";
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { z } from "zod";
 import {
   AdapterRegistry,
   compileSpec,
@@ -82,6 +74,8 @@ import {
   type NodeRuntimeServiceOptions,
   type StoredRunEvent,
 } from "@harnestai/core/node";
+import { serveAuthoringMcp } from "./authoring-mcp.js";
+import { shippedAdapters } from "./registries.js";
 
 const HELP = `Harnest Visual AI Agent Harness
 
@@ -101,7 +95,8 @@ Usage:
   harnest connection <test|login|disconnect|revoke|delete> <id> [file]
   harnest skill <list|install|review|approve> [value] [file]
   harnest serve [file] [--port <number>] [capabilities]
-  harnest mcp serve [file] [capabilities]
+  harnest mcp serve [workspace] [--transport <stdio|http>] [--host <host>] [--port <number>]
+    [--allowed-host <hostname>] [--allowed-origin <hostname>]
   harnest studio [file] [--port <number>]
 
 Connection presets:
@@ -125,9 +120,18 @@ Runtime capabilities (denied by default):
   --approve-tool <id>           Pre-approve one exact risky Tool id (repeatable)
 
 Risky Tools otherwise prompt once per call in a TTY and are denied in non-interactive runs.
-`;
 
-const shippedAdapters = [openAIAdapter, anthropicAdapter, geminiAdapter, ollamaAdapter] as const;
+Authoring MCP:
+  Serves HarnessSpec docs and secret-free static validation. HTTP binds to
+  127.0.0.1 by default; remote binding requires repeatable --allowed-host values.
+  Browser Origins are separately allowed with repeatable --allowed-origin values.
+
+Studio network access:
+  Studio binds to 127.0.0.1 by default. For a reviewed private-network demo, set
+  HARNEST_STUDIO_HOST=0.0.0.0 and HARNEST_STUDIO_ALLOWED_HOSTS to the exact
+  comma-separated browser-visible hostnames or IPs. Files still require
+  --allow-files and project-relative --context-root values.
+`;
 
 async function init(directoryValue: string): Promise<void> {
   const directory = resolve(directoryValue);
@@ -945,7 +949,13 @@ async function serve(file: string, portValue: string, capabilities: CapabilityVa
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const pathname = url.pathname;
     if (request.method === "GET" && pathname === "/health") {
-      writeJson(response, 200, { ok: true, file: harness.file });
+      const localConnections = await harness.localConnectionHealth();
+      writeJson(response, localConnections.ok ? 200 : 503, {
+        ok: localConnections.ok,
+        file: harness.file,
+        readyConnections: localConnections.readyConnections,
+        localConnections,
+      });
       return;
     }
     if (request.method === "GET" && pathname === "/contract") {
@@ -1243,218 +1253,6 @@ async function serve(file: string, portValue: string, capabilities: CapabilityVa
     approvalBroker.close();
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     await Promise.all([...activeRuns].map(([runId]) => releaseRunExecutionLease(projectDirectory, runId)));
-    await harness.close();
-  }
-}
-
-const resultText = (value: unknown): string => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-
-async function mcpServe(file: string, capabilities: CapabilityValues): Promise<void> {
-  const harness = await Harnest.load(file, sdkOptions(capabilities));
-  const activeRuns = new Map<string, ManagedRun>();
-  const runStore = new FileRunStore(dirname(harness.file));
-  const handle = serveStdio(() => {
-    const server = new McpServer(
-      { name: "harnest", version: "0.1.0" },
-      { capabilities: { tools: {} } },
-    );
-    server.registerTool("invoke_harness", {
-      title: "Invoke harness",
-      description: "Run the configured Harnest agent and return its final result.",
-      inputSchema: z.object({
-        message: z.string().optional().describe("A plain-text request for the harness"),
-        input: z.unknown().optional().describe("A structured harness input"),
-      }),
-    }, async ({ message, input }) => {
-      try {
-        const result = await harness.invoke(input === undefined ? message ?? {} : input);
-        const structuredContent = {
-          runId: result.runId,
-          output: result.output,
-          usage: result.usage,
-          costUsd: result.costUsd,
-          durationMs: result.durationMs,
-          artifacts: result.artifacts,
-        };
-        return {
-          content: [{ type: "text", text: resultText(result.output) }],
-          structuredContent,
-        };
-      } catch (error) {
-        console.error(error);
-        return { isError: true, content: [{ type: "text", text: "Harness invocation failed" }] };
-      }
-    });
-    server.registerTool("start_harness_run", {
-      title: "Start Harness run",
-      description: "Start a controllable Harness run and return its run id immediately.",
-      inputSchema: z.object({
-        message: z.string().optional(),
-        input: z.unknown().optional(),
-        resumeRunId: z.string().optional(),
-        context: CreateRunContextSchema.optional(),
-      }),
-    }, async ({ message, input, resumeRunId, context }) => {
-      const snapshot = resumeRunId ? await harness.readRunSnapshot(resumeRunId) : undefined;
-      if (resumeRunId && !snapshot) return { isError: true, content: [{ type: "text", text: "Run snapshot was not found" }] };
-      const value = input === undefined ? message ?? {} : input;
-      const options: RunOptions = context ? { session: sessionFromContext(context) } : {};
-      const executionRunId = resumeRunId ?? randomUUID();
-      try { await acquireRunExecutionLease(dirname(harness.file), executionRunId); }
-      catch (error) { return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Run is already active" }] }; }
-      let run: ManagedRun;
-      try {
-        const started = snapshot ? harness.resume(value, snapshot, options) : harness.start(value, options, executionRunId);
-        run = manageRun(started, activeRuns, () => releaseRunExecutionLease(dirname(harness.file), started.runId));
-      } catch (error) {
-        await releaseRunExecutionLease(dirname(harness.file), executionRunId);
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Run could not start" }] };
-      }
-      if (snapshot) await run.ready;
-      return {
-        content: [{ type: "text", text: run.handle.runId }],
-        structuredContent: { runId: run.handle.runId },
-      };
-    });
-    server.registerTool("get_harness_run", {
-      title: "Get Harness run",
-      description: "Get the current Run snapshot and events after a sequence.",
-      inputSchema: z.object({ runId: z.string(), after: z.number().int().nonnegative().default(0) }),
-    }, async ({ runId, after }) => {
-      const run = activeRuns.get(runId);
-      const snapshot = run?.handle.snapshot() ?? await runStore.readSnapshot(runId);
-      let persisted: StoredRunEvent[] = [];
-      try { persisted = await runStore.readEvents(runId, after); }
-      catch (error) {
-        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
-      }
-      if (!snapshot && !persisted.length && !run) {
-        return { isError: true, content: [{ type: "text", text: "Run was not found" }] };
-      }
-      const events = [...persisted, ...(run?.events ?? [])]
-        .filter((event) => (event.sequence ?? 0) > after)
-        .sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0))
-        .filter((event, index, all) => index === 0 || event.sequence !== all[index - 1]?.sequence);
-      const done = run?.done ?? (snapshot?.status !== "running" && snapshot?.status !== "paused");
-      const value = { ...(snapshot ? { snapshot: publicRunSnapshot(snapshot) } : {}), events, done };
-      return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }], structuredContent: value };
-    });
-    server.registerTool("command_harness_run", {
-      title: "Command Harness run",
-      description: "Send a message, Task directive, revision-based plan patch, or cancellation command.",
-      inputSchema: z.object({ runId: z.string(), command: z.record(z.string(), z.unknown()) }),
-    }, async ({ runId, command }) => {
-      const run = activeRuns.get(runId);
-      if (!run || run.done) {
-        const snapshot = await runStore.readSnapshot(runId);
-        const code = snapshot?.status === "paused" ? "RUN_RECOVERY_REQUIRED" : "RUN_NOT_ACTIVE";
-        const message = code === "RUN_RECOVERY_REQUIRED"
-          ? "Resume this Run with start_harness_run and the original host context before sending a command"
-          : "Run was not found";
-        return { isError: true, content: [{ type: "text", text: message }], structuredContent: { ok: false, code } };
-      }
-      try {
-        await run.handle.send(command);
-        return { content: [{ type: "text", text: "Command applied" }], structuredContent: { ok: true } };
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Command rejected" }] };
-      }
-    });
-    server.registerTool("cancel_harness_run", {
-      title: "Cancel Harness run",
-      description: "Immediately cancel a running Harness.",
-      inputSchema: z.object({ runId: z.string() }),
-    }, async ({ runId }) => {
-      const run = activeRuns.get(runId);
-      if (!run || run.done) {
-        const snapshot = await runStore.readSnapshot(runId);
-        const code = snapshot?.status === "paused" ? "RUN_RECOVERY_REQUIRED" : "RUN_NOT_ACTIVE";
-        const message = code === "RUN_RECOVERY_REQUIRED"
-          ? "Resume this Run with start_harness_run and the original host context before cancelling it"
-          : "Run was not found";
-        return { isError: true, content: [{ type: "text", text: message }], structuredContent: { ok: false, code } };
-      }
-      await run.handle.cancel();
-      return { content: [{ type: "text", text: "Run cancelled" }], structuredContent: { ok: true } };
-    });
-    server.registerTool("describe_harness", {
-      title: "Describe harness contract",
-      description: "Return the secret-free capabilities and integration contract for this harness.",
-      inputSchema: z.object({}),
-    }, async () => ({
-      content: [{ type: "text", text: JSON.stringify(harness.contract, null, 2) }],
-      structuredContent: harness.contract,
-    }));
-    server.registerTool("read_harness_artifact", {
-      title: "Read a Harness artifact",
-      description: "Return one generated artifact by the exact run and artifact ids from invoke_harness.",
-      inputSchema: z.object({
-        runId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u),
-        artifactId: z.string().regex(/^artifact_[a-f0-9]{24}$/u),
-      }),
-    }, async ({ runId, artifactId }) => {
-      try {
-        const { artifact, content } = await harness.readArtifact(runId, artifactId);
-        if (artifact.mimeType.startsWith("image/")) return {
-          content: [{ type: "image" as const, data: content.toString("base64"), mimeType: artifact.mimeType }],
-          structuredContent: { artifact },
-        };
-        if (artifact.mimeType.startsWith("audio/")) return {
-          content: [{ type: "audio" as const, data: content.toString("base64"), mimeType: artifact.mimeType }],
-          structuredContent: { artifact },
-        };
-        return {
-          content: [{
-            type: "resource" as const,
-            resource: {
-              uri: artifact.ref,
-              mimeType: artifact.mimeType,
-              blob: content.toString("base64"),
-            },
-          }],
-          structuredContent: { artifact },
-        };
-      } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: "text" as const, text: error instanceof Error ? error.message : "Artifact was not found" }],
-        };
-      }
-    });
-    server.registerTool("list_harness_permissions", {
-      title: "List persistent Harness permissions",
-      description: "List exact always-allowed Tool and Connection grants without exposing Harness paths.",
-      inputSchema: z.object({}),
-    }, async () => {
-      const permissions = (await harness.listPermissions()).map(({ harnessId: _harnessId, ...permission }) => permission);
-      return {
-        content: [{ type: "text", text: JSON.stringify(permissions, null, 2) }],
-        structuredContent: { permissions },
-      };
-    });
-    server.registerTool("revoke_harness_permission", {
-      title: "Revoke a persistent Harness permission",
-      description: "Revoke one exact always-allowed Tool and optional Connection grant.",
-      inputSchema: z.object({ toolId: z.string().regex(TOOL_ID), connectionId: z.string().optional() }),
-    }, async ({ toolId, connectionId }) => {
-      const revoked = await harness.revokePermission(toolId, connectionId);
-      return {
-        isError: !revoked,
-        content: [{ type: "text", text: revoked ? `Revoked ${toolId}` : "Permission was not found" }],
-        structuredContent: { revoked, toolId, ...(connectionId ? { connectionId } : {}) },
-      };
-    });
-    return server;
-  }, { onerror: (error) => console.error(error) });
-  console.error(`Serving ${harness.file} as MCP Tools 'describe_harness' and 'invoke_harness' over stdio`);
-  try {
-    await new Promise<void>((resolveStop) => {
-      process.stdin.once("end", resolveStop);
-      process.once("SIGINT", resolveStop);
-      process.once("SIGTERM", resolveStop);
-    });
-  } finally {
-    await handle.close();
     await harness.close();
   }
 }
@@ -2126,15 +1924,30 @@ async function main(): Promise<void> {
 
   if (command === "mcp") {
     const [action, ...mcpArgs] = args;
-    if (action !== "serve") throw new Error("mcp requires serve [file]");
+    if (action !== "serve") throw new Error("mcp requires serve [workspace]");
     const { values, positionals } = parseArgs({
       args: mcpArgs,
       allowPositionals: true,
       strict: true,
-      options: capabilityOptions,
+      options: {
+        transport: { type: "string", default: "stdio" },
+        host: { type: "string", default: "127.0.0.1" },
+        port: { type: "string", short: "p", default: "8790" },
+        "allowed-host": { type: "string", multiple: true },
+        "allowed-origin": { type: "string", multiple: true },
+      },
     });
-    if (positionals.length > 1) throw new Error("mcp serve accepts at most one file");
-    await mcpServe(positionals[0] ?? "harnest.yaml", values as CapabilityValues);
+    if (positionals.length > 1) throw new Error("mcp serve accepts at most one workspace");
+    if (values.transport !== "stdio" && values.transport !== "http") throw new Error("mcp --transport must be stdio or http");
+    const port = Number(values.port);
+    await serveAuthoringMcp({
+      workspaceRoot: positionals[0] ?? ".",
+      transport: values.transport,
+      host: values.host,
+      port,
+      ...(values["allowed-host"] ? { allowedHosts: values["allowed-host"] } : {}),
+      ...(values["allowed-origin"] ? { allowedOrigins: values["allowed-origin"] } : {}),
+    });
     return;
   }
 

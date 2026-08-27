@@ -158,7 +158,7 @@ const agentGraph = (prompt: string, structured = false, tool?: "web" | "code"): 
         ? { tool: "builtin.web-search", source: "builtin", risk: "external" }
         : { tool: "builtin.code-runner", source: "builtin", risk: "destructive" },
     } as GraphBody["components"][number]] : []),
-    { id: "agent", type: "agent", config: { maxTurns: 10, maxToolCalls: 32, toolError: "model" } },
+    { id: "agent", type: "agent", config: { maxTurns: 10, maxToolCalls: 32, toolError: tool ? "fail" : "model" } },
     { id: "output", type: "output", config: structured ? {
       format: "json",
       schema: {
@@ -258,10 +258,12 @@ export function templateSpec(id: TemplateId): HarnessSpec {
     const spec = baseAgent(id === "web-research"
       ? "Call Web Search exactly once. Set its query field to the exact user request and limit to 5. Then stop searching and synthesize only the returned results into a cited brief.\n\nUser request: {{input}}"
       : "Use only the connected, approved code result.\n\n{{input}}");
-    if (id === "web-research") {
-      const agent = spec.components.find((component) => component.id === "agent");
-      if (agent) agent.config = { ...agent.config, maxToolCalls: 1, maxTurns: 3 };
-    }
+    const agent = spec.components.find((component) => component.id === "agent");
+    if (agent) agent.config = {
+      ...agent.config,
+      toolError: "fail",
+      ...(id === "web-research" ? { maxToolCalls: 1, maxTurns: 3 } : {}),
+    };
     spec.components.splice(2, 0, { id: "tool", type: "tool", config: {
       tool: toolId,
       risk: id === "web-research" ? "external" : "destructive",
@@ -273,6 +275,8 @@ export function templateSpec(id: TemplateId): HarnessSpec {
   }
   if (id === "mcp-agent") {
     const spec = baseAgent("Use the connected MCP result to answer clearly.\n\n{{input}}");
+    const agent = spec.components.find((component) => component.id === "agent");
+    if (agent) agent.config = { ...agent.config, toolError: "fail" };
     spec.components.splice(2, 0, {
       id: "mcp", type: "tool", config: { tool: "", action: "", connectionId: "", risk: "external", source: "mcp" },
     });

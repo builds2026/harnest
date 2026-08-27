@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "harnestai"
-version = "0.2.0b1"
+version = "0.2.0b2"
 description = "Remote-only Python SDK for the Harnest v1 protocol"
 readme = "README.md"
 license = "MIT"

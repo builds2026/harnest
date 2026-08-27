@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/cli",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "type": "module",
   "bin": {
     "harnest": "./dist/index.js"
@@ -13,24 +13,34 @@
     "dist/index.js",
     "dist/index.js.map",
     "dist/index.d.ts",
-    "dist/index.d.ts.map"
+    "dist/index.d.ts.map",
+    "dist/authoring-mcp.js",
+    "dist/authoring-mcp.js.map",
+    "dist/authoring-mcp.d.ts",
+    "dist/authoring-mcp.d.ts.map",
+    "dist/registries.js",
+    "dist/registries.js.map",
+    "dist/registries.d.ts",
+    "dist/registries.d.ts.map",
+    "mcp-docs/**/*.md"
   ],
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
-    "@harnestai/adapter-gemini": "0.2.0-beta.1",
-    "@harnestai/adapter-local": "0.2.0-beta.1",
-    "@harnestai/adapter-openai": "0.2.0-beta.1",
-    "@harnestai/core": "0.2.0-beta.1",
-    "@harnestai/protocol": "0.2.0-beta.1",
-    "@harnestai/sdk": "0.2.0-beta.1",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.2",
+    "@harnestai/adapter-gemini": "0.2.0-beta.2",
+    "@harnestai/adapter-local": "0.2.0-beta.2",
+    "@harnestai/adapter-openai": "0.2.0-beta.2",
+    "@harnestai/core": "0.2.0-beta.2",
+    "@harnestai/protocol": "0.2.0-beta.2",
+    "@harnestai/sdk": "0.2.0-beta.2",
+    "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
-    "@harnestai/studio": "0.2.0-beta.1"
+    "@harnestai/studio": "0.2.0-beta.2"
   },
   "license": "MIT",
   "repository": {

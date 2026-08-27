@@ -14,9 +14,11 @@ import { atomicWriteVerifiedFile, isSensitiveWorkspacePath, readVerifiedFile } f
 
 const PROJECT_FILE = "project.json";
 const PROJECT_ROOT = ".harnest";
+const MAX_HARNESS_BYTES = 1_048_576;
 const MAX_MANIFEST_BYTES = 1_048_576;
 const MAX_TEXT_ASSET_BYTES = 1_048_576;
 const MAX_JSON_ASSET_BYTES = 4_194_304;
+const MAX_MATERIALIZED_ASSET_BYTES = 16 * 1_048_576;
 const MAX_PORTABLE_FILES = 1_000;
 const MAX_PORTABLE_BYTES = 64 * 1_048_576;
 const PORTABLE_ROOTS = new Set(["prompts", "skills", "context", "schemas", "tests", "tools", "config"]);
@@ -137,17 +139,20 @@ export async function resolveHarnessFile(inputPath: string): Promise<string> {
   } catch {
     return requested;
   }
-  const manifestPath = join(requested, PROJECT_ROOT, PROJECT_FILE);
+  const directory = await realpath(requested);
+  const manifestPath = join(directory, PROJECT_ROOT, PROJECT_FILE);
   try {
-    const parsed = HarnestProjectManifestSchema.safeParse(JSON.parse(await readFile(manifestPath, "utf8")) as unknown);
+    const parsed = HarnestProjectManifestSchema.safeParse(JSON.parse(
+      (await readVerifiedFile(manifestPath, directory, MAX_MANIFEST_BYTES)).toString("utf8"),
+    ) as unknown);
     if (!parsed.success) throw new HarnestProjectError(
       "PROJECT_MANIFEST_INVALID",
       `$.${PROJECT_ROOT}.${PROJECT_FILE}`,
       parsed.error.issues.map((issue) => issue.message).join("; "),
     );
-    return resolve(requested, parsed.data.harness);
+    return resolve(directory, parsed.data.harness);
   } catch (error) {
-    if (missing(error)) return join(requested, "harnest.yaml");
+    if (missing(error)) return join(directory, "harnest.yaml");
     throw error;
   }
 }
@@ -275,6 +280,7 @@ async function readAsset(
   project: HarnestProjectDescriptor,
   configuredPath: string,
   maxBytes: number,
+  budget?: { bytes: number },
 ): Promise<string> {
   const entry = await verifiedProjectEntry(project, configuredPath);
   if (isSensitiveWorkspacePath(project.projectDirectory, entry.path)) throw new HarnestProjectError(
@@ -285,8 +291,9 @@ async function readAsset(
     `$.${PROJECT_ROOT}.${configuredPath}`,
     `Project asset '${configuredPath}' must be a regular file`,
   );
+  let content: Buffer;
   try {
-    return (await readVerifiedFile(entry.path, project.hiddenDirectory, maxBytes)).toString("utf8");
+    content = await readVerifiedFile(entry.path, project.hiddenDirectory, maxBytes);
   } catch (error) {
     throw new HarnestProjectError(
       "PROJECT_ASSET_READ",
@@ -295,6 +302,13 @@ async function readAsset(
       error,
     );
   }
+  if (budget && budget.bytes + content.byteLength > MAX_MATERIALIZED_ASSET_BYTES) throw new HarnestProjectError(
+    "PROJECT_MATERIALIZATION_LIMIT",
+    `$.${PROJECT_ROOT}.${configuredPath}`,
+    `Materialized project assets exceed ${MAX_MATERIALIZED_ASSET_BYTES} bytes`,
+  );
+  if (budget) budget.bytes += content.byteLength;
+  return content.toString("utf8");
 }
 
 function targetComponent(spec: HarnessSpec, binding: HarnestProjectBinding) {
@@ -332,7 +346,9 @@ export async function materializeHarnestProject(
 ): Promise<{ readonly spec: HarnessSpec; readonly project?: HarnestProjectDescriptor }> {
   const project = await loadHarnestProjectManifest(filePath);
   if (!project) return { spec: sourceSpec };
+  await validatePortableIncludes(project);
   const candidate = structuredClone(sourceSpec);
+  const budget = { bytes: 0 };
   for (const binding of project.manifest.bindings ?? []) {
     const component = targetComponent(candidate, binding);
     if (binding.kind === "prompt") {
@@ -341,7 +357,7 @@ export async function materializeHarnestProject(
         `$.${PROJECT_ROOT}.${PROJECT_FILE}.bindings`,
         `Prompt asset '${binding.path}' targets '${component.type}', not a Prompt component`,
       );
-      const template = await readAsset(project, binding.path, MAX_TEXT_ASSET_BYTES);
+      const template = await readAsset(project, binding.path, MAX_TEXT_ASSET_BYTES, budget);
       if (!template.trim()) throw new HarnestProjectError(
         "PROJECT_PROMPT_EMPTY",
         `$.${PROJECT_ROOT}.${binding.path}`,
@@ -356,7 +372,7 @@ export async function materializeHarnestProject(
         `$.${PROJECT_ROOT}.${PROJECT_FILE}.bindings`,
         `Schema asset '${binding.path}' targets '${component.type}', not an Output component`,
       );
-      const schema = parseJsonAsset(await readAsset(project, binding.path, MAX_JSON_ASSET_BYTES), binding.path);
+      const schema = parseJsonAsset(await readAsset(project, binding.path, MAX_JSON_ASSET_BYTES, budget), binding.path);
       if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new HarnestProjectError(
         "PROJECT_SCHEMA_INVALID",
         `$.${PROJECT_ROOT}.${binding.path}`,
@@ -390,7 +406,7 @@ export async function materializeHarnestProject(
   if (project.manifest.tests?.length) {
     const tests: unknown[] = [];
     for (const path of project.manifest.tests) {
-      const value = parseJsonAsset(await readAsset(project, path, MAX_JSON_ASSET_BYTES), path);
+      const value = parseJsonAsset(await readAsset(project, path, MAX_JSON_ASSET_BYTES, budget), path);
       if (!Array.isArray(value)) throw new HarnestProjectError(
         "PROJECT_TESTS_INVALID",
         `$.${PROJECT_ROOT}.${path}`,
@@ -402,12 +418,18 @@ export async function materializeHarnestProject(
   }
   if (project.manifest.studio) {
     const studio = parseJsonAsset(
-      await readAsset(project, project.manifest.studio, MAX_JSON_ASSET_BYTES),
+      await readAsset(project, project.manifest.studio, MAX_JSON_ASSET_BYTES, budget),
       project.manifest.studio,
     );
     candidate.studio = studio as HarnessSpec["studio"];
   }
-  const parsed = parseSpec(stringifySpec(candidate));
+  const materializedSource = stringifySpec(candidate);
+  if (Buffer.byteLength(materializedSource, "utf8") > MAX_MATERIALIZED_ASSET_BYTES) throw new HarnestProjectError(
+    "PROJECT_MATERIALIZATION_LIMIT",
+    `$.${PROJECT_ROOT}.${PROJECT_FILE}`,
+    `Materialized Harness exceeds ${MAX_MATERIALIZED_ASSET_BYTES} bytes`,
+  );
+  const parsed = parseSpec(materializedSource);
   if (!parsed.ok) throw new HarnestProjectError(
     "PROJECT_MATERIALIZED_INVALID",
     `$.${PROJECT_ROOT}.${PROJECT_FILE}`,
@@ -424,7 +446,8 @@ export async function loadHarnestProjectSpec(filePath: string): Promise<
     const file = await resolveHarnessFile(filePath);
     let text: string;
     try {
-      text = await readFile(/* turbopackIgnore: true */ file, "utf8");
+      const directory = await realpath(dirname(file));
+      text = (await readVerifiedFile(file, directory, MAX_HARNESS_BYTES)).toString("utf8");
     } catch (error) {
       return { ok: false, diagnostics: [{
         code: "FILE_READ",
@@ -507,14 +530,24 @@ export function projectEnvironmentReferences(spec: HarnessSpec): string[] {
   const references = new Set<string>();
   const visit = (value: unknown): void => {
     if (typeof value === "string") {
-      for (const match of value.matchAll(/\benv:([A-Za-z_][A-Za-z0-9_]*)\b/g)) references.add(match[1]!);
+      const match = /^env:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
+      if (match) references.add(match[1]!);
       return;
     }
     if (Array.isArray(value)) {
       value.forEach(visit);
       return;
     }
-    if (value && typeof value === "object") Object.values(value as Record<string, unknown>).forEach(visit);
+    if (!value || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    if (record.type === "prompt" && record.config && typeof record.config === "object" && !Array.isArray(record.config)) {
+      Object.entries(record).filter(([name]) => name !== "config").forEach(([, item]) => visit(item));
+      Object.entries(record.config as Record<string, unknown>)
+        .filter(([name]) => name !== "template")
+        .forEach(([, item]) => visit(item));
+      return;
+    }
+    Object.values(record).forEach(visit);
   };
   visit(spec);
   return [...references].sort();
@@ -582,6 +615,15 @@ async function portableEntries(
     size: content.byteLength,
     sha256: createHash("sha256").update(content).digest("hex"),
   });
+}
+
+async function validatePortableIncludes(project: HarnestProjectDescriptor): Promise<void> {
+  const includes = [...new Set(project.manifest.portable?.include ?? [])];
+  for (const path of includes) await verifiedProjectEntry(project, path);
+  const roots = includes.filter((path) => !includes.some((candidate) => path.startsWith(`${candidate}/`)));
+  const result: PortableProjectFile[] = [];
+  const budget = { bytes: 0 };
+  for (const path of roots) await portableEntries(project, path, result, budget);
 }
 
 export async function listPortableProjectFiles(filePath: string): Promise<PortableProjectFile[]> {

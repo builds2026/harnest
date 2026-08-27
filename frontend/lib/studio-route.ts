@@ -14,3 +14,7 @@ export function surfaceFromPathname(pathname: string): StudioSurface {
     ? segment
     : "builder";
 }
+
+export const builderHref = (graph?: string) => graph
+  ? `${STUDIO_SURFACE_HREFS.builder}?${new URLSearchParams({ graph }).toString()}`
+  : STUDIO_SURFACE_HREFS.builder;

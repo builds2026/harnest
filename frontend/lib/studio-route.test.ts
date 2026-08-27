@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { surfaceFromPathname } from "./studio-route";
+import { builderHref, surfaceFromPathname } from "./studio-route";
 
 describe("Studio routes", () => {
   it("maps known routes and safely falls back to builder", () => {
@@ -8,5 +8,10 @@ describe("Studio routes", () => {
     expect(surfaceFromPathname("/settings")).toBe("settings");
     expect(surfaceFromPathname("/")).toBe("builder");
     expect(surfaceFromPathname("/unknown")).toBe("builder");
+  });
+
+  it("encodes named graph URLs for reload and browser history", () => {
+    expect(builderHref("review loop")).toBe("/builder?graph=review+loop");
+    expect(builderHref()).toBe("/builder");
   });
 });

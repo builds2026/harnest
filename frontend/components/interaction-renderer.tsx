@@ -1,10 +1,11 @@
 "use client";
 
 import { AlertDialog } from "@base-ui/react/alert-dialog";
+import { Form } from "@base-ui/react/form";
 import { useEffect, useMemo, useState } from "react";
 import { interactionInputValue, interactionOptions } from "../lib/interaction-values";
 import { useI18n } from "./i18n-provider";
-import { Button, Checkbox, Field, Input, Select, Textarea } from "./ui/ui";
+import { Button, Checkbox, Field, Input, Select, SelectControl, Textarea } from "./ui/ui";
 import styles from "./interaction-renderer.module.css";
 
 export type InteractionKind = "select" | "input" | "form" | "file" | "oauth" | "permission";
@@ -159,6 +160,10 @@ export function InteractionRenderer({
   };
 
   const persistentPermissionDisabled = request.data?.previewLimited !== false || request.data?.resourceResolved !== true;
+  const persistentPermissionReasons = [
+    request.data?.previewLimited !== false && t("interaction.permission.alwaysUnavailable.preview"),
+    request.data?.resourceResolved !== true && t("interaction.permission.alwaysUnavailable.resource"),
+  ].filter(Boolean).join(" ");
 
   if (request.kind === "permission") return <AlertDialog.Root open>
     <AlertDialog.Portal>
@@ -167,35 +172,33 @@ export function InteractionRenderer({
         <AlertDialog.Popup className={styles.dialog}>
           <AlertDialog.Title className={styles.title}>{request.title}</AlertDialog.Title>
           <AlertDialog.Description className={styles.message}>{request.message}</AlertDialog.Description>
-          {request.data && <pre className={styles.preview}>{JSON.stringify(request.data, null, 2)}</pre>}
-          {error && <p className={styles.error} role="alert">{error}</p>}
-          <div className={styles.permissionActions}>
-            <Button disabled={busy} variant="danger" onClick={() => void respond("decline", undefined, "deny")}>{t("interaction.permission.deny")}</Button>
-            <Button disabled={busy || persistentPermissionDisabled} onClick={() => void respond("submit", undefined, "allow_always")}>{t("interaction.permission.always")}</Button>
-            <Button disabled={busy} onClick={() => void respond("submit", undefined, "allow_for_run")}>{t("interaction.permission.run")}</Button>
-            <Button disabled={busy} variant="primary" onClick={() => void respond("submit", undefined, "allow_once")}>{t("interaction.permission.once")}</Button>
+          <p className={styles.scopeHelp}>{t("interaction.permission.scopeHelp")}</p>
+          <div className={styles.permissionChoices}>
+            <div><Button disabled={busy} variant="primary" aria-describedby={`interaction-${request.id}-once`} onClick={() => void respond("submit", undefined, "allow_once")}>{t("interaction.permission.once")}</Button><p id={`interaction-${request.id}-once`}>{t("interaction.permission.onceHelp")}</p></div>
+            <div><Button disabled={busy} aria-describedby={`interaction-${request.id}-run`} onClick={() => void respond("submit", undefined, "allow_for_run")}>{t("interaction.permission.run")}</Button><p id={`interaction-${request.id}-run`}>{t("interaction.permission.runHelp")}</p></div>
+            <div><Button disabled={busy || persistentPermissionDisabled} aria-describedby={`interaction-${request.id}-always${persistentPermissionDisabled ? ` interaction-${request.id}-always-disabled` : ""}`} onClick={() => void respond("submit", undefined, "allow_always")}>{t("interaction.permission.always")}</Button><p id={`interaction-${request.id}-always`}>{t("interaction.permission.alwaysHelp")}</p>{persistentPermissionDisabled && <p id={`interaction-${request.id}-always-disabled`} className={styles.permissionUnavailable}>{t("interaction.permission.alwaysUnavailable", { reason: persistentPermissionReasons })}</p>}</div>
+            <div><Button disabled={busy} variant="danger" aria-describedby={`interaction-${request.id}-deny`} onClick={() => void respond("decline", undefined, "deny")}>{t("interaction.permission.deny")}</Button><p id={`interaction-${request.id}-deny`}>{t("interaction.permission.denyHelp")}</p></div>
           </div>
+          {request.data && <details className={styles.technicalDetails}><summary>{t("common.details")}</summary><pre className={styles.preview}>{JSON.stringify(request.data, null, 2)}</pre></details>}
+          {error && <p className={styles.error} role="alert">{error}</p>}
         </AlertDialog.Popup>
       </AlertDialog.Viewport>
     </AlertDialog.Portal>
   </AlertDialog.Root>;
 
-  return <section className={styles.card} aria-labelledby={`interaction-${request.id}`}>
+  return <Form className={styles.card} aria-labelledby={`interaction-${request.id}`} onFormSubmit={submit}>
     <header><div><span>{t(`interaction.kind.${request.kind}`)}</span><h3 id={`interaction-${request.id}`}>{request.title}</h3></div>{request.expiresAt && <time dateTime={request.expiresAt}>{t("interaction.expires", { time: formatDate(request.expiresAt, { dateStyle: "medium", timeStyle: "short" }) })}</time>}</header>
     <p className={styles.message}>{request.message}</p>
 
     {request.kind === "select" && <Field label={typeof request.schema?.title === "string" ? request.schema.title : t("interaction.select.label")} htmlFor={`interaction-${request.id}-value`} error={submitted ? errors.value : undefined}>
-      <Select id={`interaction-${request.id}-value`} value={values.value === undefined ? "" : String(choiceOptions.findIndex(({ value }) => Object.is(value, values.value)))} onChange={(event) => setValues({ value: choiceOptions[Number(event.target.value)]?.value })}>
-        <option value="">{t("interaction.select.placeholder")}</option>
-        {choiceOptions.map(({ value, label }, index) => <option key={`${typeof value}:${String(value)}`} value={index}>{label}</option>)}
-      </Select>
+      <SelectControl label={typeof request.schema?.title === "string" ? request.schema.title : t("interaction.select.label")} value={values.value === undefined ? "" : String(choiceOptions.findIndex(({ value }) => Object.is(value, values.value)))} options={[{ value: "", label: t("interaction.select.placeholder") }, ...choiceOptions.map(({ label }, index) => ({ value: String(index), label }))]} onValueChange={(value) => setValues({ value: value === "" ? undefined : choiceOptions[Number(value)]?.value })} />
     </Field>}
 
     {request.kind === "input" && request.schema?.type === "boolean" && !choiceOptions.length
       ? <Checkbox label={typeof request.schema.title === "string" ? request.schema.title : t("interaction.input.label")} checked={values.value === true} onCheckedChange={(checked) => setValues({ value: checked })} />
       : request.kind === "input" && <Field label={typeof request.schema?.title === "string" ? request.schema.title : t("interaction.input.label")} htmlFor={`interaction-${request.id}-value`} error={submitted ? errors.value : undefined}>
         {choiceOptions.length
-          ? <Select id={`interaction-${request.id}-value`} value={values.value === undefined ? "" : String(choiceOptions.findIndex(({ value }) => Object.is(value, values.value)))} onChange={(event) => setValues({ value: choiceOptions[Number(event.target.value)]?.value })}><option value="">{t("interaction.select.placeholder")}</option>{choiceOptions.map(({ value, label }, index) => <option key={`${typeof value}:${String(value)}`} value={index}>{label}</option>)}</Select>
+          ? <SelectControl label={typeof request.schema?.title === "string" ? request.schema.title : t("interaction.input.label")} value={values.value === undefined ? "" : String(choiceOptions.findIndex(({ value }) => Object.is(value, values.value)))} options={[{ value: "", label: t("interaction.select.placeholder") }, ...choiceOptions.map(({ label }, index) => ({ value: String(index), label }))]} onValueChange={(value) => setValues({ value: value === "" ? undefined : choiceOptions[Number(value)]?.value })} />
           : request.data?.multiline === true
             ? <Textarea id={`interaction-${request.id}-value`} value={String(values.value ?? "")} onChange={(event) => setValues({ value: event.target.value })} />
             : <Input id={`interaction-${request.id}-value`} type={request.schema?.type === "number" || request.schema?.type === "integer" ? "number" : request.schema?.format === "email" ? "email" : "text"} value={String(values.value ?? "")} onChange={(event) => setValues({ value: interactionInputValue(request.schema?.type, event.target.value, event.target.valueAsNumber) })} />}
@@ -205,7 +208,7 @@ export function InteractionRenderer({
       ? <Checkbox key={key} label={schema.title ?? key} checked={values[key] === true} onCheckedChange={(checked) => setValues((current) => ({ ...current, [key]: checked }))} />
       : <Field key={key} label={schema.title ?? key} htmlFor={`interaction-${request.id}-${key}`} hint={schema.description} error={submitted ? errors[key] : undefined}>
         {schema.enum?.length
-          ? <Select id={`interaction-${request.id}-${key}`} value={values[key] === undefined ? "" : String(schema.enum.findIndex((value) => Object.is(value, values[key])))} onChange={(event) => setValues((current) => ({ ...current, [key]: schema.enum?.[Number(event.target.value)] }))}><option value="">{t("interaction.select.placeholder")}</option>{schema.enum.map((value, index) => <option key={`${typeof value}:${String(value)}`} value={index}>{String(value)}</option>)}</Select>
+          ? <SelectControl label={schema.title ?? key} value={values[key] === undefined ? "" : String(schema.enum.findIndex((value) => Object.is(value, values[key])))} options={[{ value: "", label: t("interaction.select.placeholder") }, ...schema.enum.map((value, index) => ({ value: String(index), label: String(value) }))]} onValueChange={(value) => setValues((current) => ({ ...current, [key]: value === "" ? undefined : schema.enum?.[Number(value)] }))} />
           : <Input id={`interaction-${request.id}-${key}`} type={schema.type === "number" || schema.type === "integer" ? "number" : schema.format === "email" ? "email" : "text"} value={String(values[key] ?? "")} onChange={(event) => setValues((current) => ({ ...current, [key]: schema.type === "number" || schema.type === "integer" ? event.target.valueAsNumber : event.target.value }))} />}
       </Field>)}</div>}
 
@@ -221,6 +224,6 @@ export function InteractionRenderer({
     {request.kind === "oauth" && <div className={styles.oauth}><strong>{String(request.data?.provider ?? t("interaction.oauth.provider"))}</strong>{typeof request.data?.url === "string" && <a className={styles.oauthLink} href={request.data.url} target="_blank" rel="noreferrer">{t("interaction.oauth.open")}</a>}<small>{typeof values.connectionRef === "string" ? t("interaction.oauth.ready") : t("interaction.oauth.help")}</small></div>}
     {invalid && <p className={styles.error} role="alert">{t("interaction.validation.review")}</p>}
     {error && <p className={styles.error} role="alert">{error}</p>}
-    <footer><Button disabled={busy} onClick={() => void respond("cancel")}>{t("common.cancel")}</Button><Button disabled={busy} onClick={() => void respond("decline")}>{t("interaction.decline")}</Button><Button loading={busy} variant="primary" onClick={submit}>{request.kind === "oauth" ? t("interaction.oauth.complete") : t("interaction.submit")}</Button></footer>
-  </section>;
+    <footer><Button type="button" disabled={busy} onClick={() => void respond("cancel")}>{t("common.cancel")}</Button><Button type="button" disabled={busy} onClick={() => void respond("decline")}>{t("interaction.decline")}</Button><Button type="submit" loading={busy} variant="primary">{request.kind === "oauth" ? t("interaction.oauth.complete") : t("interaction.submit")}</Button></footer>
+  </Form>;
 }

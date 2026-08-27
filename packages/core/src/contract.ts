@@ -42,7 +42,7 @@ export interface HarnessIntegrationContract {
     readonly maxCostUsd?: number;
   };
   readonly integrationSurfaces: readonly {
-    readonly id: "sdk" | "cli" | "http" | "mcp";
+    readonly id: "sdk" | "cli" | "http";
     readonly label: string;
     readonly example: string;
   }[];
@@ -145,8 +145,12 @@ export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
 
   const assertions = (spec.tests ?? []).flatMap((test): readonly HarnessAssertion[] =>
     "assertions" in test && test.assertions ? test.assertions : test.assertion ? [test.assertion] : []);
-  const requiredConnections = [...new Set(components.flatMap(({ config }) =>
-    [text(config.connectionId), text(config.fallbackConnectionId)].filter((value): value is string => Boolean(value))))].sort();
+  const requiredConnections = [...new Set([
+    ...components.flatMap(({ config }) =>
+      [text(config.connectionId), text(config.fallbackConnectionId)].filter((value): value is string => Boolean(value))),
+    ...(spec.version === "0.3" ? Object.values(spec.agentTemplates ?? {}).flatMap((template) =>
+      "a2a" in template.runner ? [template.runner.a2a.connection] : []) : []),
+  ])].sort();
   const outputComponent = components.find(({ graph, component }) => graph === "root" && component.id === spec.entrypoint && component.type === "output");
   const retry = spec.version !== "0.1" ? spec.runtime?.retry : undefined;
   const budget = spec.version !== "0.1" ? spec.runtime?.budget : undefined;
@@ -184,7 +188,6 @@ export function describeHarness(spec: HarnessSpec): HarnessIntegrationContract {
       { id: "sdk", label: "TypeScript SDK", example: "await Harnest.load(file).then(h => h.invoke(input))" },
       { id: "cli", label: "CLI", example: "harnest run <file> --input <value>" },
       { id: "http", label: "HTTP service", example: "harnest serve <file>" },
-      { id: "mcp", label: "MCP server", example: "harnest mcp serve <file>" },
     ],
   };
 }

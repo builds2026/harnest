@@ -275,7 +275,7 @@ subgraphs:
         config:
           maxTurns: 10
           maxToolCalls: 32
-          toolError: model
+          toolError: fail
       - id: output
         type: output
         config:
@@ -337,7 +337,7 @@ subgraphs:
         config:
           maxTurns: 10
           maxToolCalls: 32
-          toolError: model
+          toolError: fail
       - id: output
         type: output
         config:

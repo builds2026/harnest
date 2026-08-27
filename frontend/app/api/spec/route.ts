@@ -16,7 +16,7 @@ import {
 } from "@/lib/server";
 import { hostCapabilityDiagnosticsFor, studioCapabilityPolicy } from "@/lib/runtime-config";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
-import { FileHarnessVersionStore, compareHarnessVersions, summarizeHarnessDiff } from "@/lib/harness-version-store";
+import { FileHarnessVersionStore, compareHarnessVersions, sameHarnessRuntime, summarizeHarnessDiff } from "@/lib/harness-version-store";
 
 export const runtime = "nodejs";
 
@@ -38,6 +38,7 @@ function serializeSave<T>(file: string, task: () => Promise<T>): Promise<T> {
 
 export async function GET() {
   const file = harnessFile();
+  const capabilityPolicy = studioCapabilityPolicy(process.env);
   try {
     if (!(await fileExists(file))) {
       return Response.json({
@@ -46,6 +47,7 @@ export async function GET() {
         file: basename(file),
         exists: false,
         catalog: createBuiltinComponentRegistry().catalog(),
+        capabilityPolicy,
       });
     }
     const loaded = await loadHarnestProjectSpec(file);
@@ -59,6 +61,7 @@ export async function GET() {
         exists: true,
         catalog: resources.components.catalog(),
         diagnostics: resources.diagnostics,
+        capabilityPolicy,
         ...(loaded.project ? { project: {
           root: basename(loaded.project.projectDirectory),
           manifest: loaded.project.manifest,
@@ -119,7 +122,6 @@ export async function PUT(request: Request) {
             "harnest.yaml changed in another tab. Refresh before saving again.",
             409,
           ));
-          await store.record(previousYaml, "Current Harness before save");
         }
       } else if (baseYaml !== stringifySpec(EMPTY_SPEC)) return apiErrorResponse(new ApiRequestError(
         "SPEC_CONFLICT",
@@ -128,10 +130,12 @@ export async function PUT(request: Request) {
       ));
       const savedYaml = stringifySpec(parsed.spec);
       const unchanged = previousYaml === savedYaml;
+      const layoutOnly = previousYaml !== undefined && sameHarnessRuntime(previousYaml, savedYaml);
+      if (previousYaml && !layoutOnly) await store.record(previousYaml, "Current Harness before save");
       if (!unchanged) await saveHarnestProjectSpec(file, parsed.spec);
-      await store.record(savedYaml, previousYaml
-        ? summarizeHarnessDiff(compareHarnessVersions(previousYaml, savedYaml))
-        : "Initial Harness");
+      if (!layoutOnly) await store.record(savedYaml, previousYaml
+          ? summarizeHarnessDiff(compareHarnessVersions(previousYaml, savedYaml))
+          : "Initial Harness");
       return Response.json({
         ok: true,
         unchanged,

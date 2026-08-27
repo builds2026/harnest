@@ -62,6 +62,9 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? value as Record<string, unknown>
     : undefined;
 
+const CREDENTIAL_FIELD = /(?:password|passphrase|secret|token|api[-_]?key|access[-_]?token|credential|private[-_]?key)/iu;
+const SECRET_VALUE = /(?:\bbearer\s+[A-Za-z0-9._~+/=-]+|\b(?:password|secret|token|api[-_]?key)\s*[=:]\s*\S+|\bsk-[A-Za-z0-9_-]{12,}|\benv:[A-Za-z_][A-Za-z0-9_]*)/i;
+
 const hasModelPricing = (component: ComponentSpec): boolean => component.type !== "model"
   || (typeof component.config.inputCostPerMillion === "number"
     && typeof component.config.outputCostPerMillion === "number");
@@ -436,19 +439,33 @@ function validateGraphBody(
         "Install and list its module under runtime.adapters, or register it through the SDK",
       ));
       const reference = component.config.apiKey;
-      if (!hasConnection && reference !== undefined) {
+      if (reference !== undefined) {
         if (typeof reference !== "string" || !/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(reference)) diagnostics.push(diagnostic(
           "SECRET_LITERAL",
           `${componentPath}.config.apiKey`,
           "apiKey must be an env:NAME reference, not a literal secret",
           component.id,
         ));
-        else if (options.env && !options.env[reference.slice(4)]) diagnostics.push(diagnostic(
+        else if (!hasConnection && options.env && !options.env[reference.slice(4)]) diagnostics.push(diagnostic(
           "ENV_MISSING",
           `${componentPath}.config.apiKey`,
           `Environment variable '${reference.slice(4)}' is not set`,
           component.id,
         ));
+      }
+      if (typeof component.config.baseUrl === "string") {
+        try {
+          const url = new URL(component.config.baseUrl);
+          if (url.username || url.password
+            || [...url.searchParams].some(([name, value]) => CREDENTIAL_FIELD.test(name) || SECRET_VALUE.test(value))) {
+            diagnostics.push(diagnostic(
+              "SECRET_LITERAL",
+              `${componentPath}.config.baseUrl`,
+              "baseUrl must not contain credentials; use an apiKey env reference or saved Provider Connection",
+              component.id,
+            ));
+          }
+        } catch { /* Config schema reports malformed URLs. */ }
       }
       if (!hasConnection && reference === undefined && typeof adapter === "string" && options.env && options.registry?.has(adapter)) {
         for (const required of options.registry.get(adapter).requiredCredentials ?? []) {
@@ -502,7 +519,9 @@ function validateGraphBody(
       ));
     }
     if ((component.type === "local-tool" || component.type === "tool") && typeof component.config.tool === "string"
-      && typeof component.config.connectionId !== "string" && options.tools && !options.tools.has(component.config.tool)) {
+      && (typeof component.config.connectionId !== "string" || component.config.tool.startsWith("builtin.")
+        || component.config.source === "builtin")
+      && options.tools && !options.tools.has(component.config.tool)) {
       diagnostics.push(diagnostic(
         "TOOL_NOT_REGISTERED",
         `${componentPath}.config.tool`,
@@ -521,11 +540,13 @@ function validateGraphBody(
       && options.tools?.has(component.config.tool)
       && (options.tools.get(component.config.tool).connectionKinds?.length ?? 0) > 0
       && (typeof component.config.connectionId !== "string" || component.config.connectionId.length === 0)) {
+      const connectionKinds = options.tools.get(component.config.tool).connectionKinds!;
       diagnostics.push(diagnostic(
         "TOOL_CONNECTION_REQUIRED",
         `${componentPath}.config.connectionId`,
-        `Tool '${component.config.tool}' requires a compatible Connection`,
+        `Tool '${component.config.tool}' requires a compatible Connection (${connectionKinds.join(" or ")})`,
         component.id,
+        `Configure a saved Connection whose kind is ${connectionKinds.join(" or ")}`,
       ));
     }
     if (component.type === "local-tool" && typeof component.config.tool === "string"

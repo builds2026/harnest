@@ -177,6 +177,31 @@ export class Harnest {
     return this.#runtime().invoke(input, options);
   }
 
+  async localConnectionHealth(signal?: AbortSignal): Promise<{
+    ok: boolean;
+    requiredConnections: string[];
+    readyConnections: string[];
+    errors: Array<{ connectionId: string; message: string }>;
+  }> {
+    this.#assertOpen();
+    const requiredConnections = [...new Set(this.contract.tools.flatMap(({ tool, connectionId }) =>
+      tool && connectionId && this.#tools.has(tool)
+        && this.#tools.get(tool).connectionKinds?.includes("local-runtime") ? [connectionId] : []))];
+    const readyConnections: string[] = [];
+    const errors: Array<{ connectionId: string; message: string }> = [];
+    for (const connectionId of requiredConnections) {
+      try {
+        await this.#services.connectionManager.require(connectionId, "local-runtime");
+        const tested = await this.#services.connectionManager.test(connectionId, signal ? { signal } : {});
+        await this.#services.connectionManager.assertProcessApproved(tested);
+        readyConnections.push(connectionId);
+      } catch (error) {
+        errors.push({ connectionId, message: error instanceof Error ? error.message : "Local runtime is unavailable" });
+      }
+    }
+    return { ok: errors.length === 0, requiredConnections, readyConnections, errors };
+  }
+
   test(options: Omit<HarnessTestOptions, "env" | "components" | "tools" | "services" | "eventSink"> = {}): Promise<HarnessTestReport> {
     this.#assertOpen();
     return runHarnessTests(this.spec, this.#adapters, {

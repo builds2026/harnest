@@ -36,7 +36,25 @@ describe("v1.3 Integration Contract", () => {
     });
     expect(contract.output).toEqual({ component: "output", format: "json", schemaDeclared: true });
     expect(contract.policy).toEqual({ timeoutMs: 30_000, retryAttempts: 2, maxTokens: 8_000, maxCostUsd: 1 });
-    expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http", "mcp"]);
+    expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http"]);
     expect(JSON.stringify(contract)).not.toContain("never-print-me");
+  });
+
+  it("includes remote Agent Template connections once in sorted order", () => {
+    const spec = {
+      version: "0.3",
+      components: [
+        { id: "tool", type: "tool", config: { tool: "fixture", connectionId: "shared" } },
+        { id: "output", type: "output", config: {} },
+      ],
+      connections: [],
+      entrypoint: "output",
+      agentTemplates: {
+        remote: { description: "Remote agent", runner: { a2a: { connection: "remote" } } },
+        duplicate: { description: "Shared remote agent", runner: { a2a: { connection: "shared" } } },
+      },
+    } satisfies HarnessSpec;
+
+    expect(describeHarness(spec).requiredConnections).toEqual(["remote", "shared"]);
   });
 });

@@ -12,6 +12,7 @@ import type {
 } from "@/lib/studio-state";
 import {
   connectionCanRun,
+  connectionDetails,
   type ConnectionKind,
   type ConnectionSummary,
 } from "@/lib/connections";
@@ -299,7 +300,7 @@ function ConnectionField({
         <label htmlFor={`connection-${component.id}`}>{t("inspector.reusableConnection")}</label>
         <select id={`connection-${component.id}`} disabled={locked} value={selectedId} onChange={(event) => update(event.target.value)}>
           <option value="">{t("inspector.chooseConnection")}</option>
-          {compatible.map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionLabel(t, connection.kind)} · {t(`connections.status.${connection.status}`)}</option>)}
+          {compatible.map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionDetails(connection) ?? connectionLabel(t, connection.kind)} · {t(`connections.status.${connection.status}`)}</option>)}
         </select>
         {selected
           ? <span className={`field-help connection-inline-status is-${selected.status}`}>{t(`connections.status.${selected.status}`)}</span>
@@ -309,7 +310,7 @@ function ConnectionField({
         <label htmlFor={`fallback-connection-${component.id}`}>{t("inspector.fallback")}</label>
         <select id={`fallback-connection-${component.id}`} disabled={locked || !selectedId} value={fallbackId} onChange={(event) => updateFallback(event.target.value)}>
           <option value="">{t("inspector.noFallback")}</option>
-          {compatible.filter(({ id }) => id !== selectedId).map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {t(`connections.status.${connection.status}`)}</option>)}
+          {compatible.filter(({ id }) => id !== selectedId).map((connection) => <option key={connection.id} value={connection.id} disabled={!connectionCanRun(connection)}>{connection.name} · {connectionDetails(connection) ?? connectionLabel(t, connection.kind)} · {t(`connections.status.${connection.status}`)}</option>)}
         </select>
         <span className="field-help">{t("inspector.fallbackHelp")}</span>
       </div>}
@@ -482,6 +483,9 @@ export function Inspector({
   projectGraph,
   projectLocked = false,
   onProjectChanged,
+  pinned = false,
+  onPinnedChange,
+  onRename,
 }: {
   node?: HarnessNode;
   edge?: HarnessEdge;
@@ -504,9 +508,18 @@ export function Inspector({
   projectGraph?: string;
   projectLocked?: boolean;
   onProjectChanged?: () => void | Promise<void>;
+  pinned?: boolean;
+  onPinnedChange?: (pinned: boolean) => void;
+  onRename?: (nextId: string) => string | undefined;
 }) {
   const { t } = useI18n();
   const inspectorRef = useRef<HTMLDivElement>(null);
+  const [renameId, setRenameId] = useState(node?.id ?? "");
+  const [renameError, setRenameError] = useState("");
+  useEffect(() => {
+    setRenameId(node?.id ?? "");
+    setRenameError("");
+  }, [node?.id]);
   useEffect(() => {
     if (!focusPath || !node) return undefined;
     let timeout: number | undefined;
@@ -559,6 +572,20 @@ export function Inspector({
         <Tabs.Panel value="settings" className="inspector-tab-panel">
           <fieldset disabled={locked} className="inspector-fieldset">
             <div className="field-grid">
+              {onRename && <form className="field" data-config-path="id" onSubmit={(event) => {
+                event.preventDefault();
+                const nextId = renameId.trim();
+                if (nextId === component.id) {
+                  setRenameError("");
+                  return;
+                }
+                setRenameError(onRename(nextId) ?? "");
+              }}>
+                <label htmlFor={`component-id-${component.id}`}>{t("inspector.componentId")}</label>
+                <input id={`component-id-${component.id}`} value={renameId} maxLength={64} pattern="[A-Za-z][A-Za-z0-9_-]*" aria-invalid={Boolean(renameError)} onChange={(event) => { setRenameId(event.target.value); setRenameError(""); }} />
+                {renameError && <span className="field-help is-error" role="alert">{renameError}</span>}
+                <button className="button" type="submit" disabled={locked || renameId.trim() === component.id}>{t("inspector.rename")}</button>
+              </form>}
               {component.type === "tool" && <ToolCatalogField component={component} tools={tools ?? []} locked={locked} onChange={onChange} />}
               {onOpenConnections && hasConnectionField && <ConnectionField component={component} connections={connections ?? []} tools={tools ?? []} locked={locked} onChange={onChange} onConnect={onOpenConnections} />}
               {onProjectChanged && <ProjectBindingField component={component} graph={projectGraph} locked={locked || projectLocked} onChanged={onProjectChanged} />}
@@ -567,13 +594,14 @@ export function Inspector({
                 ? primaryFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)
                 : <div className="field-help">{t("inspector.noConfig")}</div>}
               {advancedFields.length > 0 && <details className="advanced-panel"><summary>{t("inspector.advanced")}</summary><div className="field-grid">{advancedFields.map((field) => <ConfigField key={field.path} component={component} field={field} disabled={locked} onChange={onChange} />)}</div></details>}
-              {specVersion === "0.2" && <ComponentPolicyFields component={component} locked={locked} onChange={onChange} />}
+              {specVersion !== "0.1" && <ComponentPolicyFields component={component} locked={locked} onChange={onChange} />}
             </div>
           </fieldset>
           <div className="inspector-actions is-split">
             <span>
               {subgraph && onOpenSubgraph && <button className="button" disabled={locked} onClick={() => onOpenSubgraph(subgraph)}>{subgraphs?.includes(subgraph) ? t("inspector.openSubgraph") : t("inspector.createSubgraph")}</button>}
               {canSetEntrypoint && entrypoint !== component.id && <button className="button" disabled={locked} onClick={onSetEntrypoint}>{t("inspector.setEntrypoint")}</button>}
+              {specVersion === "0.3" && onPinnedChange && <button className="button" disabled={locked} aria-pressed={pinned} onClick={() => onPinnedChange(!pinned)}>{t(pinned ? "inspector.unpin" : "inspector.pin")}</button>}
             </span>
             <button className="button" disabled={locked} onClick={onDelete}>{t("inspector.deleteComponent")}</button>
           </div>

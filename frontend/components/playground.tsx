@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { Popover } from "@base-ui/react/popover";
+import { Tabs } from "@base-ui/react/tabs";
 import type { Diagnostic, RunEvent } from "@harnestai/core";
 import { HarnestClient } from "@harnestai/sdk";
 import { readNdjson } from "@/lib/ndjson";
@@ -15,7 +17,8 @@ import type {
 } from "@/lib/playground";
 import { useI18n } from "./i18n-provider";
 import { InteractionRenderer, type InteractionResponseView, type InteractionView } from "./interaction-renderer";
-import { ConfirmDialog } from "./ui/ui";
+import { Markdown } from "./markdown";
+import { ConfirmDialog, SelectControl } from "./ui/ui";
 
 interface PlaygroundProject {
   readonly ready: boolean;
@@ -150,12 +153,12 @@ function RunTimeline({ runId, events, live = false }: { runId?: string; events?:
 
 function FilePreview({ sessionId, file }: { sessionId: string; file?: PlaygroundFile }) {
   const { t } = useI18n();
-  const [text, setText] = useState("");
+  const [text, setText] = useState<string>();
   const [failed, setFailed] = useState(false);
   const url = file && file.source !== "sandbox"
     ? `/api/playground/files?sessionId=${encodeURIComponent(sessionId)}&fileId=${encodeURIComponent(file.id)}` : undefined;
   useEffect(() => {
-    setText("");
+    setText(undefined);
     setFailed(false);
     if (!url || file?.preview !== "text") return;
     const controller = new AbortController();
@@ -175,7 +178,7 @@ function FilePreview({ sessionId, file }: { sessionId: string; file?: Playground
   if (file.preview === "video") return <video className="file-preview-media" src={url} controls preload="metadata" />;
   if (file.preview === "audio") return <audio className="file-preview-audio" src={url} controls preload="metadata" />;
   if (file.preview === "pdf") return <iframe className="file-preview-frame" src={url} title={t("playground.files.previewNamed", { name: file.name })} sandbox="" />;
-  if (file.preview === "text") return <pre className="file-preview-text">{text || t("playground.file.loadingPreview")}</pre>;
+  if (file.preview === "text") return <pre className="file-preview-text">{text ?? t("playground.file.loadingPreview")}</pre>;
   return <div className="file-preview-empty"><span aria-hidden="true">▱</span><strong>{t("playground.file.noPreview")}</strong><small>{file.mimeType}</small></div>;
 }
 
@@ -325,7 +328,7 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   }, [project?.capabilities]);
 
   useEffect(() => {
-    const compact = window.matchMedia("(max-width: 920px)");
+    const compact = window.matchMedia("(max-width: 1180px)");
     const collapse = () => {
       if (compact.matches) { setLeftOpen(false); setRightOpen(false); }
     };
@@ -390,12 +393,12 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
 
   const showLeft = () => {
     setLeftOpen(true);
-    if (window.matchMedia("(max-width: 920px)").matches) setRightOpen(false);
+    if (window.matchMedia("(max-width: 1180px)").matches) setRightOpen(false);
   };
 
   const showRight = () => {
     setRightOpen(true);
-    if (window.matchMedia("(max-width: 920px)").matches) setLeftOpen(false);
+    if (window.matchMedia("(max-width: 1180px)").matches) setLeftOpen(false);
   };
 
   const openSession = async (id: string) => {
@@ -618,17 +621,24 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
   const uploadedFiles = files.filter(({ source }) => source === "upload");
   const sandboxFiles = [...files.filter(({ source }) => source === "artifact"), ...liveFiles];
   const previewFile = [...files, ...liveFiles].find(({ id }) => id === previewFileId);
-  const currentFiles = rightTab === "files" ? uploadedFiles : sandboxFiles;
   const selectedModel = project?.capabilities.models.find((option) => `${option.componentKey}\u0000${option.connectionId}` === modelValue);
   const readyToSend = Boolean(session && project?.ready && message.trim() && runState === "idle" && !uploading);
   const setupIssueCount = project?.diagnostics.filter(({ severity }) => severity === "error").length ?? 0;
+  const renderFilePanel = (tab: "files" | "sandbox") => {
+    const panelFiles = tab === "files" ? uploadedFiles : sandboxFiles;
+    return <Tabs.Panel value={tab} className="file-panel">
+      <div className="file-explorer-heading"><div><strong>{t(tab === "files" ? "playground.files.conversation" : "playground.files.output")}</strong><small>{t(tab === "files" ? "playground.files.mountHelp" : liveFiles.length ? "playground.files.liveHelp" : "playground.files.outputHelp")}</small></div>{tab === "files" && <label className={`mini-upload ${!canAttach ? "is-disabled" : ""}`}>＋<input type="file" multiple accept={project?.capabilities.attachments.accepted} disabled={!canAttach || uploading} onChange={(event) => void upload(event)} /></label>}</div>
+      <div className="file-list">{panelFiles.length ? panelFiles.map((file) => <div className={`file-row ${previewFileId === file.id ? "is-active" : ""}`} key={file.id}><button onClick={() => setPreviewFileId(file.id)}><span className={`file-kind is-${file.preview}`} aria-hidden="true">{file.source === "sandbox" ? "↻" : file.source === "artifact" ? "↳" : "▱"}</span><span><strong>{file.name}</strong><small>{bytes(file.size)} · {file.source === "sandbox" ? t("playground.files.writing") : file.mimeType}</small></span></button>{file.source !== "sandbox" && <label title={t("playground.files.useNext", { name: file.name })}><input type="checkbox" checked={selectedFileIds.has(file.id)} disabled={!canAttach || runState !== "idle"} onChange={() => toggleFile(file.id)} /><span className="sr-only">{t("playground.files.useNext", { name: file.name })}</span></label>} {file.source !== "sandbox" && <button className="file-remove" aria-label={t("playground.files.remove", { name: file.name })} onClick={() => void removeFile(file)}>×</button>}</div>) : <div className="file-list-empty"><span>{tab === "files" ? "＋" : "◇"}</span><strong>{t(tab === "files" ? "playground.files.emptyUploads" : "playground.files.emptyOutput")}</strong><small>{t(tab === "files" ? "playground.files.emptyUploadsHelp" : "playground.files.emptyOutputHelp")}</small></div>}</div>
+      <div className="file-preview"><div className="file-preview-heading"><div><strong>{previewFile?.name ?? t("playground.files.preview")}</strong>{previewFile && <small>{previewFile.sandboxPath ?? previewFile.mimeType}</small>}</div>{previewFile && previewFile.source !== "sandbox" && <a className="button" href={`/api/playground/files?sessionId=${encodeURIComponent(session?.id ?? "")}&fileId=${encodeURIComponent(previewFile.id)}&download=1`}>{t("common.download")}</a>}</div><FilePreview sessionId={session?.id ?? ""} file={previewFile} /></div>
+    </Tabs.Panel>;
+  };
 
   if (loading && !project) return <section className="playground-loading"><span className="playground-spinner" /><strong>{t("playground.loading")}</strong><small>{t("playground.loading.description")}</small></section>;
 
   return <section className={`playground ${leftOpen ? "has-left" : ""} ${rightOpen ? "has-right" : ""}`} aria-label={t("playground.aria")}>
     {leftOpen ? <aside className="playground-history" aria-label={t("playground.history.aria")}>
       <header><div><span className="sheet-eyebrow">{t("playground.conversations")}</span><strong>{t("playground.history")}</strong></div><button className="panel-toggle" aria-label={t("playground.history.collapse")} aria-expanded="true" onClick={() => setLeftOpen(false)}>←</button></header>
-      <button className="new-chat-button" disabled={runState !== "idle"} onClick={() => void createSession().then(({ id }) => loadSession(id))}><span>＋</span> {t("playground.newConversation")}</button>
+      <button className="new-chat-button" aria-label={t("playground.newConversation")} disabled={runState !== "idle"} onClick={() => void createSession().then(({ id }) => loadSession(id))}><span>＋</span> {t("playground.newConversation")}</button>
       <nav className="conversation-list" aria-label={t("playground.history.saved")}>
         {project?.sessions.map((item) => <div className={`conversation-item ${item.id === session?.id ? "is-active" : ""}`} key={item.id}>
           <button disabled={runState !== "idle"} onClick={() => void openSession(item.id)}><strong>{item.title}</strong><span>{item.preview || t("playground.noMessages")}</span><small>{formatDate(item.updatedAt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · {formatNumber(item.messageCount)}</small></button>
@@ -650,14 +660,14 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       <div className="playground-messages" aria-live="polite">
         {!session?.messages.length && !liveRun ? <div className="playground-empty-chat"><span className="empty-chat-mark">H</span><h2>{t("playground.empty.title")}</h2><p>{t("playground.empty.description")}</p><div><span>1</span> {t("playground.attach")} <span>2</span> {t("playground.capabilities")} <span>3</span> {t("nav.playground")}</div></div> : session?.messages.map((item) => <article className={`playground-message is-${item.role}`} key={item.id}>
           <div className="message-author"><span>{item.role === "user" ? t("playground.you") : "H"}</span><strong>{item.role === "user" ? t("playground.you") : t("playground.harness")}</strong><time>{formatTime(item.createdAt)}</time></div>
-          <div className="message-body"><div className="message-content">{item.content}</div>
+          <div className="message-body"><div className="message-content">{item.role === "assistant" ? <Markdown>{item.content}</Markdown> : item.content}</div>
             {item.fileIds?.length ? <div className="message-files">{item.fileIds.map((id) => <span key={id}>{files.find((file) => file.id === id)?.name ?? t("playground.attachedFile")}</span>)}</div> : null}
             {item.role === "assistant" && <><RunTimeline runId={item.runId} />{(item.usage || item.costUsd !== undefined) && <div className="message-usage"><span>{t("playground.tokens", { count: item.usage?.totalTokens ?? "—" })}</span>{item.usage?.cachedInputTokens ? <span>{t("playground.cachedTokens", { count: item.usage.cachedInputTokens })}</span> : null}{item.usage?.cachedInputTokens && item.usage.inputTokens ? <span>{t("playground.cacheHitRatio", { ratio: Math.round(item.usage.cachedInputTokens / item.usage.inputTokens * 100) })}</span> : null}{item.usage?.cacheWriteInputTokens ? <span>{t("playground.cacheWriteTokens", { count: item.usage.cacheWriteInputTokens })}</span> : null}<span>${(item.costUsd ?? 0).toFixed(6)}</span><span>{item.finishReason ?? t("playground.unknown")}</span></div>}</>}
           </div>
         </article>)}
         {liveRun && <article className="playground-message is-assistant">
           <div className="message-author"><span>H</span><strong>{t("playground.harness")}</strong><time>{t("playground.now")}</time></div>
-          <div className="message-body"><div className="working-label"><span className="is-live" />{runState === "cancelling" ? t("playground.cancelling") : runState === "paused" ? t("playground.waitingForInput") : liveRun.error ? t("common.needsAttention") : t("playground.working")}</div><div className="message-content">{liveRun.output ?? (liveRun.text || liveRun.error || "")}</div><RunTimeline runId={liveRun.runId} events={liveRun.events} live /></div>
+          <div className="message-body"><div className="working-label"><span className="is-live" />{runState === "cancelling" ? t("playground.cancelling") : runState === "paused" ? t("playground.waitingForInput") : liveRun.error ? t("common.needsAttention") : t("playground.working")}</div><div className="message-content"><Markdown>{liveRun.output ?? (liveRun.text || liveRun.error || "")}</Markdown></div><RunTimeline runId={liveRun.runId} events={liveRun.events} live /></div>
         </article>}
       </div>
 
@@ -668,8 +678,8 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
           <div className="composer-toolbar">
             <div className="composer-tools">
               <label className={`composer-tool-button ${!canAttach ? "is-disabled" : ""}`} title={canAttach ? t("playground.uploadHelp") : project?.capabilities.attachments.enabled ? t("playground.runnerDisabled") : t("playground.attachRunner")}>＋<span>{t("playground.attach")}</span><input type="file" multiple accept={project?.capabilities.attachments.accepted} disabled={!canAttach || uploading || runState !== "idle"} onChange={(event) => void upload(event)} /></label>
-              <details className="plugin-menu"><summary className="composer-tool-button"><span className="plugin-dot" />{t("playground.capabilities")} <small>{(project?.capabilities.plugins.length ?? 0) - disabledPlugins.size}/{project?.capabilities.plugins.length ?? 0}</small></summary><div className="plugin-menu-popover"><header><strong>{t("playground.runCapabilities")}</strong><small>{t("playground.connectedOnly")}</small></header>{project?.capabilities.plugins.length ? project.capabilities.plugins.map((plugin) => <label key={plugin.componentKey}><input type="checkbox" checked={!disabledPlugins.has(plugin.componentKey)} disabled={runState !== "idle"} onChange={() => togglePlugin(plugin.componentKey)} /><span><strong>{plugin.label}</strong><small>{plugin.kind.toLocaleUpperCase()} · {plugin.risk ?? t("playground.policyManaged")}</small></span></label>) : <p>{t("playground.noOptionalCapabilities")}</p>}</div></details>
-              {project?.capabilities.models.length ? <label className="model-picker"><span className="sr-only">{t("playground.modelForRun")}</span><select value={modelValue} disabled={runState !== "idle"} onChange={(event) => setModelValue(event.target.value)}>{project.capabilities.models.map((option) => <option key={`${option.componentKey}:${option.connectionId}`} value={`${option.componentKey}\u0000${option.connectionId}`}>{option.label}</option>)}</select></label> : <span className="harness-default-model">{t("playground.harnessModel")}</span>}
+              <Popover.Root><Popover.Trigger className="composer-tool-button"><span className="plugin-dot" />{t("playground.capabilities")} <small>{(project?.capabilities.plugins.length ?? 0) - disabledPlugins.size}/{project?.capabilities.plugins.length ?? 0}</small></Popover.Trigger><Popover.Portal><Popover.Positioner className="plugin-menu-positioner" side="top" align="start" sideOffset={8}><Popover.Popup className="plugin-menu-popover"><header><div><Popover.Title className="plugin-menu-title">{t("playground.runCapabilities")}</Popover.Title><Popover.Description className="plugin-menu-description">{t("playground.connectedOnly")}</Popover.Description></div><Popover.Close className="plugin-menu-close" aria-label={t("common.close")}>×</Popover.Close></header>{project?.capabilities.plugins.length ? project.capabilities.plugins.map((plugin) => <label key={plugin.componentKey}><input type="checkbox" checked={!disabledPlugins.has(plugin.componentKey)} disabled={runState !== "idle"} onChange={() => togglePlugin(plugin.componentKey)} /><span><strong>{plugin.label}</strong><small>{plugin.kind.toLocaleUpperCase()} · {plugin.risk ?? t("playground.policyManaged")}</small></span></label>) : <p>{t("playground.noOptionalCapabilities")}</p>}</Popover.Popup></Popover.Positioner></Popover.Portal></Popover.Root>
+              {project?.capabilities.models.length ? <SelectControl className="model-picker-control" label={t("playground.modelForRun")} value={modelValue} disabled={runState !== "idle"} onValueChange={setModelValue} options={project.capabilities.models.map((option) => ({ value: `${option.componentKey}\u0000${option.connectionId}`, label: option.label }))} /> : <span className="harness-default-model">{t("playground.harnessModel")}</span>}
             </div>
             {runState === "idle" ? <button className="send-button" disabled={!readyToSend} aria-label={t("playground.send")} onClick={() => void run()}>↑</button> : <button className="stop-button" aria-label={t("playground.cancelRun")} onClick={cancel}>■</button>}
           </div>
@@ -678,13 +688,15 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
       </div>
     </section>
 
-    {rightOpen ? <aside className="playground-files" aria-label={t("playground.filesAndSandbox")}>
-      <header><div className="file-tabs" role="tablist" aria-label={t("playground.resources")}>
-        {project?.capabilities.attachments.enabled && <button role="tab" aria-selected={rightTab === "files"} className={rightTab === "files" ? "is-active" : ""} onClick={() => setRightTab("files")}>{t("playground.uploads")} <span>{uploadedFiles.length}</span></button>}
-        {project?.capabilities.attachments.enabled && <button role="tab" aria-selected={rightTab === "sandbox"} className={rightTab === "sandbox" ? "is-active" : ""} onClick={() => setRightTab("sandbox")}>{t("playground.sandbox")} <span>{sandboxFiles.length}</span></button>}
-        <button role="tab" aria-selected={rightTab === "details"} className={rightTab === "details" ? "is-active" : ""} onClick={() => setRightTab("details")}>{t("playground.details")}</button>
-      </div><button className="panel-toggle" aria-label={t("playground.files.collapse")} aria-expanded="true" onClick={() => setRightOpen(false)}>→</button></header>
-      {rightTab === "details" ? <div className="playground-details">
+    {rightOpen ? <Tabs.Root render={<aside className="playground-files" aria-label={t("playground.filesAndSandbox")} />} value={rightTab} onValueChange={(value) => { if (value === "files" || value === "sandbox" || value === "details") setRightTab(value); }}>
+      <header><Tabs.List className="file-tabs" aria-label={t("playground.resources")} activateOnFocus>
+        {project?.capabilities.attachments.enabled && <Tabs.Tab value="files" className={rightTab === "files" ? "is-active" : ""}>{t("playground.uploads")} <span>{uploadedFiles.length}</span></Tabs.Tab>}
+        {project?.capabilities.attachments.enabled && <Tabs.Tab value="sandbox" className={rightTab === "sandbox" ? "is-active" : ""}>{t("playground.sandbox")} <span>{sandboxFiles.length}</span></Tabs.Tab>}
+        <Tabs.Tab value="details" className={rightTab === "details" ? "is-active" : ""}>{t("playground.details")}</Tabs.Tab>
+      </Tabs.List><button className="panel-toggle" aria-label={t("playground.files.collapse")} aria-expanded="true" onClick={() => setRightOpen(false)}>→</button></header>
+      {project?.capabilities.attachments.enabled && renderFilePanel("files")}
+      {project?.capabilities.attachments.enabled && renderFilePanel("sandbox")}
+      <Tabs.Panel value="details" className="playground-details">
         <div className={`readiness-card ${project?.ready ? "is-ready" : "is-blocked"}`}><span>{project?.ready ? t("common.ready") : t("playground.status.blocked")}</span><strong>{project?.ready ? t("playground.status.canRun") : t("playground.status.issues", { count: setupIssueCount })}</strong></div>
         <dl><div><dt>{t("playground.details.models")}</dt><dd>{project?.capabilities.models.length || t("playground.details.harnessDefault")}</dd></div><div><dt>{t("playground.details.optional")}</dt><dd>{project?.capabilities.plugins.length ?? 0}</dd></div><div><dt>{t("playground.details.workspace")}</dt><dd>{codeRunnerEnabled ? t("playground.details.codeRunner") : project?.capabilities.attachments.directModelInput ? t("playground.details.directMedia") : t("playground.details.unsupported")}</dd></div><div><dt>{t("playground.details.replay")}</dt><dd>{t("playground.details.replayValue")}</dd></div><div><dt>{t("playground.details.retention")}</dt><dd>{t("playground.details.daysInactive", { count: project?.retentionDays ?? 30 })}</dd></div></dl>
         <section><strong>{t("playground.details.isolation")}</strong><p>{t("playground.details.isolationHelp")}</p></section>
@@ -692,12 +704,8 @@ export function Playground({ onOpenBuilder }: { onOpenBuilder: () => void }) {
         {project?.diagnostics.length ? <section><strong>{t("playground.details.diagnostics")}</strong><ul>{project.diagnostics.slice(0, 8).map((diagnostic, index) => <li key={`${diagnostic.code}:${index}`}>{diagnostic.message}</li>)}</ul></section> : null}
         <button className="button" onClick={() => void refreshProject().catch((error: unknown) => setNotice(apiErrorMessage(error, t("playground.error.refresh"), t)))}>{t("playground.details.refresh")}</button>
         <button className="button" onClick={onOpenBuilder}>{t("playground.details.openBuilder")}</button>
-      </div> : <>
-        <div className="file-explorer-heading"><div><strong>{t(rightTab === "files" ? "playground.files.conversation" : "playground.files.output")}</strong><small>{t(rightTab === "files" ? "playground.files.mountHelp" : liveFiles.length ? "playground.files.liveHelp" : "playground.files.outputHelp")}</small></div>{rightTab === "files" && <label className={`mini-upload ${!canAttach ? "is-disabled" : ""}`}>＋<input type="file" multiple accept={project?.capabilities.attachments.accepted} disabled={!canAttach || uploading} onChange={(event) => void upload(event)} /></label>}</div>
-        <div className="file-list">{currentFiles.length ? currentFiles.map((file) => <div className={`file-row ${previewFileId === file.id ? "is-active" : ""}`} key={file.id}><button onClick={() => setPreviewFileId(file.id)}><span className={`file-kind is-${file.preview}`} aria-hidden="true">{file.source === "sandbox" ? "↻" : file.source === "artifact" ? "↳" : "▱"}</span><span><strong>{file.name}</strong><small>{bytes(file.size)} · {file.source === "sandbox" ? t("playground.files.writing") : file.mimeType}</small></span></button>{file.source !== "sandbox" && <label title={t("playground.files.useNext", { name: file.name })}><input type="checkbox" checked={selectedFileIds.has(file.id)} disabled={!canAttach || runState !== "idle"} onChange={() => toggleFile(file.id)} /><span className="sr-only">{t("playground.files.useNext", { name: file.name })}</span></label>} {file.source !== "sandbox" && <button className="file-remove" aria-label={t("playground.files.remove", { name: file.name })} onClick={() => void removeFile(file)}>×</button>}</div>) : <div className="file-list-empty"><span>{rightTab === "files" ? "＋" : "◇"}</span><strong>{t(rightTab === "files" ? "playground.files.emptyUploads" : "playground.files.emptyOutput")}</strong><small>{t(rightTab === "files" ? "playground.files.emptyUploadsHelp" : "playground.files.emptyOutputHelp")}</small></div>}</div>
-        <div className="file-preview"><div className="file-preview-heading"><div><strong>{previewFile?.name ?? t("playground.files.preview")}</strong>{previewFile && <small>{previewFile.sandboxPath ?? previewFile.mimeType}</small>}</div>{previewFile && previewFile.source !== "sandbox" && <a className="button" href={`/api/playground/files?sessionId=${encodeURIComponent(session?.id ?? "")}&fileId=${encodeURIComponent(previewFile.id)}&download=1`}>{t("common.download")}</a>}</div><FilePreview sessionId={session?.id ?? ""} file={previewFile} /></div>
-      </>}
-    </aside> : <button className="collapsed-panel-button is-right" aria-label={t("playground.files.expand")} aria-expanded="false" onClick={showRight}>← {t("playground.files")}</button>}
+      </Tabs.Panel>
+    </Tabs.Root> : <button className="collapsed-panel-button is-right" aria-label={t("playground.files.expand")} aria-expanded="false" onClick={showRight}>← {t("playground.files")}</button>}
 
     {pendingInteraction && <InteractionRenderer
       request={pendingInteraction}

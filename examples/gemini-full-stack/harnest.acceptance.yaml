@@ -130,7 +130,7 @@ subgraphs:
           maxTurns: 4
           maxToolCalls: 2
           toolTimeoutMs: 5000
-          toolError: model
+          toolError: fail
           allowTools:
             - demo.release-check
       - id: schemaCheck

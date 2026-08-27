@@ -42,7 +42,7 @@ import type {
   ServiceResult,
 } from "./component.js";
 import type { RunEvent } from "./runtime.js";
-import type { RunSnapshot } from "./orchestration.js";
+import type { InteractionRequest, RunSnapshot } from "./orchestration.js";
 import { normalizeSpec } from "./graph.js";
 import { acquireRunExecutionLease, releaseRunExecutionLease } from "./node-run-idempotency.js";
 import {
@@ -1943,6 +1943,14 @@ export class NodeRuntimeServices implements RuntimeServices {
     };
   }
 
+  canResolveInteraction(request: InteractionRequest): boolean {
+    if (this.#options.requestToolApproval) return true;
+    const data = request.data && typeof request.data === "object" ? request.data as Record<string, unknown> : undefined;
+    const permission = data?.permission && typeof data.permission === "object"
+      ? data.permission as Record<string, unknown> : undefined;
+    return typeof permission?.toolId === "string" && this.#options.approvedToolIds?.includes(permission.toolId) === true;
+  }
+
   listToolPermissions(): Promise<PersistedToolPermission[]> {
     return this.#toolPermissions.list(this.#harnessId);
   }
@@ -2685,6 +2693,33 @@ export class FileRunStore {
       });
     }
     return summaries;
+  }
+
+  delete(runId: string): Promise<boolean> {
+    if (!RUN_ID.test(runId)) return Promise.reject(new Error("Run id is invalid"));
+    let deleted = false;
+    const remove = async () => {
+      const root = await this.#root;
+      await acquireRunExecutionLease(root, runId);
+      try {
+        const directory = await storageDirectory(root, "runs");
+        const bundle = await this.#bundle(directory, runId);
+        if (bundle) {
+          await rm(bundle, { recursive: true, force: true });
+          deleted = true;
+        }
+        try {
+          const legacy = await runFile(directory, runId);
+          await rm(legacy.path, { force: true });
+          deleted = true;
+        } catch (error) {
+          if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+        }
+      } finally {
+        await releaseRunExecutionLease(root, runId);
+      }
+    };
+    return this.#enqueue(runId, remove).then(() => deleted);
   }
 
   async #append(event: RunEvent): Promise<void> {

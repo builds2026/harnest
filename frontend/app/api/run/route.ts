@@ -6,7 +6,7 @@ import {
 } from "@harnestai/core";
 import { loadSpecFile } from "@harnestai/core/node";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
-import { approvalBroker } from "@/lib/approval-broker";
+import { runRegistry } from "@/lib/run-registry";
 import {
   diagnosticResponse,
   harnessFile,
@@ -31,9 +31,7 @@ export async function POST(request: Request) {
 
   const loaded = await loadSpecFile(harnessFile());
   if (!loaded.ok) return diagnosticResponse(loaded.diagnostics);
-  const resources = await runtimeResourcesFor(loaded.spec, {
-    requestToolApproval: (approval, context) => approvalBroker.request(approval, context.signal),
-  });
+  const resources = await runtimeResourcesFor(loaded.spec);
   const validation = validateSpec(loaded.spec, {
     registry: resources.adapters,
     components: resources.components,
@@ -55,26 +53,26 @@ export async function POST(request: Request) {
     return diagnosticResponse([requestDiagnostic("Could not start the harness runtime")], 500);
   }
 
-  const iterator = runtimeInstance.stream(input, { signal: request.signal })[Symbol.asyncIterator]();
+  const handle = runtimeInstance.start(input, { signal: request.signal });
+  await runRegistry.add(handle, () => resources.services.close());
+  const iterator = (runRegistry.stream(handle.runId, 0, [], request.signal) as AsyncIterable<RunEvent>)[Symbol.asyncIterator]();
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await iterator.next();
         if (next.done) {
-          await resources.services.close();
           controller.close();
           return;
         }
         controller.enqueue(encoder.encode(`${JSON.stringify(next.value satisfies RunEvent)}\n`));
       } catch {
-        await resources.services.close();
         controller.close();
       }
     },
     async cancel() {
       await iterator.return?.();
-      await resources.services.close();
+      await runRegistry.cancel(handle.runId);
     },
   });
 

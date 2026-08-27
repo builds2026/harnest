@@ -10,6 +10,11 @@ export function diagnosticFieldPath(path: string): string | undefined {
   return segments.at(-1);
 }
 
+export function diagnosticGraphName(path: string): string | undefined {
+  const normalized = path.replace(/^\$\.?/, "").replace(/\[(?:"|')?([^\]"']+)(?:"|')?\]/g, ".$1");
+  return normalized.match(/^subgraphs\.([^.]+)\./)?.[1];
+}
+
 export function diagnosticRecoveryAction(diagnostic: Pick<Diagnostic, "code" | "path" | "message" | "componentId">): DiagnosticRecoveryAction {
   const text = `${diagnostic.code} ${diagnostic.message}`.toLocaleUpperCase();
   if (/CONNECTION|CREDENTIAL|PROVIDER|OAUTH|MCP.*AUTH/.test(text)) return "connect-service";

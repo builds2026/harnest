@@ -1,18 +1,25 @@
 .card { border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--surface-raised); padding: 16px; display: grid; gap: 14px; max-width: 720px; }
 .card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.card header span { color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.card header span { color: var(--text-tertiary); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .card h3 { margin: 3px 0 0; font-size: 16px; }
-.card time { color: var(--text-muted); font-size: 11px; }
+.card time { color: var(--text-tertiary); font-size: 11px; }
 .message { margin: 0; color: var(--text-secondary); line-height: 1.55; }
 .form, .fileList { display: grid; gap: 12px; }
 .oauth { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; display: grid; gap: 7px; }
-.oauth small { color: var(--text-muted); }
+.oauth small { color: var(--text-tertiary); }
 .oauthLink { color: var(--accent); font-weight: 700; width: fit-content; }
-.preview { overflow: auto; max-height: 260px; margin: 0; padding: 12px; border-radius: var(--radius-md); background: var(--surface-sunken); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.preview { overflow: auto; max-height: 260px; margin: 0; padding: 12px; border-radius: var(--radius-md); color: var(--code-text); background: var(--code-bg); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .error { color: var(--danger); margin: 0; font-size: 12px; }
-.card footer, .permissionActions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
-.backdrop { position: fixed; inset: 0; background: rgb(5 8 13 / .72); z-index: var(--z-modal, 80); }
-.viewport { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px; z-index: calc(var(--z-modal, 80) + 1); }
-.dialog { width: min(680px, 100%); max-height: min(760px, 90vh); overflow: auto; background: var(--surface-raised); border: 1px solid var(--border-strong); border-radius: var(--radius-xl); box-shadow: var(--shadow-xl); padding: 20px; display: grid; gap: 16px; }
+.card footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.backdrop { position: fixed; inset: 0; z-index: 200; background: var(--overlay); }
+.viewport { position: fixed; inset: 0; z-index: 201; display: grid; place-items: center; padding: 20px; }
+.dialog { width: min(680px, 100%); max-height: min(760px, 90vh); overflow: auto; padding: 20px; border: 1px solid var(--border-strong); border-radius: var(--radius-lg); color: var(--text-primary); background: var(--surface-raised); box-shadow: var(--shadow-lg); display: grid; gap: 16px; }
 .title { margin: 0; font-size: 18px; }
-@media (max-width: 640px) { .card header { display: grid; } .card footer, .permissionActions { display: grid; grid-template-columns: 1fr; } }
+.scopeHelp { margin: 0; color: var(--text-secondary); line-height: 1.5; }
+.permissionChoices { display: grid; gap: 8px; }
+.permissionChoices > div { display: grid; grid-template-columns: minmax(130px, auto) minmax(0, 1fr); align-items: start; gap: 4px 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.permissionChoices p { margin: 3px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.permissionChoices .permissionUnavailable { grid-column: 2; margin-top: 0; color: var(--warning); }
+.technicalDetails summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; font-weight: 700; }
+.technicalDetails .preview { margin-top: 8px; }
+@media (max-width: 640px) { .card header { display: grid; } .card footer { display: grid; grid-template-columns: 1fr; } .permissionChoices > div { grid-template-columns: 1fr; } .permissionChoices .permissionUnavailable { grid-column: 1; } }

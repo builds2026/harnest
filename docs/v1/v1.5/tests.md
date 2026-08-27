@@ -2,28 +2,40 @@
 
 ## Required gates
 
-Run from `/home/louis/Documents/harnest`:
+Run from `/home/louis/Documents/Harnest_root/harnest`:
 
 ```bash
 npm run lint
 npm run typecheck
 npm test
 npm run build
-npm run e2e:runtime --workspace @harnestai/studio
+npm run test:e2e
 uv run --project python --extra test pytest -q
 uv build --project python
 ```
 
-Run from `/home/louis/Documents/nextjs_ai`:
+Run from `/home/louis/Documents/Harnest_root/nextjs_ai`:
 
 ```bash
 npm run lint
 npm run typecheck
 npm test
 npm run build
+npm run test:e2e
+npm run test:db
 ```
 
 Release verification additionally packs every public npm workspace, installs the tarballs together in an empty project, installs the Python wheel in an empty virtual environment, and executes the same protocol golden fixture through both clients.
+
+## Verified on 2026-08-27
+
+- Harnest: lint, typecheck, 64/64 unit/integration test files with 393/393 tests, the 33-route Studio production build, and both Studio browser suites passed.
+- Studio: 26/26 browser journeys and the real-runtime permission/file-reuse journey passed. Builder, Playground, Runs, Integrate, and Settings were also audited at their live remote URL in light and dark mode; the 1024px Playground had no horizontal overflow, console error, or page error.
+- Python SDK: 4/4 tests passed; wheel and source distribution built successfully.
+- Container isolation: the real Docker Code Runner smoke passed with network disabled, bounded resources, stdout `5050`, and one verified `result.json` artifact.
+- Reference host: lint, typecheck, 46/46 tests, the 16-route production build, the browser E2E journey through local Supabase, and all 8 local Supabase RLS assertions passed.
+- Reference-host live stack: five durable runs covered `allow_once`, `allow_for_run`, `allow_always`, persistent reuse, revoke, and `deny`; all five reached `succeeded`. Memory and PKM provenance were present in every answer, allowed calls executed the Tool, and the denied call did not.
+- Registry publication and operator-credentialed Gemini, remote Supabase, and OAuth/Firecrawl smoke tests were not attempted; they remain in `remaining-issues.md`.
 
 ## Verified on 2026-08-26
 
@@ -44,7 +56,8 @@ Release verification additionally packs every public npm workspace, installs the
 - public snapshot/event redaction and cross-run Connection isolation
 - Playground attachment reuse and persistent grant revocation
 - reference-app ownership, lease/reconnect, provider bridge, file digest, and RLS policy tests
+- authoring MCP resource/prompt discovery, `validate_harness_project` structured diagnostics and `setupRequired`, workspace/symlink containment, stdio and Streamable HTTP `/mcp`, and the absence of runtime invocation Tools
 
 ## Live smoke tests
 
-Live Gemini, OAuth, Firecrawl/SearXNG, Supabase RLS, PDF/image, and container tests require operator-owned credentials or services. A passing build is not recorded as a substitute for those checks; their exact status belongs in `remaining-issues.md`.
+Local Supabase RLS, deterministic Memory/PKM, permission, streaming transport, image reuse, and real Docker isolation are verified above. Live Gemini, OAuth, Firecrawl/SearXNG, and a remote Supabase project still require operator-owned credentials or services. A passing build is not recorded as a substitute for those checks; their exact status belongs in `remaining-issues.md`.

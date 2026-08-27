@@ -16,6 +16,19 @@ const record = (value: unknown): Record<string, unknown> => {
   return value as Record<string, unknown>;
 };
 
+export async function GET() {
+  let resources: Awaited<ReturnType<typeof runtimeResourcesFor>> | undefined;
+  try {
+    resources = await runtimeResourcesFor(EMPTY_SPEC);
+    const catalog = await resources.toolStore.catalog();
+    return Response.json(catalog, { headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+  } catch (error) {
+    return apiErrorResponse(error);
+  } finally {
+    await resources?.services.close();
+  }
+}
+
 export async function POST(request: Request) {
   let resources: Awaited<ReturnType<typeof runtimeResourcesFor>> | undefined;
   try {

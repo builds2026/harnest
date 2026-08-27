@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/sdk",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -29,12 +29,12 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
-    "@harnestai/adapter-gemini": "0.2.0-beta.1",
-    "@harnestai/adapter-local": "0.2.0-beta.1",
-    "@harnestai/adapter-openai": "0.2.0-beta.1",
-    "@harnestai/core": "0.2.0-beta.1",
-    "@harnestai/protocol": "0.2.0-beta.1"
+    "@harnestai/adapter-anthropic": "0.2.0-beta.2",
+    "@harnestai/adapter-gemini": "0.2.0-beta.2",
+    "@harnestai/adapter-local": "0.2.0-beta.2",
+    "@harnestai/adapter-openai": "0.2.0-beta.2",
+    "@harnestai/core": "0.2.0-beta.2",
+    "@harnestai/protocol": "0.2.0-beta.2"
   },
   "license": "MIT",
   "repository": {

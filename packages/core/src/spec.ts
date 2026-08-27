@@ -166,6 +166,9 @@ export const HarnessTestCaseV02Schema = z.object({
   if (test.assertion === undefined && test.assertions === undefined) {
     context.addIssue({ code: "custom", message: "A test requires assertion or assertions", path: ["assertions"] });
   }
+  if (test.assertion !== undefined && test.assertions !== undefined) {
+    context.addIssue({ code: "custom", message: "A test cannot contain both assertion and assertions", path: ["assertions"] });
+  }
 });
 
 export const HarnessSpecV01Schema = z.object({

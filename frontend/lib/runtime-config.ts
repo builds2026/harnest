@@ -1,14 +1,8 @@
 import type { Diagnostic, HarnessSpec } from "@harnestai/core";
 import type { NodeRuntimeServiceOptions } from "@harnestai/core/node";
+import type { StudioCapabilityPolicy } from "./host-policy";
 
-export interface StudioCapabilityPolicy {
-  readonly allowModules: boolean;
-  readonly allowFiles: boolean;
-  readonly contextRoots: readonly string[];
-  readonly processCommands: readonly string[];
-  readonly networkHosts: readonly string[];
-  readonly approvedToolIds: readonly string[];
-}
+export type { StudioCapabilityPolicy } from "./host-policy";
 
 const commaList = (value: string | undefined) => value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
 

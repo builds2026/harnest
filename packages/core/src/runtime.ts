@@ -17,6 +17,7 @@ import {
   type RuntimeMetrics,
   type RunSessionContext,
   type RuntimeServices,
+  type ServiceExecutionContext,
 } from "./component.js";
 import {
   compileSpec,
@@ -32,6 +33,7 @@ import {
   type AgentInstance,
   type OrchestrationEvent,
   type InteractionRequest,
+  type InteractionResponse,
   type RunCommand,
   type RunSnapshot,
   type SideEffectCheckpoint,
@@ -314,7 +316,7 @@ interface RunContext {
   readonly control: RunControl;
   readonly staticAgents: Map<string, AgentInstance>;
   readonly session?: RunSessionContext;
-  readonly unattended: boolean;
+  readonly compatibility: boolean;
   readonly sideEffectCheckpoint: (key: string) => SideEffectCheckpoint | undefined;
   readonly saveSideEffectCheckpoint: (key: string, checkpoint: Omit<SideEffectCheckpoint, "updatedAt">) => Promise<void>;
 }
@@ -654,11 +656,23 @@ export class HarnessRuntime {
     const runId = globalThis.crypto.randomUUID();
     const control = new RunControl(runId);
     const handle = new RuntimeRunHandle(runId, control, this.#execute(input, options, runId, control, true));
+    const canResolveInteraction = (request: InteractionRequest) => Boolean(
+      this.#services.requestInteraction
+      || (request.kind === "permission" && this.#services.requestToolApproval
+        && (this.#services.canResolveInteraction?.(request) ?? true)),
+    );
     return {
       async *[Symbol.asyncIterator]() {
         let finished = false;
         try {
           for await (const event of handle.events) {
+            if (event.type === "interaction-requested" && !canResolveInteraction(event.request)) {
+              await handle.cancel();
+              throw new RuntimeError(
+                "RUN_INTERACTION_REQUIRED",
+                "This compatibility stream requires user input; use start() and RunHandle.send(), or the HTTP v1 Run API",
+              );
+            }
             yield event;
             if (event.type === "run-end" || event.type === "error") finished = true;
           }
@@ -669,10 +683,22 @@ export class HarnessRuntime {
     };
   }
 
-  invoke(input: unknown, options: RunOptions = {}): Promise<RunResult> {
+  async invoke(input: unknown, options: RunOptions = {}): Promise<RunResult> {
     const runId = globalThis.crypto.randomUUID();
     const control = new RunControl(runId);
-    return new RuntimeRunHandle(runId, control, this.#execute(input, options, runId, control, true)).result();
+    const handle = new RuntimeRunHandle(runId, control, this.#execute(input, options, runId, control, true));
+    for await (const event of handle.events) {
+      if (event.type === "interaction-requested" && !this.#services.requestInteraction
+        && !(event.request.kind === "permission" && this.#services.requestToolApproval
+          && (this.#services.canResolveInteraction?.(event.request) ?? true))) {
+        await handle.cancel();
+        throw new RuntimeError(
+          "RUN_INTERACTION_REQUIRED",
+          "This compatibility invocation requires user input; use start() and RunHandle.send(), or the HTTP v1 Run API",
+        );
+      }
+    }
+    return handle.result();
   }
 
   async #publish(event: RunEvent): Promise<void> {
@@ -691,6 +717,31 @@ export class HarnessRuntime {
       } finally { this.#privateSnapshots.delete(key); }
     }
     await this.#eventSink?.append(event);
+  }
+
+  #requestInteraction(
+    run: RunContext,
+    request: Parameters<RunControl["requestInteraction"]>[0],
+    context: ServiceExecutionContext,
+  ): Promise<InteractionResponse> {
+    const pendingBefore = new Set(run.control.snapshot().pendingInteractions?.map(({ id }) => id));
+    const waiting = run.control.requestInteraction(request);
+    const interaction = run.control.snapshot().pendingInteractions?.find(({ id }) =>
+      id === request.id || !pendingBefore.has(id));
+    const requestFromService = this.#services.requestInteraction;
+    if (interaction && requestFromService) void (async () => {
+      try {
+        run.control.resolveInteraction(await requestFromService(interaction, context));
+      } catch {
+        run.control.resolveInteraction({
+          interactionId: interaction.id,
+          checkpointDigest: interaction.checkpoint.digest,
+          action: "cancel",
+          ...(interaction.kind === "permission" ? { permission: "deny" } : {}),
+        });
+      }
+    })();
+    return waiting;
   }
 
   async #approveTool(run: RunContext, request: ToolApprovalRequest): Promise<ToolApprovalDecision> {
@@ -722,16 +773,6 @@ export class HarnessRuntime {
     if (await permissions?.find(persistentScope, context)) {
       return { approved: true, source: "policy", mode: "allow_always", reason: "Allowed by persistent host policy" };
     }
-    if (run.unattended && !this.#services.requestInteraction) {
-      if (!this.#services.requestToolApproval) return {
-        approved: false,
-        source: "policy",
-        mode: "deny",
-        reason: `Tool risk '${request.tool.risk ?? "external"}' requires explicit approval`,
-      };
-      const decision = await this.#services.requestToolApproval(request, context);
-      return { ...decision, mode: normalizePermissionDecision(decision.mode, decision.approved) };
-    }
     const waiting = run.control.requestInteraction({
       id: interactionId,
       nodeId: request.nodeId,
@@ -761,6 +802,17 @@ export class HarnessRuntime {
       try {
         if (this.#services.requestInteraction) {
           run.control.resolveInteraction(await this.#services.requestInteraction(interaction, context));
+        } else if (run.compatibility && this.#services.requestToolApproval
+          && (this.#services.canResolveInteraction?.(interaction) ?? true)) {
+          const decision = await this.#services.requestToolApproval(request, context);
+          const permission = normalizePermissionDecision(decision.mode, decision.approved);
+          run.control.resolveInteraction({
+            interactionId,
+            checkpointDigest: interaction.checkpoint.digest,
+            action: decision.approved ? "submit" : "decline",
+            permission,
+            ...(decision.reason ? { value: { reason: decision.reason } } : {}),
+          });
         }
       } catch {
         run.control.resolveInteraction({
@@ -789,7 +841,7 @@ export class HarnessRuntime {
     options: RunOptions,
     runId: string,
     control: RunControl,
-    unattended = false,
+    compatibility = false,
   ): AsyncIterable<RunEvent> {
     const started = performance.now();
     const timeoutController = new AbortController();
@@ -878,7 +930,7 @@ export class HarnessRuntime {
         await saveSideEffectCheckpoint();
       },
       staticAgents: new Map(),
-      unattended,
+      compatibility,
       ...(options.session ? { session: options.session } : {}),
     };
     const startEvent = sanitizeEvent(stamp({
@@ -1274,7 +1326,14 @@ export class HarnessRuntime {
             signal,
             run,
           ),
-          requestInteraction: (request) => run.control.requestInteraction(request),
+          requestInteraction: (request) => this.#requestInteraction(run, request, {
+            signal,
+            runId: run.runId,
+            nodeId,
+            iteration,
+            resolveSecret: run.resolveSecret,
+            ...(run.session?.contextRef ? { contextRef: run.session.contextRef } : {}),
+          }),
           requestToolApproval: (request) => this.#approveTool(run, request),
           sideEffectCheckpoint: run.sideEffectCheckpoint,
           saveSideEffectCheckpoint: run.saveSideEffectCheckpoint,

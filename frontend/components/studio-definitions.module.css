@@ -1,0 +1,31 @@
+.workspace { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; height: 100%; padding: 16px; overflow: auto; }
+.section { min-width: 0; }
+.section > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.section > header div { display: grid; gap: 3px; }
+.section > header strong { color: var(--text-primary); }
+.section > header span, .card small, .empty span { color: var(--text-tertiary); font-size: 12px; }
+.list { display: grid; gap: 8px; }
+.card, .empty { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
+.card summary { display: flex; justify-content: space-between; gap: 12px; padding: 11px 12px; cursor: pointer; }
+.card summary > span:first-child { display: grid; min-width: 0; }
+.card summary small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card summary > span:last-child { color: var(--text-secondary); font-size: 12px; }
+.card dl { display: grid; gap: 7px; margin: 0; padding: 0 12px 10px; }
+.card dl div { display: flex; justify-content: space-between; gap: 16px; }
+.card dt { color: var(--text-tertiary); font-size: 12px; }
+.card dd { margin: 0; color: var(--text-secondary); text-align: right; }
+.card footer { display: flex; justify-content: flex-end; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); }
+.empty { display: grid; place-items: center; gap: 4px; min-height: 110px; padding: 18px; text-align: center; }
+.dialog { width: min(520px, calc(100vw - 32px)); max-height: min(760px, calc(100vh - 32px)); overflow: auto; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-raised); color: var(--text-primary); box-shadow: var(--shadow-lg); }
+.dialog > h2 { margin: 0 0 4px; font-size: 18px; }
+.dialog > p { margin: 0 0 18px; color: var(--text-tertiary); }
+.dialog form { display: grid; gap: 14px; }
+.dialog form > label, .limits label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 12px; }
+.dialog input, .dialog textarea, .dialog select { width: 100%; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-muted); color: var(--text-primary); font: inherit; }
+.dialog textarea { min-height: 86px; resize: vertical; }
+.dialog fieldset { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.check { display: flex !important; align-items: center; gap: 5px !important; }
+.check input { width: auto; }
+.limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding-top: 10px; }
+.dialog form > footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+@media (max-width: 800px) { .workspace { grid-template-columns: 1fr; } .limits { grid-template-columns: 1fr; } }

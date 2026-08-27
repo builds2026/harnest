@@ -10,6 +10,7 @@ import {
 } from "@harnestai/core/browser";
 import {
   connectionCanRun,
+  connectionDetails,
   connectionOperationForAction,
   type ConnectionAction,
   type ConnectionActionResult,
@@ -24,6 +25,7 @@ import type { ApiErrorDetails } from "@/lib/api";
 import type { Translator } from "@/i18n/core";
 import type { MessageKey } from "@/i18n/messages/en-US";
 import { useI18n } from "./i18n-provider";
+import { ArgumentList } from "./argument-list";
 import { Button, EmptyState, InlineNotice } from "./ui/ui";
 
 type ManagerMode = "list" | "kind" | "form";
@@ -33,7 +35,7 @@ const emptyConfig = (kind: ConnectionKind): Record<string, unknown> => kind === 
   : kind === "tool-service"
     ? { ...FIRECRAWL_CONNECTION_CONFIG }
     : kind === "mcp-http"
-      ? { url: "", oauth: true }
+      ? { url: "", oauth: true, authentication: "oauth" }
       : kind === "http-api"
         ? { url: "" }
         : kind === "local-runtime"
@@ -113,6 +115,9 @@ function ConnectionForm({
     return next;
   });
   const builtinAdapter = ["gemini", "openai", "anthropic", "ollama"].includes(String(config.adapter ?? ""));
+  const mcpAuthentication = ["oauth", "token", "none"].includes(String(config.authentication))
+    ? String(config.authentication)
+    : config.oauth === true ? "oauth" : connection?.credentialPresence.token ? "token" : "none";
   const submit = (event: FormEvent) => {
     event.preventDefault();
     void onSaved({
@@ -183,7 +188,7 @@ function ConnectionForm({
         {(kind === "mcp-http" || kind === "http-api") && (
           <div className="field"><label htmlFor="connection-url">{t("connections.form.serverUrl")}</label><input id="connection-url" type="url" required placeholder="https://…" value={String(config.url ?? "")} onChange={(event) => update("url", event.target.value)} /></div>
         )}
-        {kind === "mcp-http" && <div className="field"><label htmlFor="connection-mcp-auth">{t("connections.form.signInMethod")}</label><select id="connection-mcp-auth" value={config.oauth === true ? "oauth" : "token"} onChange={(event) => update("oauth", event.target.value === "oauth")}><option value="oauth">{t("connections.form.browserSignIn")}</option><option value="token">{t("connections.form.bearer")}</option></select><span className="field-help">{t("connections.form.oauthHelp")}</span></div>}
+        {kind === "mcp-http" && <div className="field"><label htmlFor="connection-mcp-auth">{t("connections.form.signInMethod")}</label><select id="connection-mcp-auth" value={mcpAuthentication} onChange={(event) => setConfig((current) => ({ ...current, authentication: event.target.value, oauth: event.target.value === "oauth" }))}><option value="oauth">{t("connections.form.browserSignIn")}</option><option value="token">{t("connections.form.bearer")}</option><option value="none">{t("connections.form.none")}</option></select><span className="field-help">{t(mcpAuthentication === "none" ? "connections.form.noneHelp" : "connections.form.oauthHelp")}</span></div>}
         {kind === "local-runtime" && <>
           <div className="field"><label htmlFor="connection-runtime">{t("connections.form.codeRuntime")}</label><select id="connection-runtime" value={String(config.runtime ?? "node")} onChange={(event) => setConfig((current) => ({ ...current, runtime: event.target.value, image: DEFAULT_SANDBOX_IMAGES[event.target.value as keyof typeof DEFAULT_SANDBOX_IMAGES] }))}><option value="node">Node.js</option><option value="python">Python</option></select></div>
           <div className="field"><label htmlFor="connection-image">{t("connections.form.sandboxImage")}</label><input id="connection-image" required value={String(config.image ?? "")} onChange={(event) => update("image", event.target.value)} /><span className="field-help">{t("connections.form.sandboxHelp")}</span></div>
@@ -191,16 +196,17 @@ function ConnectionForm({
         {kind === "mcp-stdio" && <>
           <div className="field"><label htmlFor="connection-image">{t("connections.form.mcpImage")}</label><input id="connection-image" required placeholder="ghcr.io/owner/mcp-server:version" value={String(config.image ?? "")} onChange={(event) => update("image", event.target.value)} /><span className="field-help">{t("connections.form.mcpImageHelp")}</span></div>
           <div className="field"><label htmlFor="connection-command">{t("connections.form.command")}</label><input id="connection-command" required placeholder="node" value={String(config.command ?? "")} onChange={(event) => update("command", event.target.value)} /></div>
-          <div className="field"><label htmlFor="connection-args">{t("connections.form.arguments")}</label><input id="connection-args" placeholder="server.js --stdio" value={Array.isArray(config.args) ? config.args.join(" ") : ""} onChange={(event) => update("args", event.target.value.split(/\s+/).filter(Boolean))} /></div>
+          <ArgumentList id="connection-args" label={t("connections.form.arguments")} args={Array.isArray(config.args) ? config.args.filter((value): value is string => typeof value === "string") : []} addLabel={t("common.addArgument")} removeLabel={t("common.removeArgument")} disabled={busy} onChange={(args) => update("args", args)} />
         </>}
         {definition.secretFields.filter((field) => !(field.id === "token"
-          && ((kind === "mcp-http" && config.oauth === true)
+          && ((kind === "mcp-http" && mcpAuthentication !== "token")
             || (kind === "tool-service" && config.connector !== "firecrawl" && config.authScheme !== "bearer")))).map((field) => (
           <div className="field" key={field.id}>
             <label htmlFor={`connection-secret-${field.id}`}>{kind === "tool-service" && config.connector === "firecrawl" ? "Firecrawl API key" : field.label}</label>
             <input
               id={`connection-secret-${field.id}`}
               type="password"
+              required={kind === "mcp-http" && mcpAuthentication === "token" && !connection?.credentialPresence[field.id]}
               autoComplete="new-password"
               placeholder={connection?.credentialPresence[field.id] ? t("connections.form.credentialSaved") : t("connections.form.credentialEnter")}
               value={secrets[field.id] ?? ""}
@@ -311,9 +317,11 @@ export function ConnectionManager({
   useEffect(() => {
     if (!open) return;
     const requested = requestedId ? connections.find((connection) => connection.id === requestedId) : undefined;
+    const compatible = requestedKind && connections.some((connection) => connection.kind === requestedKind);
     setKind(requested?.kind ?? requestedKind ?? "provider");
-    setMode(requestedKind && !requested ? "form" : "list");
+    setMode(requestedKind && !requested && !compatible ? "form" : "list");
     setEditing(requested);
+    setQuery("");
     setMessage("");
     setOperations({});
     setOperationErrors({});
@@ -370,9 +378,9 @@ export function ConnectionManager({
 
   const visible = useMemo(() => {
     const value = query.trim().toLocaleLowerCase();
-    return connections.filter((connection) => (!requestedId || connection.id === requestedId) && (!value
-      || `${connection.name} ${connection.kind} ${connection.scope} ${connection.status}`.toLocaleLowerCase().includes(value)));
-  }, [connections, query, requestedId]);
+    return connections.filter((connection) => (!requestedKind || connection.kind === requestedKind) && (!value
+      || `${connection.name} ${connection.kind} ${connectionDetails(connection) ?? ""} ${connection.scope} ${connection.status}`.toLocaleLowerCase().includes(value)));
+  }, [connections, query, requestedKind]);
 
   if (!open) return null;
   const definition = definitions.find((item) => item.id === kind) ?? definitions[0];
@@ -550,8 +558,9 @@ export function ConnectionManager({
                 const operationError = operationErrors[connection.id];
                 const cardBusy = Boolean(operation && operation !== "idle");
                 const status = t(`connections.status.${connection.status}`);
+                const details = connectionDetails(connection);
                 return <article key={connection.id} className={`connection-card ${cardBusy ? "is-busy" : ""}`} aria-busy={cardBusy || undefined}>
-                  <div className="connection-card-heading"><span className={`connection-status is-${connection.status}`} aria-label={status} /><div><strong>{connection.name}</strong><small>{t(KIND_LABEL_KEYS[connection.kind])} · {t(`connections.form.scope.${connection.scope}`)}{connection.lastCheckedAt ? ` · ${t("connections.lastChecked", { time: formatRelative(connection.lastCheckedAt) })}` : ` · ${t("connections.neverChecked")}`}</small></div><span className="connection-status-copy">{status}</span></div>
+                  <div className="connection-card-heading"><span className={`connection-status is-${connection.status}`} aria-label={status} /><div><strong>{connection.name}</strong><small>{[t(KIND_LABEL_KEYS[connection.kind]), details, t(`connections.form.scope.${connection.scope}`), connection.lastCheckedAt ? t("connections.lastChecked", { time: formatRelative(connection.lastCheckedAt) }) : t("connections.neverChecked")].filter(Boolean).join(" · ")}</small></div><span className="connection-status-copy">{status}</span></div>
                   {operation && operation !== "idle" && <InlineNotice title={t(OPERATION_KEYS[operation])} action={<Button size="small" onClick={() => cancelOperation(connection.id)}>{t("common.cancel")}</Button>}>{t("connections.operation.description")}</InlineNotice>}
                   {operationError ? <InlineNotice tone="danger" title={t("common.needsAttention")} action={operationError.recoverable && main.action ? <Button size="small" onClick={() => void action(connection, main.action!)}>{t("connections.action.retry")}</Button> : undefined}><span>{operationError.message}</span><details><summary>{t("common.details")}</summary><code>{operationError.code} · {operationError.category}{operationError.technicalMessage ? `\n${operationError.technicalMessage}` : ""}</code></details></InlineNotice> : connection.error && <InlineNotice tone="danger" title={status}><span>{t("connections.error.description")}</span><details><summary>{t("common.details")}</summary><code>{connection.error.code}{connection.error.message ? ` · ${connection.error.message}` : ""}</code></details></InlineNotice>}
                   <div className="connection-card-actions">

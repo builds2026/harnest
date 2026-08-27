@@ -6,6 +6,7 @@
 - `packages/sdk` is the remote TypeScript client. The embedded Node runtime remains available through `@harnestai/sdk/node`.
 - `python` contains sync and async remote clients. It does not embed or reimplement the Harnest runtime.
 - `packages/cli` and Studio expose the same `/v1` resource paths and wire envelopes. Existing NDJSON and embedded APIs remain compatibility surfaces.
+- `packages/cli` also exposes `harnest mcp serve [workspace]` as an authoring-only MCP server. It serves documentation, generated catalogs, schema, an authoring prompt, and secret-free static validation; the former runtime-serving `describe_harness`/`invoke_harness` MCP surface is not part of v1.5. Runtime execution remains on the embedded SDK, CLI, Studio, and HTTP APIs.
 
 ## Runtime
 
@@ -24,7 +25,7 @@
 
 ## Reference host
 
-`/home/louis/Documents/nextjs_ai` is a separate Next.js service. Its browser talks only to its authenticated BFF. Supabase owns product records and RLS; a lease-based worker talks to Harnest and to a bearer-protected internal provider bridge. The worker does not hold Supabase credentials or directly query product tables.
+`/home/louis/Documents/Harnest_root/nextjs_ai` is a separate Next.js service. Its browser talks only to its authenticated BFF. Supabase owns product records and RLS; a lease-based worker talks to Harnest and to a bearer-protected internal provider bridge. The worker does not hold Supabase credentials or directly query product tables.
 
 The create-run request carries an opaque `contextRef`, provider revisions, and safe attachment metadata separately from model input. Harnest asks the host bridge to resolve that reference; neither the reference nor host identifiers are copied into trace, cache identity, or final output.
 

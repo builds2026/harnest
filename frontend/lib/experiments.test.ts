@@ -24,6 +24,51 @@ describe("experiment variants", () => {
       .toThrow("does not exist");
   });
 
+  it("targets root and subgraph components with the same id independently", () => {
+    const spec: HarnessSpec = {
+      version: "0.3",
+      components: [{ id: "model", type: "model", config: { model: "root", temperature: 0.2 } }],
+      connections: [],
+      entrypoint: "model",
+      subgraphs: {
+        worker: {
+          components: [{ id: "model", type: "model", config: { model: "worker", temperature: 0.4 } }],
+          connections: [],
+          entrypoint: "model",
+        },
+      },
+    };
+
+    const root = applyExperimentVariant(spec, {
+      id: "root",
+      label: "Root",
+      componentId: "model",
+      config: { temperature: 0.8 },
+    });
+    const subgraph = applyExperimentVariant(spec, {
+      id: "worker",
+      label: "Worker",
+      graph: "worker",
+      componentId: "model",
+      config: { temperature: 0.9 },
+    });
+
+    const configFor = (candidate: HarnessSpec, graph?: string) => (graph
+      ? candidate.version === "0.1" ? undefined : candidate.subgraphs?.[graph]
+      : candidate)?.components[0]?.config;
+    expect(configFor(root)).toMatchObject({ temperature: 0.8 });
+    expect(configFor(root, "worker")).toMatchObject({ temperature: 0.4 });
+    expect(configFor(subgraph)).toMatchObject({ temperature: 0.2 });
+    expect(configFor(subgraph, "worker")).toMatchObject({ temperature: 0.9 });
+    expect(() => applyExperimentVariant(spec, {
+      id: "missing",
+      label: "Missing",
+      graph: "missing",
+      componentId: "model",
+      config: {},
+    })).toThrow("Graph 'missing' does not exist");
+  });
+
   it("keeps setting value types intact", () => {
     expect(parseExperimentValue("0.7", 0.2)).toBe(0.7);
     expect(parseExperimentValue("false", true)).toBe(false);

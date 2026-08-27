@@ -76,7 +76,7 @@ Model components can select a second saved Provider as a fallback. Harnest switc
 
 ## Use a harness without Studio
 
-The same runtime can be embedded, served over loopback HTTP, or exposed as an MCP tool:
+The same runtime can be embedded or served over loopback HTTP:
 
 ```bash
 # Secret-free contract for CI or deployment tooling
@@ -85,8 +85,6 @@ npm run harnest -- contract harnest.yaml -- --json
 # GET /health, GET /contract, POST /invoke, POST /stream (NDJSON)
 npm run harnest -- serve harnest.yaml -- --port 8787 --allow-modules
 
-# stdio MCP server with describe_harness + invoke_harness
-npm run harnest -- mcp serve harnest.yaml -- --allow-modules
 ```
 
 ```ts
@@ -103,6 +101,28 @@ try {
 ```
 
 `Harnest.stream()` exposes runtime events and `Harnest.test()` runs the spec's declared cases. Module execution remains opt-in; omit it for specs made only from shipped adapters and built-ins.
+
+## Design harnesses from MCP clients
+
+The authoring MCP gives Claude Code, Codex, and other MCP clients the installed HarnessSpec documentation, exact component/Tool catalogs, a machine-readable schema, and secret-free project validation. `harnest mcp serve [workspace]` is authoring-only: it never exposes a completed Harness as a runtime Tool or runs models, Tools, adapters, modules, tests, or deployment steps.
+
+```bash
+# Source checkout: build once, then configure this stdio command in the client
+npm run build:packages
+node /absolute/path/to/harnest/packages/cli/dist/index.js \
+  mcp serve /absolute/path/to/harness-project
+
+# Same-machine Streamable HTTP from the source checkout
+node /absolute/path/to/harnest/packages/cli/dist/index.js \
+  mcp serve /absolute/path/to/harness-project \
+  --transport http --host 127.0.0.1 --port 8790
+```
+
+After `0.2.0-beta.2` is published, the equivalent package command will be `npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project`. The registry currently contains only `0.2.0-beta.1`, so use the source-checkout commands for the current authoring MCP.
+
+The only authoring Tool is `validate_harness_project`; clients edit files with their own workspace tools. A valid result can still list later user setup in `setupRequired.environmentVariables`, `connections`, `adapters`, and `modules`. Do not invent or collect those values: users add secrets later through the host vault, environment, or Connection/OAuth UI and run credentialed tests separately.
+
+ChatGPT web cannot reach local stdio or loopback. It needs a controlled, remotely reachable HTTPS Streamable HTTP URL such as `https://mcp.example.com/mcp`. Harnest provides no deployment, TLS termination, OAuth, internet-facing authorization, or tenant isolation; the operator must supply those at a controlled, authenticating edge and restrict every server to a narrow workspace. See [the exact Claude Code, Codex `config.toml`, and ChatGPT web setup](packages/cli/mcp-docs/integration.md).
 
 Create one deployment artifact containing only the validated spec and project `assets/`:
 

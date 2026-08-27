@@ -13,6 +13,7 @@ v1.5 makes human input, durable pause/resume, remote SDKs, and app-owned context
 - [providers.md](./providers.md) — external data-provider ownership and context assembly
 - [sdk-publishing.md](./sdk-publishing.md) — TypeScript/Python surface and release process
 - [nextjs-ai.md](./nextjs-ai.md) — independent reference product architecture and operation
+- [design-system.md](./design-system.md) — shared Studio/UI principles, tokens, Base UI boundaries, and verification rules
 - [implementation.md](./implementation.md) — delivered files, compatibility, and data flow
 - [tests.md](./tests.md) — verification commands and evidence
 - [remaining-issues.md](./remaining-issues.md) — verified environment or release blockers only

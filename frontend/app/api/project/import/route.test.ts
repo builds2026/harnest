@@ -46,9 +46,9 @@ entrypoint: prompt
         headers: { host: "127.0.0.1", origin: "http://127.0.0.1", "content-length": "100000" },
         body: form,
       }));
-      const payload = await response.json() as { project: { managed: boolean; name?: string }; error?: unknown };
+      const payload = await response.json() as { project: { managed: boolean; name?: string; fileCount: number; excludedCount: number }; error?: unknown };
       expect(response.status, JSON.stringify(payload.error)).toBe(201);
-      expect(payload.project).toMatchObject({ managed: true, name: "selected-project" });
+      expect(payload.project).toMatchObject({ managed: true, name: "selected-project", fileCount: 3, excludedCount: 1 });
       const importedHarness = harnessFile();
       const importedRoot = dirname(importedHarness);
       expect(importedHarness).toBe(join(importedRoot, "harnest.yaml"));

@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/studio",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "type": "module",
   "files": [
     "app",
@@ -8,7 +8,6 @@
     "i18n",
     "lib",
     "scripts",
-    "workers",
     "next-env.d.ts",
     "next.config.mjs",
     "proxy.ts",
@@ -29,13 +28,13 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
-    "@harnestai/adapter-anthropic": "0.2.0-beta.1",
-    "@harnestai/adapter-gemini": "0.2.0-beta.1",
-    "@harnestai/adapter-local": "0.2.0-beta.1",
-    "@harnestai/adapter-openai": "0.2.0-beta.1",
-    "@harnestai/core": "0.2.0-beta.1",
-    "@harnestai/protocol": "0.2.0-beta.1",
-    "@harnestai/sdk": "0.2.0-beta.1",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.2",
+    "@harnestai/adapter-gemini": "0.2.0-beta.2",
+    "@harnestai/adapter-local": "0.2.0-beta.2",
+    "@harnestai/adapter-openai": "0.2.0-beta.2",
+    "@harnestai/core": "0.2.0-beta.2",
+    "@harnestai/protocol": "0.2.0-beta.2",
+    "@harnestai/sdk": "0.2.0-beta.2",
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
@@ -44,6 +43,7 @@
     "next": "16.3.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
     "typescript": "^6.0.3"
   },
   "devDependencies": {

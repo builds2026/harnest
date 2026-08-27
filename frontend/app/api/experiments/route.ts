@@ -34,6 +34,7 @@ const variant = (value: unknown): ExperimentVariant => {
     id,
     label: text(item.label, "Variant label", 80),
     componentId: text(item.componentId, "Component id", 128),
+    ...(item.graph === undefined ? {} : { graph: text(item.graph, "Graph", 128) }),
     config: record(item.config, "Variant config"),
   };
 };

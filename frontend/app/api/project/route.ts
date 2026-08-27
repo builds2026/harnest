@@ -10,11 +10,24 @@ import {
 } from "@harnestai/core/node";
 import { basename } from "node:path";
 import { ApiRequestError, apiErrorResponse, assertSameOrigin, readJsonBody } from "@/lib/api-server";
-import { harnessFile } from "@/lib/server";
+import { harnessFile, studioBaseHarnessFile } from "@/lib/server";
 
 export const runtime = "nodejs";
 
 const textExtensions = /\.(?:cjs|css|csv|html|js|json|jsx|md|mjs|py|sh|toml|ts|tsx|txt|xml|ya?ml)$/i;
+const protectedProjectFiles = new Set([".harnest/project.json", ".harnest/studio.json"]);
+
+const fileCapabilities = (path: string, size: number) => {
+  const previewable = textExtensions.test(path) && size <= 4_194_304;
+  return { previewable, editable: previewable && !protectedProjectFiles.has(path) };
+};
+
+const browserFile = ({ archivePath, size, sha256, content }: {
+  readonly archivePath: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly content: string;
+}) => ({ path: archivePath, size, sha256, content, ...fileCapabilities(archivePath, size) });
 
 function projectError(error: unknown) {
   if (!(error instanceof HarnestProjectError)) return error;
@@ -30,15 +43,20 @@ export async function GET(request: Request) {
     const project = await loadHarnestProjectManifest(file);
     if (!project) return Response.json({ project: null, files: [] });
     const selected = new URL(request.url).searchParams.get("path");
-    if (selected) return Response.json({ file: await readPortableProjectTextFile(file, selected) });
+    if (selected) return Response.json({ file: browserFile(await readPortableProjectTextFile(file, selected)) });
     const files = (await listPortableProjectFiles(file)).map(({ archivePath, size, sha256 }) => ({
       path: archivePath,
       size,
       sha256,
-      editable: textExtensions.test(archivePath) && size <= 4_194_304,
+      ...fileCapabilities(archivePath, size),
     }));
     return Response.json({
-      project: { root: basename(project.projectDirectory), manifest: project.manifest, managed: project.projectDirectory.includes(`${process.platform === "win32" ? "\\" : "/"}.harnest${process.platform === "win32" ? "\\" : "/"}imports${process.platform === "win32" ? "\\" : "/"}`) },
+      project: {
+        root: basename(project.projectDirectory),
+        harness: project.manifest.harness,
+        manifest: project.manifest,
+        managed: file !== studioBaseHarnessFile(),
+      },
       files,
     });
   } catch (error) {
@@ -58,8 +76,11 @@ export async function PUT(request: Request) {
       || !/^sha256:[a-f0-9]{64}$/.test(`sha256:${sha256.replace(/^sha256:/, "")}`)) {
       throw new ApiRequestError("PROJECT_ASSET_INVALID", "Project path, text content, and SHA-256 revision are required");
     }
+    if (protectedProjectFiles.has(path)) {
+      throw new ApiRequestError("PROJECT_ASSET_READ_ONLY", "Project metadata is read-only in Studio", 422);
+    }
     const file = await writePortableProjectTextFile(harnessFile(), path, content, sha256.replace(/^sha256:/, ""));
-    return Response.json({ ok: true, file });
+    return Response.json({ ok: true, file: browserFile(file) });
   } catch (error) {
     return apiErrorResponse(projectError(error));
   }
@@ -77,7 +98,7 @@ export async function POST(request: Request) {
       if (typeof value.path !== "string" || typeof value.content !== "string") {
         throw new ApiRequestError("PROJECT_ASSET_INVALID", "Project path and initial text content are required");
       }
-      return Response.json({ ok: true, file: await createPortableProjectTextFile(harnessFile(), value.path, value.content) }, { status: 201 });
+      return Response.json({ ok: true, file: browserFile(await createPortableProjectTextFile(harnessFile(), value.path, value.content)) }, { status: 201 });
     }
     if (value.action === "bind") {
       if ((value.kind !== "prompt" && value.kind !== "context" && value.kind !== "schema")

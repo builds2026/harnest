@@ -751,10 +751,9 @@ describe("v1.2 Agent Tool loop", () => {
       } }],
       [{ from: { component: "sendTool", port: "tool" }, to: { component: "agent", port: "tools" } }],
     );
-    const denied = await new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools }).invoke("send");
-    expect(denied.output).toBe("not sent");
+    await expect(new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools }).invoke("send"))
+      .rejects.toMatchObject({ code: "RUN_INTERACTION_REQUIRED" });
     expect(executions).toBe(0);
-    expect(denied.trace).toContainEqual(expect.objectContaining({ type: "tool-approval", approved: false }));
 
     requests.length = 0;
     const services: RuntimeServices = {
@@ -766,6 +765,44 @@ describe("v1.2 Agent Tool loop", () => {
     const approved = await new HarnessRuntime(graph, new AdapterRegistry().register(adapter), { tools, services }).invoke("send");
     expect(approved.output).toBe("sent");
     expect(executions).toBe(1);
+  });
+
+  it("fails instead of letting a Provider claim success after a denied Tool", async () => {
+    let turns = 0;
+    let executions = 0;
+    const adapter: ModelAdapter = {
+      id: "scripted",
+      capabilities: { streaming: true, json: false, cancellation: true, tools: true },
+      async *run() {
+        turns += 1;
+        if (turns === 1) {
+          yield { type: "tool-call", call: { id: "send-1", name: "send", input: {} } };
+          yield { type: "finish", reason: "tool" };
+          return;
+        }
+        yield { type: "text-delta", text: "sent" };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const tools = new ToolRegistry().register({
+      id: "send", label: "Send", description: "Sends data externally", risk: "external",
+      inputSchema: { type: "object", additionalProperties: false },
+      execute() { executions += 1; return "sent"; },
+    });
+    const graph = spec(
+      [{ id: "sendTool", type: "tool", config: { tool: "send" } }],
+      [{ from: { component: "sendTool", port: "tool" }, to: { component: "agent", port: "tools" } }],
+    );
+    const agent = graph.components.find(({ id }) => id === "agent");
+    if (!agent) throw new Error("Agent fixture is missing");
+    agent.config = { ...agent.config, toolError: "fail" };
+
+    await expect(new HarnessRuntime(graph, new AdapterRegistry().register(adapter), {
+      tools,
+      services: { async requestToolApproval() { return { approved: false, source: "user", mode: "deny" }; } },
+    }).invoke("send"))
+      .rejects.toMatchObject({ code: "TOOL_APPROVAL_DENIED" });
+    expect({ turns, executions }).toEqual({ turns: 1, executions: 0 });
   });
 
   it("does not let graph routing turn a registered read Tool into a Connection action", async () => {
@@ -823,7 +860,10 @@ describe("v1.2 Agent Tool loop", () => {
       execute() { localExecutions += 1; return "done"; },
     });
     await expect(new HarnessRuntime(local, new AdapterRegistry(), { tools }).invoke({}))
-      .rejects.toMatchObject({ code: "TOOL_APPROVAL_DENIED" });
+      .rejects.toMatchObject({ code: "RUN_INTERACTION_REQUIRED" });
+    await expect((async () => {
+      for await (const event of new HarnessRuntime(local, new AdapterRegistry(), { tools }).stream({})) void event;
+    })()).rejects.toMatchObject({ code: "RUN_INTERACTION_REQUIRED" });
 
     const mcp: HarnessSpecV02 = {
       version: "0.2",
@@ -836,7 +876,7 @@ describe("v1.2 Agent Tool loop", () => {
     };
     await expect(new HarnessRuntime(mcp, new AdapterRegistry(), {
       services: { async callMcpTool() { mcpExecutions += 1; return { value: "done" }; } },
-    }).invoke({})).rejects.toMatchObject({ code: "TOOL_APPROVAL_DENIED" });
+    }).invoke({})).rejects.toMatchObject({ code: "RUN_INTERACTION_REQUIRED" });
     expect({ localExecutions, mcpExecutions }).toEqual({ localExecutions: 0, mcpExecutions: 0 });
   });
 

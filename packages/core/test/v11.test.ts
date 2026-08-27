@@ -290,6 +290,20 @@ describe("v1.1 component registry and graph", () => {
       "SECRET_LITERAL",
     ]));
 
+    const connected = spec([{
+      id: "mcp",
+      type: "mcp-tool",
+      config: {
+        connectionId: "saved-mcp",
+        tool: "sum",
+        url: "https://user:password@example.test/mcp?access_token=literal",
+        headers: { Authorization: "Bearer literal" },
+      },
+    }], [], "mcp");
+    const connectedSecrets = validateSpec(connected).diagnostics.filter(({ code }) => code === "SECRET_LITERAL");
+    expect(connectedSecrets.map(({ path }) => path).filter((path) => path.endsWith(".config.url"))).toHaveLength(2);
+    expect(connectedSecrets.map(({ path }) => path)).toContain("$.components[0].config.headers.Authorization");
+
     const router = spec([{
       id: "route",
       type: "router",
@@ -331,6 +345,20 @@ describe("v1.1 component registry and graph", () => {
     );
     expect(validateSpec(invalidTestSchema, { components }).diagnostics.map(({ code }) => code))
       .toContain("TEST_SCHEMA_DEFINITION_INVALID");
+
+    const ambiguousTest = spec(
+      [{ id: "source", type: "test.source", config: { value: "value" } }],
+      [],
+      "source",
+      { tests: [{
+        id: "ambiguous",
+        input: "value",
+        assertion: { type: "equals", value: "value" },
+        assertions: [{ type: "includes", value: "value" }],
+      }] },
+    );
+    expect(validateSpec(ambiguousTest, { components }).diagnostics)
+      .toContainEqual(expect.objectContaining({ code: "SPEC_SCHEMA", message: "A test cannot contain both assertion and assertions" }));
   });
 });
 

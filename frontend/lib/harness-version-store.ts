@@ -100,6 +100,13 @@ export function compareHarnessVersions(leftYaml: string, rightYaml: string): Har
   };
 }
 
+export function sameHarnessRuntime(leftYaml: string, rightYaml: string): boolean {
+  const left = parseSpec(leftYaml);
+  const right = parseSpec(rightYaml);
+  if (!left.ok || !right.ok) return false;
+  return stable({ ...left.spec, studio: undefined }) === stable({ ...right.spec, studio: undefined });
+}
+
 export function summarizeHarnessDiff(diff: HarnessVersionDiff): string {
   const componentChanges = diff.components.added.length + diff.components.removed.length + diff.components.changed.length;
   const connectionChanges = diff.connections.added.length + diff.connections.removed.length + diff.connections.changed.length;

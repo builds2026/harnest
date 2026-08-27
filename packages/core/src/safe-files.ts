@@ -55,7 +55,9 @@ export async function openVerifiedFile(
       stat(/* turbopackIgnore: true */ canonical),
     ]);
     if (!inside(root, canonical) || link.isSymbolicLink() || !opened.isFile() || !current.isFile()
-      || !sameFile(opened, current)) throw new Error(`File '${path}' changed during I/O`);
+      || opened.nlink !== 1 || current.nlink !== 1 || !sameFile(opened, current)) {
+      throw new Error(`File '${path}' changed during I/O`);
+    }
   };
   try {
     await verify();

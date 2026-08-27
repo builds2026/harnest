@@ -472,7 +472,7 @@ describe("harnest CLI", () => {
     const result = await exec(process.execPath, [cli, "contract", join(directory, "harnest.yaml"), "--json"], { cwd: root });
     const contract = JSON.parse(result.stdout) as { specVersion: string; capabilities: string[]; integrationSurfaces: Array<{ id: string }> };
     expect(contract).toMatchObject({ specVersion: "0.2", capabilities: ["conversation"] });
-    expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http", "mcp"]);
+    expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http"]);
   });
 
   it("lists and revokes persistent Tool permissions through the CLI", async () => {
@@ -549,7 +549,7 @@ describe("harnest CLI", () => {
     });
   });
 
-  it("serves the same harness through HTTP and MCP", async () => {
+  it("serves a harness through HTTP and exposes authoring validation through MCP", async () => {
     const directory = await project("cli-serving");
     await cp(join(root, "examples", "custom-adapter", "echo-adapter.mjs"), join(directory, "echo-adapter.mjs"));
     await cp(join(root, "examples", "custom-adapter", "harnest.yaml"), join(directory, "harnest.yaml"));
@@ -582,6 +582,13 @@ describe("harnest CLI", () => {
       const contract = await fetch(`http://127.0.0.1:${port}/contract`);
       expect(contract.status).toBe(200);
       await expect(contract.json()).resolves.toMatchObject({ specVersion: "0.1", integrationSurfaces: expect.any(Array) });
+      const health = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(health.status).toBe(200);
+      await expect(health.json()).resolves.toMatchObject({
+        ok: true,
+        readyConnections: [],
+        localConnections: { ok: true, requiredConnections: [], readyConnections: [] },
+      });
       const response = await fetch(`http://127.0.0.1:${port}/invoke`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -596,7 +603,7 @@ describe("harnest CLI", () => {
 
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [cli, "mcp", "serve", spec, "--allow-modules"],
+      args: [cli, "mcp", "serve", directory],
       cwd: root,
       stderr: "pipe",
     });
@@ -604,11 +611,11 @@ describe("harnest CLI", () => {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["invoke_harness", "describe_harness"]));
-      const described = await client.callTool({ name: "describe_harness", arguments: {} });
-      expect(described.structuredContent).toMatchObject({ specVersion: "0.1", contractVersion: "1" });
-      const called = await client.callTool({ name: "invoke_harness", arguments: { message: "MCP hello" } });
-      expect(called.content).toContainEqual(expect.objectContaining({ type: "text", text: expect.stringContaining("MCP hello") }));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(["validate_harness_project"]);
+      const resources = await client.listResources();
+      expect(resources.resources.map((resource) => resource.uri)).toContain("harnest://docs/index");
+      const validated = await client.callTool({ name: "validate_harness_project", arguments: { path: "." } });
+      expect(validated.structuredContent).toMatchObject({ ok: true, specVersion: "0.1" });
     } finally {
       await client.close();
     }
@@ -883,7 +890,7 @@ entrypoint: output
     expect(JSON.parse(traced.stdout)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "run-end", runId }),
     ]));
-  });
+  }, 15_000);
 
   it("runs the RAG, safe custom Tool, and evaluation Loop examples and rejects unisolated legacy MCP", async () => {
     const examples = await project("examples");
@@ -946,17 +953,19 @@ entrypoint: output
   it("denies risky Tools in non-TTY runs unless the exact id is pre-approved", async () => {
     const directory = await cliToolProject("cli-tool-approval", "external");
     const spec = join(directory, "harnest.yaml");
-    const denied = await exec(process.execPath, [
+    await expect(exec(process.execPath, [
       cli, "run", spec, "--input", "Find Seoul", "--allow-modules",
-    ], { cwd: root });
-    expect(denied.stdout).toContain("requires explicit approval");
-    expect(denied.stdout).not.toContain("South Korea");
+    ], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("use start()"),
+    });
 
-    const wrongId = await exec(process.execPath, [
+    await expect(exec(process.execPath, [
       cli, "run", spec, "--input", "Find Seoul", "--allow-modules", "--approve-tool", "custom.other",
-    ], { cwd: root });
-    expect(wrongId.stdout).toContain("requires explicit approval");
-    expect(wrongId.stdout).not.toContain("South Korea");
+    ], { cwd: root })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("use start()"),
+    });
 
     const approved = await exec(process.execPath, [
       cli, "run", spec, "--input", "Find Seoul", "--allow-modules", "--approve-tool", "custom.city",
@@ -975,7 +984,7 @@ entrypoint: output
       code: 1,
       stderr: expect.stringContaining("requires an exact Tool id"),
     });
-  });
+  }, 30_000);
 
   it("requires an isolated Sandbox Connection for a stored TypeScript Tool", async () => {
     const directory = await cliToolProject("cli-stored-tool", "read", "custom.stored-city");

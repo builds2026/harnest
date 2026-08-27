@@ -11,5 +11,17 @@ describe("Dynamic Team recipe", () => {
     expect(spec.agentTemplates?.researcher?.capabilities).toContain("network");
     expect(spec.teams?.engineering?.limits?.maxParallel).toBe(4);
     expect(spec.studio?.pinned).toEqual(["classify"]);
+    expect(["research_agent", "coding_agent"].map((name) =>
+      spec.subgraphs?.[name]?.components.find(({ id }) => id === "agent")?.config.toolError))
+      .toEqual(["fail", "fail"]);
   });
+
+  it.each(["web-research", "coding-agent", "mcp-agent"] as const)(
+    "fails the %s recipe when its required Tool is denied or fails",
+    (id) => {
+      const spec = templateSpec(id);
+      const agent = spec.components.find(({ id: componentId }) => componentId === "agent");
+      expect((agent?.config as Record<string, unknown> | undefined)?.toolError).toBe("fail");
+    },
+  );
 });

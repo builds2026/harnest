@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { traceViewKey, visibleActiveEdgeId, visibleTraceId } from "./trace-view";
+import type { RunEvent } from "@harnestai/core";
+import { groupTraceEvents, traceViewKey, visibleActiveEdgeId, visibleTraceId } from "./trace-view";
 
 describe("Studio scoped trace projection", () => {
   it("keeps root events out of a subgraph and nested events out of root", () => {
@@ -23,5 +24,20 @@ describe("Studio scoped trace projection", () => {
   it("keeps equal local IDs isolated between graph lenses", () => {
     expect(traceViewKey(undefined, "output")).toBe("$root/output");
     expect(traceViewKey("revise", "output")).toBe("revise/output");
+  });
+
+  it("groups consecutive text deltas while retaining their raw events", () => {
+    const base = { runId: "run", timestamp: new Date(0).toISOString() };
+    const events = [
+      { ...base, type: "text-delta", nodeId: "agent", text: "Hel" },
+      { ...base, type: "text-delta", nodeId: "agent", text: "lo" },
+      { ...base, type: "usage", nodeId: "agent", usage: {} },
+      { ...base, type: "text-delta", nodeId: "other", text: "!" },
+    ] as unknown as RunEvent[];
+
+    const grouped = groupTraceEvents(events);
+    expect(grouped).toHaveLength(3);
+    expect(grouped[0]?.event).toMatchObject({ type: "text-delta", text: "Hello" });
+    expect(grouped[0]?.events).toHaveLength(2);
   });
 });

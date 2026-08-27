@@ -4,12 +4,13 @@ import type { Diagnostic, HarnessIntegrationContract, HarnessSpec } from "@harne
 import { Dialog } from "@base-ui/react/dialog";
 import type { MessageKey } from "@/i18n/messages/en-US";
 import type { Locale } from "@/i18n/core";
-import { connectionCanRun, type ConnectionSummary } from "@/lib/connections";
+import { connectionCanRun, connectionDetails, type ConnectionSummary } from "@/lib/connections";
 import { apiErrorMessage, requestJson } from "@/lib/api-client";
 import { connectionLabel } from "@/i18n/manifest";
 import { useI18n } from "./i18n-provider";
 import { Button } from "./ui/ui";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState } from "react";
+import type { StudioCapabilityPolicy } from "@/lib/host-policy";
 
 export type SettingsPage = "general" | "connections" | "tools" | "runtime";
 
@@ -95,6 +96,9 @@ export function StudioSettings({
   specVersion,
   runtimeConfig,
   runtimeLocked,
+  capabilityPolicy,
+  hostDiagnostics,
+  restartCommand,
   onOpenChange,
   onPageChange,
   onThemeChange,
@@ -103,7 +107,6 @@ export function StudioSettings({
   onManageTools,
   onManageSkills,
   onRuntimeChange,
-  children,
 }: {
   open: boolean;
   page: SettingsPage;
@@ -118,6 +121,9 @@ export function StudioSettings({
   specVersion: HarnessSpec["version"];
   runtimeConfig: Readonly<Record<string, unknown>>;
   runtimeLocked: boolean;
+  capabilityPolicy: StudioCapabilityPolicy;
+  hostDiagnostics: readonly Diagnostic[];
+  restartCommand: string;
   onOpenChange: (open: boolean) => void;
   onPageChange: (page: SettingsPage) => void;
   onThemeChange: (theme: "light" | "dark") => void;
@@ -126,7 +132,6 @@ export function StudioSettings({
   onManageTools: () => void;
   onManageSkills: () => void;
   onRuntimeChange: (runtime: Record<string, unknown> | undefined) => void;
-  children?: ReactNode;
 }) {
   const { t, formatDate, formatNumber } = useI18n();
   const selected = SETTINGS_PAGES.find(({ id }) => id === page) ?? SETTINGS_PAGES[0];
@@ -139,6 +144,7 @@ export function StudioSettings({
   const [contextCacheCount, setContextCacheCount] = useState(0);
   const [contextCacheError, setContextCacheError] = useState("");
   const [contextCacheBusy, setContextCacheBusy] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const loadToolPermissions = useCallback(async () => {
     try {
       const payload = await requestJson<{ permissions: ToolPermissionView[] }>("/api/tool-permissions");
@@ -191,6 +197,22 @@ export function StudioSettings({
       setPermissionBusy("");
     }
   };
+  const copyRestartCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(restartCommand);
+      setCopyState("copied");
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = restartCommand;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.append(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      setCopyState(copied ? "copied" : "error");
+    }
+  };
 
   return <Dialog.Root open={open} onOpenChange={onOpenChange}>
     <Dialog.Portal>
@@ -238,7 +260,7 @@ export function StudioSettings({
                 <section className="settings-section is-inline"><div><h3>{t("settings.connections")}</h3><p>{t("settings.servicesSecurity")}</p></div><Button onClick={() => openManager(onManageConnections)}>{t("settings.manageServices")}</Button></section>
                 <div className="settings-summary"><span><strong>{formatNumber(readyConnections)}</strong><small>{t("settings.metric.ready")}</small></span><span><strong>{formatNumber(connections.length - readyConnections)}</strong><small>{t("settings.metric.attention")}</small></span><span><strong>{formatNumber(contract.requiredConnections.length)}</strong><small>{t("settings.metric.used")}</small></span></div>
                 <section className="settings-service-list" aria-label={t("settings.connections")}>
-                  {connections.length ? connections.map((connection) => <article key={connection.id}><span className={`service-state is-${connectionCanRun(connection) ? "ready" : "blocked"}`} /><span><strong>{connection.name}</strong><small>{connectionLabel(t, connection.kind)} · {t(`connections.form.scope.${connection.scope}`)}</small></span><em>{t(`connections.status.${connection.status}`)}</em></article>) : <div className="settings-empty"><strong>{t("settings.noServices")}</strong><p>{t("settings.noServices.description")}</p><Button variant="primary" onClick={() => openManager(onManageConnections)}>{t("settings.addFirstService")}</Button></div>}
+                  {connections.length ? connections.map((connection) => <article key={connection.id}><span className={`service-state is-${connectionCanRun(connection) ? "ready" : "blocked"}`} /><span><strong>{connection.name}</strong><small>{[connectionDetails(connection) ?? connectionLabel(t, connection.kind), t(`connections.form.scope.${connection.scope}`)].join(" · ")}</small></span><em>{t(`connections.status.${connection.status}`)}</em></article>) : <div className="settings-empty"><strong>{t("settings.noServices")}</strong><p>{t("settings.noServices.description")}</p><Button variant="primary" onClick={() => openManager(onManageConnections)}>{t("settings.addFirstService")}</Button></div>}
                 </section>
               </>}
 
@@ -261,6 +283,18 @@ export function StudioSettings({
 
               {page === "runtime" && <>
                 <RuntimeSpecSettings key={JSON.stringify(runtimeConfig)} version={specVersion} runtime={runtimeConfig} locked={runtimeLocked} onChange={onRuntimeChange} />
+                <section className="settings-section">
+                  <div><h3>{t("settings.hostPolicy")}</h3><p>{t("settings.hostPolicy.description")}</p></div>
+                  <dl className="settings-runtime-list">
+                    <div><dt>{t("settings.hostPolicy.modules")}</dt><dd className={capabilityPolicy.allowModules ? "is-pass" : "is-fault"}>{t(capabilityPolicy.allowModules ? "common.allowed" : "common.denied")}</dd></div>
+                    <div><dt>{t("settings.hostPolicy.files")}</dt><dd className={capabilityPolicy.allowFiles ? "is-pass" : "is-fault"}>{t(capabilityPolicy.allowFiles ? "common.allowed" : "common.denied")}</dd></div>
+                    <div><dt>{t("settings.hostPolicy.roots")}</dt><dd>{capabilityPolicy.contextRoots.join(", ") || t("common.none")}</dd></div>
+                    <div><dt>{t("settings.hostPolicy.process")}</dt><dd>{capabilityPolicy.processCommands.join(", ") || t("common.none")}</dd></div>
+                    <div><dt>{t("settings.hostPolicy.network")}</dt><dd>{capabilityPolicy.networkHosts.join(", ") || t("common.none")}</dd></div>
+                    <div><dt>{t("settings.hostPolicy.tools")}</dt><dd>{capabilityPolicy.approvedToolIds.join(", ") || t("common.none")}</dd></div>
+                  </dl>
+                  {hostDiagnostics.length ? <div className="settings-host-restart" role="alert"><strong>{t("settings.hostPolicy.denied", { count: hostDiagnostics.length })}</strong><p>{t("settings.hostPolicy.restartHelp")}</p><code tabIndex={0}>{restartCommand}</code><div><Button size="small" onClick={() => void copyRestartCommand()}>{t(copyState === "copied" ? "common.copied" : "common.copy")}</Button>{copyState === "error" && <span className="field-error" role="status">{t("settings.hostPolicy.copyFailed")}</span>}</div></div> : <p className="settings-host-ready" role="status">{t("settings.hostPolicy.ready")}</p>}
+                </section>
                 <section className="settings-section is-inline"><div><h3>{t("settings.runtime.cacheRegistry")}</h3><p>{t("settings.runtime.cacheRegistryDescription", { count: formatNumber(contextCacheCount) })}</p>{contextCacheError && <span className="field-error" role="status">{contextCacheError}</span>}</div><Button disabled={contextCacheBusy || contextCacheCount === 0} onClick={() => void clearContextCache()}>{contextCacheBusy ? t("settings.runtime.cacheClearing") : t("settings.runtime.cacheClear")}</Button></section>
                 <section className="settings-section"><div><h3>{t("settings.declaredCapabilities")}</h3><p>{t("settings.declaredCapabilities.description")}</p></div><div className="settings-capabilities">{contract.capabilities.length ? contract.capabilities.map((capability) => <span key={capability}>{capability.replaceAll("-", " ")}</span>) : <span>{t("settings.textRuntime")}</span>}</div></section>
                 <section className="settings-section"><div><h3>{t("settings.safetyBoundaries")}</h3><p>{t("settings.safetyBoundaries.description")}</p></div><dl className="settings-runtime-list"><div><dt>{t("settings.runtime.conversation")}</dt><dd>{t("settings.runtime.conversation.value")}</dd></div><div><dt>{t("settings.runtime.history")}</dt><dd>{t("settings.runtime.history.value")}</dd></div><div><dt>{t("settings.runtime.sandbox")}</dt><dd>{t("settings.runtime.sandbox.value")}</dd></div><div><dt>{t("settings.runtime.surfaces")}</dt><dd>{contract.integrationSurfaces.map(({ id }) => id.toUpperCase()).join(" · ")}</dd></div></dl></section>
@@ -270,6 +304,5 @@ export function StudioSettings({
         </Dialog.Popup>
       </Dialog.Viewport>
     </Dialog.Portal>
-    {children}
   </Dialog.Root>;
 }

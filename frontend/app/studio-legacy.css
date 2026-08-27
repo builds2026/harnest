@@ -196,7 +196,7 @@
 .recipe-needs,
 .recipe-sample {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .recipe-meta {
@@ -231,7 +231,7 @@
 .recipe-needs small,
 .recipe-sample small {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -466,9 +466,19 @@
 }
 
 .palette-panel {
+  display: flex;
+  flex-direction: column;
   grid-area: palette;
   overflow: auto;
   border-right: 1px solid var(--line);
+}
+
+.palette-tabs-root,
+.palette-tab-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 }
 
 .panel-heading {
@@ -544,7 +554,7 @@
   color: var(--muted);
   background: transparent;
   font-family: var(--display);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -784,7 +794,7 @@
 .onboarding-blank {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .onboarding-blank {
@@ -862,7 +872,7 @@
   max-width: 180px;
   height: 26px;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .graph-crumb {
@@ -872,7 +882,7 @@
   color: var(--muted);
   background: transparent;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .graph-crumb:hover:not(:disabled) {
@@ -971,7 +981,7 @@
 .react-flow__edge-text {
   fill: #50616a;
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .react-flow__edge-textbg {
@@ -1071,7 +1081,7 @@
   margin-top: 1px;
   color: var(--muted);
   font-family: var(--display);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 650;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1110,7 +1120,7 @@
   color: var(--node-color);
   background: white;
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
   font-weight: 700;
 }
 
@@ -1125,7 +1135,7 @@
   overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1139,7 +1149,7 @@
   min-height: 18px;
   color: #667680;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .port-row.is-input {
@@ -1158,7 +1168,7 @@
   color: var(--node-color, var(--signal));
   background: white;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
 }
 
@@ -1212,7 +1222,7 @@
 .port-picker-list small {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .port-picker header strong {
@@ -1391,7 +1401,7 @@
 
 .last-run-state span {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: uppercase;
 }
 
@@ -1483,7 +1493,7 @@
   margin-bottom: 14px;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.5;
 }
 
@@ -1694,7 +1704,7 @@
 .sheet-eyebrow {
   color: #8aa9e9;
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1788,7 +1798,7 @@
 .connection-status-copy,
 .connection-error {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .connection-status {
@@ -1899,7 +1909,7 @@
   color: #dce7ec;
   background: #1c282f;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   white-space: pre-wrap;
 }
 
@@ -1924,7 +1934,7 @@
 .source-review code {
   overflow-wrap: anywhere;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .source-review p {
@@ -1975,7 +1985,7 @@
 .picker-item span {
   margin-top: 3px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.45;
 }
 
@@ -2027,7 +2037,7 @@
 .approval-body code {
   color: var(--graphite);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .approval-body pre {
@@ -2056,7 +2066,7 @@
   border-radius: 5px;
   background: #f0f4f6;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .approval-meter span {
@@ -2177,7 +2187,7 @@
   color: white;
   background: var(--fault);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .dock-tools {
@@ -2299,14 +2309,14 @@ button.trace-item:hover {
 .trace-time {
   color: var(--fault);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .diagnostic-path,
 .trace-meta {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .diagnostic-message,
@@ -2427,7 +2437,7 @@ button.trace-item:hover {
   gap: 8px 12px;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .tests-pane,
@@ -2479,7 +2489,7 @@ button.trace-item:hover {
   gap: 4px;
   color: #48575f;
   font-family: var(--display);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -2526,7 +2536,7 @@ button.trace-item:hover {
   gap: 6px 10px;
   padding: 8px 10px;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .experiment-result header {
@@ -2606,7 +2616,7 @@ button.trace-item:hover {
 .run-history-heading span {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .test-report,
@@ -2665,7 +2675,7 @@ button.trace-item:hover {
 .test-case-advanced > span {
   color: #48575f;
   font-family: var(--display);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -2711,7 +2721,7 @@ button.trace-item:hover {
   grid-column: 1 / -1;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .test-case-advanced {
@@ -2775,7 +2785,7 @@ button.trace-item:hover {
   margin-top: 3px;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .test-state {
@@ -2784,7 +2794,7 @@ button.trace-item:hover {
   color: white;
   background: var(--muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
   text-align: center;
   text-transform: uppercase;
 }
@@ -2832,7 +2842,7 @@ button.trace-item:hover {
   border-bottom: 1px solid var(--line);
   background: transparent;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .run-history-item:hover,
@@ -2844,7 +2854,7 @@ button.trace-item:hover {
 .run-history-item small,
 .run-history-empty {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .run-history-empty {
@@ -2882,7 +2892,7 @@ button.trace-item:hover {
   color: #dce7ec;
   background: #1c282f;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.5;
 }
 
@@ -2900,7 +2910,7 @@ button.trace-item:hover {
   color: #d6e0e5;
   background: #223038;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .status-led {
@@ -3203,7 +3213,7 @@ button.trace-item:hover {
 .connection-card.is-busy { border-color: color-mix(in srgb, var(--accent) 44%, var(--border)); }
 .connection-card [role="status"] details { margin-top: 5px; }
 .connection-card [role="status"] summary { cursor: pointer; font-size: 10px; }
-.connection-card [role="status"] code { display: block; margin-top: 5px; font-size: 9px; }
+.connection-card [role="status"] code { display: block; margin-top: 5px; font-size: 10px; }
 
 .status-retry {
   padding: 2px 7px;
@@ -3211,7 +3221,7 @@ button.trace-item:hover {
   border-radius: 5px;
   color: var(--danger);
   background: var(--danger-soft);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 750;
 }
 
@@ -3239,7 +3249,7 @@ button.trace-item:hover {
 
 .diagnostic-open {
   color: var(--accent);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 750;
   white-space: nowrap;
 }
@@ -3252,7 +3262,7 @@ button.trace-item:hover {
   border-radius: 6px;
   color: var(--accent);
   background: var(--accent-soft);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 750;
 }
 
@@ -3356,7 +3366,7 @@ button.trace-item:hover {
 .contract-metrics small {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .contract-readiness strong {
@@ -3442,7 +3452,7 @@ button.trace-item:hover {
   color: var(--signal);
   background: color-mix(in srgb, var(--signal) 6%, var(--paper-raised));
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: capitalize;
 }
 
@@ -3463,7 +3473,7 @@ button.trace-item:hover {
   gap: 6px;
   color: var(--signal);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .sandbox-contract > div span {
@@ -3508,7 +3518,7 @@ button.trace-item:hover {
 
 .contract-list small {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .contract-state {
@@ -3565,7 +3575,7 @@ button.trace-item:hover {
   border-radius: 4px;
   color: var(--signal);
   background: transparent;
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .integration-snippets pre {
@@ -3576,7 +3586,7 @@ button.trace-item:hover {
   color: var(--graphite);
   background: color-mix(in srgb, var(--ceramic) 70%, var(--paper-raised));
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -3880,7 +3890,7 @@ button.trace-item:hover {
 .conversation-item small {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .conversation-delete {
@@ -3915,7 +3925,7 @@ button.trace-item:hover {
 
 .playground-history > footer small {
   color: var(--playground-muted);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .collapsed-panel-button {
@@ -4080,7 +4090,7 @@ button.trace-item:hover {
   margin-top: 22px;
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: uppercase;
 }
 
@@ -4144,7 +4154,7 @@ button.trace-item:hover {
 .message-author time {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .message-body {
@@ -4184,7 +4194,7 @@ button.trace-item:hover {
   color: var(--playground-text);
   background: var(--playground-hover);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .composer-files button span {
@@ -4199,7 +4209,7 @@ button.trace-item:hover {
   margin-bottom: 9px;
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: uppercase;
 }
 
@@ -4255,7 +4265,7 @@ button.trace-item:hover {
 .playground-timeline > summary small,
 .playground-timeline-body > p {
   color: var(--playground-muted);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .playground-timeline > summary > span:last-child {
@@ -4268,7 +4278,7 @@ button.trace-item:hover {
   color: var(--playground-muted);
   background: var(--playground-raised);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .playground-timeline-body {
@@ -4341,12 +4351,12 @@ button.trace-item:hover {
 .timeline-event small {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .timeline-event details {
   grid-column: 1 / -1;
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .timeline-event details summary {
@@ -4363,7 +4373,7 @@ button.trace-item:hover {
   border-radius: 3px;
   background: var(--playground-raised);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
   white-space: pre-wrap;
 }
 
@@ -4387,7 +4397,7 @@ button.trace-item:hover {
   border-radius: 3px;
   background: var(--playground-surface);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .playground-composer-wrap {
@@ -4499,65 +4509,69 @@ button.trace-item:hover {
 .composer-tool-button small {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
-.plugin-menu {
-  position: relative;
-}
-
-.plugin-menu > summary {
-  cursor: pointer;
-  list-style: none;
-}
-
-.plugin-menu > summary::-webkit-details-marker {
-  display: none;
+.plugin-menu-positioner {
+  z-index: 30;
 }
 
 .plugin-menu-popover {
-  position: absolute;
-  z-index: 30;
-  bottom: calc(100% + 8px);
-  left: 0;
   width: min(320px, 75vw);
   max-height: 340px;
   padding: 8px;
   overflow: auto;
-  border: 1px solid var(--playground-border-strong);
+  border: 1px solid var(--border-strong);
   border-radius: 7px;
-  background: var(--playground-raised);
+  color: var(--text-primary);
+  background: var(--surface-raised);
   box-shadow: 0 14px 40px rgb(23 34 41 / 18%);
 }
 
 .plugin-menu-popover > header {
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
   padding: 5px 6px 9px;
-  border-bottom: 1px solid var(--playground-border);
+  border-bottom: 1px solid var(--border);
 }
 
-.plugin-menu-popover > header strong {
+.plugin-menu-title {
+  margin: 0;
   font-family: var(--display);
   font-size: 12px;
 }
 
-.plugin-menu-popover > header small,
+.plugin-menu-description,
 .plugin-menu-popover > p {
-  color: var(--playground-muted);
-  font-size: 9px;
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: 10px;
 }
+
+.plugin-menu-close {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: transparent;
+}
+
+.plugin-menu-close:hover { color: var(--text-primary); background: var(--surface-hover); }
 
 .plugin-menu-popover label {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
   gap: 7px;
   padding: 8px 6px;
-  border-bottom: 1px solid var(--playground-border);
+  border-bottom: 1px solid var(--border);
 }
 
 .plugin-menu-popover label:hover {
-  background: var(--playground-hover);
+  background: var(--surface-hover);
 }
 
 .plugin-menu-popover label > span {
@@ -4570,9 +4584,9 @@ button.trace-item:hover {
 }
 
 .plugin-menu-popover label small {
-  color: var(--playground-muted);
+  color: var(--text-secondary);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .model-picker {
@@ -4628,7 +4642,7 @@ button.trace-item:hover {
   margin: 6px auto 0;
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .playground-files {
@@ -4643,6 +4657,13 @@ button.trace-item:hover {
 .playground-files > header {
   padding-left: 8px;
   background: var(--playground-deep-surface);
+}
+
+.file-panel {
+  display: grid;
+  min-height: 0;
+  grid-row: 2 / -1;
+  grid-template-rows: auto minmax(100px, .42fr) minmax(180px, .58fr);
 }
 
 .file-tabs {
@@ -4681,7 +4702,7 @@ button.trace-item:hover {
   margin-left: 3px;
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .file-explorer-heading {
@@ -4706,7 +4727,7 @@ button.trace-item:hover {
 
 .file-explorer-heading small {
   color: var(--playground-muted);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .mini-upload {
@@ -4796,7 +4817,7 @@ button.trace-item:hover {
 .file-row small {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .file-row > label {
@@ -4847,7 +4868,7 @@ button.trace-item:hover {
 .file-list-empty small,
 .file-preview-empty small {
   max-width: 240px;
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.5;
 }
 
@@ -4896,13 +4917,13 @@ button.trace-item:hover {
 .file-preview-heading small {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .file-preview-heading .button {
   min-height: 26px;
   padding-inline: 8px;
-  font-size: 9px;
+  font-size: 10px;
   line-height: 24px;
   text-decoration: none;
 }
@@ -4937,7 +4958,7 @@ button.trace-item:hover {
   color: var(--playground-text);
   background: color-mix(in srgb, var(--playground-raised) 92%, transparent);
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -4973,7 +4994,7 @@ button.trace-item:hover {
 .readiness-card span {
   color: var(--playground-muted);
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 10px;
   text-transform: uppercase;
 }
 
@@ -5002,7 +5023,7 @@ button.trace-item:hover {
 .playground-details dt,
 .playground-details dd {
   margin: 0;
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .playground-details dt {
@@ -5026,7 +5047,7 @@ button.trace-item:hover {
 .playground-details section p,
 .playground-details section li {
   color: var(--playground-muted);
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1.55;
 }
 
@@ -5063,7 +5084,7 @@ button.trace-item:hover {
   }
 }
 
-@media (max-width: 920px) {
+@media (max-width: 1180px) {
   body:has(.studio-shell.is-playground) {
     overflow: hidden;
   }
@@ -5284,4 +5305,3 @@ button.trace-item:hover {
   border-color: var(--line);
   background: var(--paper-raised);
 }
-

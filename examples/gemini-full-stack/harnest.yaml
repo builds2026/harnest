@@ -60,7 +60,7 @@ components:
       maxToolCalls: 8
       toolTimeoutMs: 30000
       maxTokens: 12000
-      toolError: model
+      toolError: fail
       allowTools:
         - builtin.web-search
         - builtin.web-scrape

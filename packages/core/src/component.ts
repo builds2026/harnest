@@ -205,6 +205,8 @@ export interface RuntimeServices extends InteractionService {
     request: ToolApprovalRequest,
     context: ServiceExecutionContext,
   ): Promise<ToolApprovalDecision>;
+  /** Whether a legacy compatibility call can resolve this interaction without a RunHandle command channel. */
+  canResolveInteraction?(request: InteractionRequest): boolean;
   loadSkill?(
     skillId: string,
     context: ServiceExecutionContext,
@@ -2275,6 +2277,9 @@ const componentDiagnostic = (
   componentId: string,
 ): Diagnostic => ({ code, path, message, componentId, severity: "error" });
 
+const MCP_CREDENTIAL_FIELD = /(?:password|passphrase|secret|token|api[-_]?key|access[-_]?token|credential|private[-_]?key)/iu;
+const MCP_SECRET_VALUE = /(?:\bbearer\s+[A-Za-z0-9._~+/=-]+|\b(?:password|secret|token|api[-_]?key)\s*[=:]\s*\S+|\bsk-[A-Za-z0-9_-]{12,}|\benv:[A-Za-z_][A-Za-z0-9_]*)/i;
+
 const validateModelComponent: NonNullable<ComponentDefinition["validate"]> = (component, context) => {
   const hasConnection = typeof component.config.connectionId === "string" && component.config.connectionId.length > 0;
   const hasLegacy = typeof component.config.adapter === "string" && component.config.adapter.length > 0
@@ -2308,23 +2313,7 @@ const validateContextComponent: NonNullable<ComponentDefinition["validate"]> = (
 
 const validateMcpComponent: NonNullable<ComponentDefinition["validate"]> = (component, context) => {
   const diagnostics: Diagnostic[] = [];
-  if (typeof component.config.connectionId === "string" && component.config.connectionId.length > 0) return diagnostics;
-  if (component.config.transport === "stdio"
-    && (typeof component.config.command !== "string" || component.config.command.length === 0)) {
-    diagnostics.push(componentDiagnostic("MCP_COMMAND_REQUIRED", `${context.path}.config.command`, "stdio MCP requires a command", component.id));
-  }
-  if (component.config.transport === "http") {
-    if (typeof component.config.url !== "string" || component.config.url.length === 0) {
-      diagnostics.push(componentDiagnostic("MCP_URL_REQUIRED", `${context.path}.config.url`, "HTTP MCP requires a URL", component.id));
-    } else {
-      try {
-        const url = new URL(component.config.url);
-        if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("protocol");
-      } catch {
-        diagnostics.push(componentDiagnostic("MCP_URL_INVALID", `${context.path}.config.url`, "MCP URL must use http or https", component.id));
-      }
-    }
-  }
+  const hasConnection = typeof component.config.connectionId === "string" && component.config.connectionId.length > 0;
   const headers = asRecord(component.config.headers);
   for (const [name, reference] of Object.entries(headers ?? {})) {
     if (typeof reference !== "string" || !/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(reference)) {
@@ -2334,6 +2323,38 @@ const validateMcpComponent: NonNullable<ComponentDefinition["validate"]> = (comp
         "MCP header values must use env:NAME references",
         component.id,
       ));
+    }
+  }
+  if (typeof component.config.url === "string" && component.config.url.length > 0) {
+    try {
+      const url = new URL(component.config.url);
+      if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("protocol");
+      if (url.username || url.password) diagnostics.push(componentDiagnostic(
+        "SECRET_LITERAL",
+        `${context.path}.config.url`,
+        "MCP URL must not contain embedded credentials",
+        component.id,
+      ));
+      if ([...url.searchParams].some(([name, value]) => MCP_CREDENTIAL_FIELD.test(name) || MCP_SECRET_VALUE.test(value))) {
+        diagnostics.push(componentDiagnostic(
+          "SECRET_LITERAL",
+          `${context.path}.config.url`,
+          "MCP URL query parameters must not contain credentials",
+          component.id,
+        ));
+      }
+    } catch {
+      diagnostics.push(componentDiagnostic("MCP_URL_INVALID", `${context.path}.config.url`, "MCP URL must use http or https", component.id));
+    }
+  }
+  if (hasConnection) return diagnostics;
+  if (component.config.transport === "stdio"
+    && (typeof component.config.command !== "string" || component.config.command.length === 0)) {
+    diagnostics.push(componentDiagnostic("MCP_COMMAND_REQUIRED", `${context.path}.config.command`, "stdio MCP requires a command", component.id));
+  }
+  if (component.config.transport === "http") {
+    if (typeof component.config.url !== "string" || component.config.url.length === 0) {
+      diagnostics.push(componentDiagnostic("MCP_URL_REQUIRED", `${context.path}.config.url`, "HTTP MCP requires a URL", component.id));
     }
   }
   return diagnostics;

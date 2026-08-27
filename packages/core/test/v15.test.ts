@@ -24,7 +24,13 @@ import {
   type RunEvent,
   type ServiceExecutionContext,
 } from "../src/index.js";
-import { FileRunStore, NodeRuntimeServices, resolveMcpElicitation } from "../src/node.js";
+import {
+  acquireRunExecutionLease,
+  FileRunStore,
+  NodeRuntimeServices,
+  releaseRunExecutionLease,
+  resolveMcpElicitation,
+} from "../src/node.js";
 
 const required = <T>(value: T | undefined): T => {
   if (value === undefined) throw new Error("Expected test state was not created");
@@ -323,6 +329,64 @@ describe("v1.5 interaction contracts", () => {
       value: "Ada",
     } });
     await expect(resumed.result()).resolves.toMatchObject({ output: "Ada" });
+  });
+
+  it.each(["invoke", "stream"] as const)("%s resolves a standalone Interaction through RuntimeServices", async (method) => {
+    const graph = {
+      version: "0.2",
+      components: [
+        { id: "ask", type: "interaction", config: { kind: "input", title: "Name", message: "Your name?" } },
+        { id: "output", type: "output", config: {} },
+      ],
+      connections: [{ from: { component: "ask", port: "value" }, to: { component: "output", port: "value" } }],
+      entrypoint: "output",
+    } satisfies HarnessSpec;
+    const requests: Parameters<NonNullable<ServiceExecutionContext["requestInteraction"]>>[0][] = [];
+    const runtime = new HarnessRuntime(graph, new AdapterRegistry(), { services: {
+      requestInteraction: async (request, context) => {
+        requests.push(request);
+        expect(context).toMatchObject({ runId: request.runId, nodeId: "ask", iteration: 0 });
+        return {
+          interactionId: request.id,
+          checkpointDigest: request.checkpoint.digest,
+          action: "submit",
+          value: "Ada",
+        };
+      },
+    } });
+
+    const events: RunEvent[] = [];
+    if (method === "invoke") {
+      const result = await runtime.invoke(undefined);
+      expect(result.output).toBe("Ada");
+      events.push(...result.trace);
+    } else {
+      for await (const event of runtime.stream(undefined)) events.push(event);
+      expect(events.find((event) => event.type === "run-end")).toMatchObject({ output: "Ada" });
+    }
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ id: "interaction_ask_0", runId: expect.any(String), checkpoint: { digest: expect.any(String) } });
+    expect(events.filter((event) => event.type === "run-paused").map((event) => event.paused)).toEqual([true, false]);
+  });
+
+  it.each(["invoke", "stream"] as const)("%s rejects a standalone Interaction when only legacy Tool approval is available", async (method) => {
+    const graph = {
+      version: "0.2",
+      components: [
+        { id: "ask", type: "interaction", config: { kind: "input", title: "Name", message: "Your name?" } },
+        { id: "output", type: "output", config: {} },
+      ],
+      connections: [{ from: { component: "ask", port: "value" }, to: { component: "output", port: "value" } }],
+      entrypoint: "output",
+    } satisfies HarnessSpec;
+    const runtime = new HarnessRuntime(graph, new AdapterRegistry(), { services: {
+      requestToolApproval: async () => ({ approved: true, source: "user" }),
+    } });
+    const execution = method === "invoke"
+      ? runtime.invoke(undefined)
+      : (async () => { for await (const event of runtime.stream(undefined)) void event; })();
+
+    await expect(execution).rejects.toMatchObject({ code: "RUN_INTERACTION_REQUIRED" });
   });
 
   it("rejects allow_always when preview or permission resource is incomplete", () => {
@@ -905,6 +969,29 @@ describe("v1.5 interaction contracts", () => {
         output, state: {}, usage: {}, costUsd: 0, iterations: 1, durationMs: 10, finishReason: "stop",
       });
       await expect(store.readEvents("run_result")).resolves.toMatchObject([{ output }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes a persisted Run bundle without affecting other Runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "harnest-v15-run-delete-"));
+    try {
+      const store = new FileRunStore(root);
+      const event = (runId: string) => ({
+        type: "run-end" as const, runId, timestamp: new Date().toISOString(), sequence: 1,
+        output: "done", state: {}, usage: {}, costUsd: 0, iterations: 1, durationMs: 10, finishReason: "stop" as const,
+      });
+      await store.append(event("run_delete"));
+      await store.append(event("run_keep"));
+
+      await acquireRunExecutionLease(root, "run_delete");
+      await expect(store.delete("run_delete")).rejects.toThrow("already active");
+      await releaseRunExecutionLease(root, "run_delete");
+      await expect(store.delete("run_delete")).resolves.toBe(true);
+      await expect(store.delete("run_delete")).resolves.toBe(false);
+      await expect(store.read("run_delete")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(store.list()).resolves.toEqual([expect.objectContaining({ runId: "run_keep" })]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

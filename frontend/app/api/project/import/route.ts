@@ -83,6 +83,8 @@ export async function POST(request: Request) {
     }
     root = await importRoot();
     let total = 0;
+    let imported = 0;
+    let excluded = 0;
     const seen = new Set<string>();
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index] as File;
@@ -94,9 +96,13 @@ export async function POST(request: Request) {
       }
       total += file.size;
       const target = resolve(root, ...path.split("/"));
-      if (!inside(root, target) || isSensitiveWorkspacePath(root, target)) continue;
+      if (!inside(root, target) || isSensitiveWorkspacePath(root, target)) {
+        excluded += 1;
+        continue;
+      }
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await writeFile(target, new Uint8Array(await file.arrayBuffer()), { flag: "wx", mode: 0o600 });
+      imported += 1;
     }
     let harness = await resolveHarnessFile(root);
     try {
@@ -135,7 +141,8 @@ export async function POST(request: Request) {
       project: {
         name: String(form.get("name") ?? "Imported project").slice(0, 128),
         managed: true,
-        fileCount: seen.size,
+        fileCount: imported,
+        excludedCount: excluded,
         bytes: total,
       },
     }, { status: 201 });

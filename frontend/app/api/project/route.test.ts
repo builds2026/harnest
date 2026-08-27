@@ -40,23 +40,35 @@ describe("portable project file API", () => {
     }, { "prompts/main.md": "Initial {{input}}" });
 
     const index = await GET(new Request("http://127.0.0.1:3000/api/project"));
-    const payload = await index.json() as { files: Array<{ path: string; sha256: string }> };
+    const payload = await index.json() as { project: { managed: boolean; harness: string }; files: Array<{ path: string; sha256: string; previewable: boolean; editable: boolean }> };
+    expect(payload.project).toMatchObject({ managed: false, harness: "harnest.yaml" });
+    const manifest = payload.files.find(({ path }) => path === ".harnest/project.json");
+    expect(manifest).toMatchObject({ previewable: true, editable: false });
     const prompt = payload.files.find(({ path }) => path === ".harnest/prompts/main.md");
     expect(prompt).toBeTruthy();
     const opened = await GET(new Request("http://127.0.0.1:3000/api/project?path=.harnest%2Fprompts%2Fmain.md"));
-    await expect(opened.json()).resolves.toMatchObject({ file: { content: "Initial {{input}}" } });
+    const openedPayload = await opened.json() as { file: { path: string; content: string; sha256: string } };
+    expect(openedPayload).toMatchObject({ file: { path: ".harnest/prompts/main.md", content: "Initial {{input}}" } });
+    expect(openedPayload.file.path).not.toContain(root);
 
-    const save = (sha256: string, content: string) => PUT(new Request("http://127.0.0.1:3000/api/project", {
+    const save = (path: string, sha256: string, content: string) => PUT(new Request("http://127.0.0.1:3000/api/project", {
       method: "PUT",
       headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
-      body: JSON.stringify({ path: prompt!.path, sha256, content }),
+      body: JSON.stringify({ path, sha256, content }),
     }));
-    const updated = await save(prompt!.sha256, "Updated {{input}}");
+    const updated = await save(prompt!.path, openedPayload.file.sha256, "Updated {{input}}");
     expect(updated.status).toBe(200);
+    await expect(updated.json()).resolves.toMatchObject({ file: { path: ".harnest/prompts/main.md" } });
     await expect(readFile(join(root, ".harnest", "prompts", "main.md"), "utf8")).resolves.toBe("Updated {{input}}");
     const loaded = await loadSpecFile(root);
     expect(loaded.ok && loaded.spec.components[0]?.config).toMatchObject({ template: "Updated {{input}}" });
-    expect((await save(prompt!.sha256, "stale {{input}}")).status).toBe(409);
+    expect((await save(prompt!.path, prompt!.sha256, "stale {{input}}")).status).toBe(409);
+
+    const openedManifest = await GET(new Request("http://127.0.0.1:3000/api/project?path=.harnest%2Fproject.json"));
+    const manifestPayload = await openedManifest.json() as { file: { content: string; sha256: string; previewable: boolean; editable: boolean } };
+    expect(manifestPayload.file).toMatchObject({ previewable: true, editable: false });
+    expect((await save(".harnest/project.json", manifestPayload.file.sha256, "{}\n")).status).toBe(422);
+    await expect(readFile(join(root, ".harnest", "project.json"), "utf8")).resolves.toBe(manifestPayload.file.content);
   });
 
   it("creates, binds, unbinds, and safely deletes portable project sources", async () => {
@@ -78,13 +90,14 @@ describe("portable project file API", () => {
     });
     const createdResponse = await POST(request({ action: "create", path: ".harnest/context/brief.md", content: "Ground truth" }));
     expect(createdResponse.status).toBe(201);
-    const created = await createdResponse.json() as { file: { archivePath: string; sha256: string } };
+    const created = await createdResponse.json() as { file: { path: string; sha256: string } };
+    expect(created.file.path).toBe(".harnest/context/brief.md");
 
-    expect((await POST(request({ action: "bind", kind: "context", component: "knowledge", path: created.file.archivePath }))).status).toBe(200);
+    expect((await POST(request({ action: "bind", kind: "context", component: "knowledge", path: created.file.path }))).status).toBe(200);
     const blocked = await DELETE(new Request("http://127.0.0.1:3000/api/project", {
       method: "DELETE",
       headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
-      body: JSON.stringify({ path: created.file.archivePath, sha256: created.file.sha256 }),
+      body: JSON.stringify({ path: created.file.path, sha256: created.file.sha256 }),
     }));
     expect(blocked.status).toBe(409);
 
@@ -92,7 +105,7 @@ describe("portable project file API", () => {
     const removed = await DELETE(new Request("http://127.0.0.1:3000/api/project", {
       method: "DELETE",
       headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
-      body: JSON.stringify({ path: created.file.archivePath, sha256: created.file.sha256 }),
+      body: JSON.stringify({ path: created.file.path, sha256: created.file.sha256 }),
     }));
     expect(removed.status).toBe(200);
     await expect(readFile(join(root, ".harnest", "context", "brief.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });

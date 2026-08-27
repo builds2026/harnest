@@ -107,6 +107,10 @@ const browserKind = (profile: ConnectionProfile): ConnectionKind => profile.kind
 
 async function coreConfig(input: ConnectionMutation, current?: ConnectionProfile): Promise<Readonly<Record<string, unknown>>> {
   const config = { ...(input.config ?? {}) };
+  const authentication = input.kind === "mcp-http" && ["oauth", "token", "none"].includes(String(config.authentication))
+    ? String(config.authentication)
+    : undefined;
+  delete config.authentication;
   if (input.kind === "provider") {
     const adapter = typeof config.adapter === "string" && config.adapter.trim()
       ? config.adapter.trim()
@@ -141,7 +145,9 @@ async function coreConfig(input: ConnectionMutation, current?: ConnectionProfile
   }
   if (input.kind !== "mcp-http") return config;
   const normalized: Record<string, unknown> = { ...config, transport: "http" };
-  if (input.secrets?.token || current?.credentialFields.includes("token")) {
+  const token = authentication === "token"
+    || (authentication === undefined && config.oauth !== true && Boolean(input.secrets?.token || current?.credentialFields.includes("token")));
+  if (token && (input.secrets?.token || current?.credentialFields.includes("token"))) {
     normalized.headerCredentials = { Authorization: "token" };
   }
   return normalized;
@@ -163,7 +169,13 @@ const browserConfig = (profile: ConnectionProfile): Readonly<Record<string, unkn
   // These are server-managed bindings. The browser edits their public inputs
   // (Connection kind and write-only credentials), never the internal mapping.
   delete config.headerCredentials;
-  if (profile.kind === "mcp") delete config.transport;
+  if (profile.kind === "mcp") {
+    delete config.transport;
+    if (profile.config.transport === "http") {
+      config.authentication = profile.config.oauth === true ? "oauth"
+        : profile.credentialFields.includes("token") ? "token" : "none";
+    }
+  }
   return config;
 };
 
@@ -271,9 +283,14 @@ export class StudioConnectionService {
   }
 
   async update(input: ConnectionMutation & { id: string }): Promise<ConnectionSummary> {
-    const current = await this.#manager.require(input.id);
+    let current = await this.#manager.require(input.id);
     if (current.scope !== input.scope || current.kind !== coreKind(input.kind) || browserKind(current) !== input.kind) {
       throw new ApiRequestError("CONNECTION_IMMUTABLE_FIELD", "Connection kind and scope cannot change after creation");
+    }
+    const authentication = input.kind === "mcp-http" ? input.config?.authentication : undefined;
+    if ((authentication === "none" || authentication === "oauth") && current.credentialFields.includes("token")) {
+      await this.#manager.disconnect(input.id);
+      current = await this.#manager.require(input.id);
     }
     const profile = await this.#manager.update(input.id, {
       name: input.name,
@@ -284,7 +301,7 @@ export class StudioConnectionService {
 
   async delete(id: string): Promise<void> {
     if (!CONNECTION_ID.test(id)) throw new ApiRequestError("CONNECTION_ID_INVALID", "Connection id is invalid");
-    if (!await this.#manager.delete(id)) throw new ApiRequestError("CONNECTION_NOT_FOUND", "Connection was not found", 404);
+    await this.#manager.delete(id);
   }
 
   async action(

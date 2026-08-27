@@ -109,7 +109,14 @@ export const connectionKindLabel = (kind: ConnectionKind) => ({
 })[kind];
 
 export const connectionCanRun = (connection: Pick<ConnectionSummary, "status">) =>
-  connection.status === "connected" || connection.status === "unknown";
+  connection.status === "connected";
+
+export function connectionDetails(connection: Pick<ConnectionSummary, "kind" | "config">): string | undefined {
+  if (connection.kind !== "provider") return undefined;
+  const adapter = String(connection.config.adapter ?? "");
+  const service = ({ gemini: "Google AI Studio", openai: "OpenAI", anthropic: "Anthropic", ollama: "Ollama" } as Record<string, string>)[adapter] ?? adapter;
+  return [service, String(connection.config.model ?? "")].filter(Boolean).join(" · ") || undefined;
+}
 
 export function missingConnectionSetup(
   components: readonly { type: string; config: Readonly<Record<string, unknown>> }[],

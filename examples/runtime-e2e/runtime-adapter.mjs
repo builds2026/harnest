@@ -9,8 +9,9 @@ const adapter = {
   },
   async *run(request, context) {
     context.signal.throwIfAborted();
-    const current = request.messages.at(-1)?.content;
-    const parts = Array.isArray(current) ? current : [{ type: "text", text: String(current ?? "") }];
+    const parts = request.messages.flatMap(({ content }) => Array.isArray(content)
+      ? content
+      : [{ type: "text", text: String(content ?? "") }]);
     const text = parts.filter((part) => part.type === "text").map((part) => part.text).join("\n");
     const media = parts.filter((part) => part.type === "media");
     const answer = [
