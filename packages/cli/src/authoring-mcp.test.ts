@@ -218,6 +218,23 @@ describe("authoring validation", () => {
     expect(result.diagnostics).not.toContainEqual(expect.objectContaining({ code: "ENV_MISSING" }));
   });
 
+  it("keeps placeholders structurally valid but warns that runtime configuration remains", async () => {
+    const root = await workspace();
+    const result = await validateHarnessInput({
+      workspaceRoot: root,
+      yaml: validYaml.replace("model: test-model", "model: USER_CONFIGURES_MODEL"),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.diagnostics).toContainEqual(expect.objectContaining({
+      code: "AUTHORING_CONFIGURATION_REQUIRED",
+      componentId: "model",
+      path: "$.components[1].config.model",
+      severity: "warning",
+    }));
+    expect(result.checks).toContain("Declared tests, Connections, credentials, models, Tools, and interactions were not executed");
+  });
+
   it("returns useful diagnostics for malformed and invalid HarnessSpec YAML", async () => {
     const root = await workspace();
     const secret = "sk-malformed-MUST-NOT-LEAK-2f7a";
@@ -436,6 +453,8 @@ describe("authoring MCP protocol surface", () => {
       expect(designPrompt).toBeDefined();
       const prompt = await client.getPrompt({ name: designPrompt!.name, arguments: { requirement: "Build a support agent" } });
       expect(prompt.messages.length).toBeGreaterThan(0);
+      expect(JSON.stringify(prompt)).toContain("do not silently substitute another ID");
+      expect(JSON.stringify(prompt)).toContain("Declarative tests cannot inject host permission decisions");
 
       const tools = await client.listTools();
       const validateTool = tools.tools.find((tool) => /validate.*harness|harness.*validate/i.test(tool.name));
@@ -544,7 +563,7 @@ describe("authoring MCP protocol surface", () => {
       expect(oversizedDelete.status).toBe(413);
 
       await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
-      expect(client.getServerVersion()).toEqual({ name: "harnest-authoring", version: "0.2.0-beta.2" });
+      expect(client.getServerVersion()).toEqual({ name: "harnest-authoring", version: "0.2.0-beta.3" });
       const resources = await client.listResources();
       expect(resources.resources.map(({ uri }) => uri)).toContain("harnest://docs/index");
       await expect(client.readResource({ uri: "harnest://docs/index" })).resolves.toMatchObject({

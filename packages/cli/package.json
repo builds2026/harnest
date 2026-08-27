@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/cli",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "type": "module",
   "bin": {
     "harnest": "./dist/index.js"
@@ -28,19 +28,19 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@harnestai/adapter-anthropic": "0.2.0-beta.2",
-    "@harnestai/adapter-gemini": "0.2.0-beta.2",
-    "@harnestai/adapter-local": "0.2.0-beta.2",
-    "@harnestai/adapter-openai": "0.2.0-beta.2",
-    "@harnestai/core": "0.2.0-beta.2",
-    "@harnestai/protocol": "0.2.0-beta.2",
-    "@harnestai/sdk": "0.2.0-beta.2",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.3",
+    "@harnestai/adapter-gemini": "0.2.0-beta.3",
+    "@harnestai/adapter-local": "0.2.0-beta.3",
+    "@harnestai/adapter-openai": "0.2.0-beta.3",
+    "@harnestai/core": "0.2.0-beta.3",
+    "@harnestai/protocol": "0.2.0-beta.3",
+    "@harnestai/sdk": "0.2.0-beta.3",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
-    "@harnestai/studio": "0.2.0-beta.2"
+    "@harnestai/studio": "0.2.0-beta.3"
   },
   "license": "MIT",
   "repository": {

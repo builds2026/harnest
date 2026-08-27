@@ -36,6 +36,7 @@ const JWT = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 const PRIVATE_KEY_BLOCK = /-----BEGIN ((?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----[\s\S]{16,}?-----END \1-----/g;
 const CREDENTIALED_URL = /\bhttps?:\/\/[^\s/:?#]+:[^\s/@?#]+@[^\s/]+/gi;
 const CREDENTIAL_ASSIGNMENT = /\b(?:password|passphrase|client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|secret|token)\s*[:=]\s*["']?([A-Za-z0-9._~+/=@%!-]{16,})/giu;
+const CONFIGURATION_PLACEHOLDER = /^(?:USER_CONFIGURES_[A-Z0-9_]+|CHANGEME|REPLACE_ME|TBD)$/i;
 const authoringAdapters = createShippedAdapterRegistry();
 
 interface DocumentResource {
@@ -286,6 +287,34 @@ const secretLiteralDiagnostics = (spec: HarnessSpec): Diagnostic[] => {
   return diagnostics;
 };
 
+const configurationPlaceholderDiagnostics = (spec: HarnessSpec): Diagnostic[] => [
+  { path: "$", components: spec.components },
+  ...(spec.version === "0.1" ? [] : Object.entries(spec.subgraphs ?? {}).map(([name, body]) => ({
+    path: `$.subgraphs.${name}`,
+    components: body.components,
+  }))),
+].flatMap(({ path, components }) => components.flatMap((component, index) => {
+  const diagnostics: Diagnostic[] = [];
+  const visit = (value: unknown, childPath: string): void => {
+    if (typeof value === "string") {
+      if (CONFIGURATION_PLACEHOLDER.test(value.trim())) diagnostics.push({
+        code: "AUTHORING_CONFIGURATION_REQUIRED",
+        path: childPath,
+        componentId: component.id,
+        message: "This non-secret configuration placeholder must be replaced before runtime execution.",
+        hint: "Set the value explicitly or use the default from a compatible saved Connection, then run credentialed validation and tests.",
+        severity: "warning",
+      });
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((item, itemIndex) => visit(item, `${childPath}[${itemIndex}]`));
+    if (typeof value !== "object" || value === null) return;
+    for (const [key, item] of Object.entries(value)) visit(item, `${childPath}.${key}`);
+  };
+  visit(component.config, `${path}.components[${index}].config`);
+  return diagnostics;
+}));
+
 const failure = (
   kind: "project" | "yaml",
   diagnostics: readonly Diagnostic[],
@@ -361,7 +390,12 @@ const analyze = (
     };
     return item;
   });
-  const diagnostics = [...initialDiagnostics, ...validationDiagnostics, ...secretLiteralDiagnostics(spec)];
+  const diagnostics = [
+    ...initialDiagnostics,
+    ...validationDiagnostics,
+    ...configurationPlaceholderDiagnostics(spec),
+    ...secretLiteralDiagnostics(spec),
+  ];
   if (adapterModules.length) diagnostics.push({
     code: "AUTHORING_ADAPTER_MODULE_VALIDATION_DEFERRED",
     path: "$.runtime.adapters",
@@ -398,6 +432,7 @@ const analyze = (
       "Built-in component configs and typed ports",
       "Graph reachability, cycles, state, subgraphs, Loop, Team, tests, and JSON Schemas",
       "High-confidence credential literals in materialized HarnessSpec string values rejected; .env/vault values and Adapter/runtime modules never loaded",
+      "Declared tests, Connections, credentials, models, Tools, and interactions were not executed",
     ],
   };
 };
@@ -479,7 +514,7 @@ export function buildAuthoringMcpServer(options: { readonly workspaceRoot: strin
   const server = new McpServer(
     { name: "harnest-authoring", version: SERVER_VERSION },
     {
-      instructions: "Design Harnest HarnessSpec v0.3 projects. Read harnest://docs/index first, use the generated component and Tool catalogs for exact schemas, edit files with the host's filesystem tools, then call validate_harness_project. Never put secrets in HarnessSpec. Validation inspects materialized HarnessSpec strings to reject obvious literals, but never accesses .env, vault, or saved Connection credentials.",
+      instructions: "Design Harnest HarnessSpec v0.3 projects. Read harnest://docs/index first, use the generated component and Tool catalogs for exact schemas, edit files with the host's filesystem tools, then call validate_harness_project. Never put secrets in HarnessSpec. Validation inspects materialized HarnessSpec strings to reject obvious literals, but never accesses .env, vault, or saved Connection credentials. Static validity never means runtime readiness: review every warning, report every setupRequired name exactly, and never claim tests, Connections, models, Tools, or interactions worked unless the host verifies them separately.",
       capabilities: { tools: {}, resources: {}, prompts: {} },
     },
   );
@@ -514,7 +549,10 @@ export function buildAuthoringMcpServer(options: { readonly workspaceRoot: strin
         "Read harnest://docs/index, harnest://docs/components, and the relevant topic resources before editing.",
         "Use the host filesystem tools to create or update the project. Do not write API keys, tokens, or passwords.",
         `When complete, call validate_harness_project with path ${JSON.stringify(projectPath ?? ".")} and repair every error.`,
-        "Report required Connections and environment variable names separately for the user to configure later.",
+        "Review every warning. Replace non-secret configuration placeholders before runtime execution.",
+        "Report required Connection IDs exactly and use those same IDs in any setup command; do not silently substitute another ID.",
+        "Do not encode a permission approval or denial as user input and call it tested. Declarative tests cannot inject host permission decisions; report that flow as a separate runtime E2E check.",
+        "Report required Connections and environment variable names separately for the user to configure later. Never claim the Harness is runtime-ready or tested while setup remains or execution was not performed.",
       ].join("\n"),
     },
   }] }));

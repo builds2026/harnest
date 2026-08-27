@@ -1,7 +1,7 @@
 import { mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AdapterError,
   AdapterRegistry,
@@ -306,6 +306,30 @@ describe("adapters and runtime", () => {
     ]));
     const report = await runHarnessTests(spec, registry);
     expect(report).toMatchObject({ ok: true, passed: 2, failed: 0 });
+  });
+
+  it("treats JSON Schema formats as annotations without runtime warnings", async () => {
+    const spec = validSpec();
+    spec.version = "0.2";
+    const output = spec.components[3];
+    if (output?.type !== "output") throw new Error("fixture");
+    output.config.schema = {
+      type: "object",
+      properties: { url: { type: "string", format: "uri" } },
+      required: ["url"],
+    };
+    spec.tests = [{ id: "uri", input: "x", assertion: { type: "output-schema", schema: output.config.schema } }];
+    const registry = new AdapterRegistry().register(fakeAdapter([
+      { type: "text-delta", text: '{"url":"https://example.com"}' },
+      { type: "finish", reason: "stop" },
+    ]));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(runHarnessTests(spec, registry)).resolves.toMatchObject({ ok: true });
+      expect(warning).not.toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 

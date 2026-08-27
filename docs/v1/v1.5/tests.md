@@ -29,13 +29,14 @@ Release verification additionally packs every public npm workspace, installs the
 
 ## Verified on 2026-08-27
 
-- Harnest: lint, typecheck, 64/64 unit/integration test files with 393/393 tests, the 33-route Studio production build, and both Studio browser suites passed.
+- Harnest: lint, typecheck, 64/64 unit/integration test files with 396/396 tests, the 33-route Studio production build, and both Studio browser suites passed.
 - Studio: 26/26 browser journeys and the real-runtime permission/file-reuse journey passed. Builder, Playground, Runs, Integrate, and Settings were also audited at their live remote URL in light and dark mode; the 1024px Playground had no horizontal overflow, console error, or page error.
 - Python SDK: 4/4 tests passed; wheel and source distribution built successfully.
 - Container isolation: the real Docker Code Runner smoke passed with network disabled, bounded resources, stdout `5050`, and one verified `result.json` artifact.
 - Reference host: lint, typecheck, 46/46 tests, the 16-route production build, the browser E2E journey through local Supabase, and all 8 local Supabase RLS assertions passed.
 - Reference-host live stack: five durable runs covered `allow_once`, `allow_for_run`, `allow_always`, persistent reuse, revoke, and `deny`; all five reached `succeeded`. Memory and PKM provenance were present in every answer, allowed calls executed the Tool, and the denied call did not.
-- Registry publication and operator-credentialed Gemini, remote Supabase, and OAuth/Firecrawl smoke tests were not attempted; they remain in `remaining-issues.md`.
+- The published `@harnestai/cli@0.2.0-beta.3` authoring MCP passed clean-install stdio and loopback HTTP smoke tests. The `my-first-agent` Gemini Connection also passed a credentialed provider probe; OAuth/Firecrawl, remote Supabase, and broader hosted-provider checks remain in `remaining-issues.md`.
+- `my-first-agent`: Gemini plus local SearXNG passed both declared Harness tests. Real CLI interactions verified repeated `allow_once`, successful search, `deny`, safe fallback, no persistent grant, and final-output-only CLI projection.
 
 ## Verified on 2026-08-26
 
@@ -56,8 +57,8 @@ Release verification additionally packs every public npm workspace, installs the
 - public snapshot/event redaction and cross-run Connection isolation
 - Playground attachment reuse and persistent grant revocation
 - reference-app ownership, lease/reconnect, provider bridge, file digest, and RLS policy tests
-- authoring MCP resource/prompt discovery, `validate_harness_project` structured diagnostics and `setupRequired`, workspace/symlink containment, stdio and Streamable HTTP `/mcp`, and the absence of runtime invocation Tools
+- authoring MCP resource/prompt discovery, `validate_harness_project` structured diagnostics and `setupRequired`, unresolved configuration warnings, exact Connection-ID and permission-E2E authoring guards, workspace/symlink containment, stdio and Streamable HTTP `/mcp`, and the absence of runtime invocation Tools
 
 ## Live smoke tests
 
-Local Supabase RLS, deterministic Memory/PKM, permission, streaming transport, image reuse, and real Docker isolation are verified above. Live Gemini, OAuth, Firecrawl/SearXNG, and a remote Supabase project still require operator-owned credentials or services. A passing build is not recorded as a substitute for those checks; their exact status belongs in `remaining-issues.md`.
+Local Supabase RLS, deterministic Memory/PKM, permission, streaming transport, image reuse, real Docker isolation, a live Gemini provider probe, and local SearXNG search are verified above. Hosted multimodal Gemini, OAuth, Firecrawl/remote SearXNG, and a remote Supabase project still require operator-owned credentials or services. A passing build is not recorded as a substitute for those checks; their exact status belongs in `remaining-issues.md`.

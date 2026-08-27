@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/adapter-local",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,8 +20,8 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@harnestai/adapter-openai": "0.2.0-beta.2",
-    "@harnestai/core": "0.2.0-beta.2"
+    "@harnestai/adapter-openai": "0.2.0-beta.3",
+    "@harnestai/core": "0.2.0-beta.3"
   },
   "license": "MIT",
   "repository": {

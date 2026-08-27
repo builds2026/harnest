@@ -38,7 +38,7 @@ function evaluateAssertion(assertion: HarnessAssertion, result: RunResult): Harn
   else if (assertion.type === "includes") ok = comparable(result.output).includes(assertion.value);
   else if (assertion.type === "matches") ok = safeRegexTest(assertion.value, comparable(result.output));
   else if (assertion.type === "output-schema") {
-    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(assertion.schema);
+    const validate = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(assertion.schema);
     ok = Boolean(validate(result.output));
     if (!ok) message = new Ajv2020().errorsText(validate.errors);
   } else if (assertion.type === "tool-called") {

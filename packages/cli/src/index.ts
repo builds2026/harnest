@@ -151,7 +151,7 @@ async function init(directoryValue: string): Promise<void> {
     output: { x: 780, y: 170 },
   };
   const spec: HarnessSpec = {
-    version: "0.2",
+    version: "0.3",
     components: [
       {
         id: "model",
@@ -647,13 +647,8 @@ function serviceOptions(values: CapabilityValues): NodeRuntimeServiceOptions {
 async function run(file: string, rawInput: string, capabilities: CapabilityValues): Promise<void> {
   const harness = await Harnest.load(file, sdkOptions(capabilities));
   let end: RunEndEvent | undefined;
-  let streamedText = "";
   try {
     for await (const event of harness.stream(inputValue(rawInput))) {
-      if (event.type === "text-delta") {
-        streamedText += event.text;
-        process.stdout.write(event.text);
-      }
       if (event.type === "run-end") end = event;
     }
   } finally {
@@ -661,10 +656,8 @@ async function run(file: string, rawInput: string, capabilities: CapabilityValue
   }
 
   if (!end) throw new Error("Runtime ended without a result");
-  if (streamedText) process.stdout.write("\n");
   const finalOutput = typeof end.output === "string" ? end.output : JSON.stringify(end.output, null, 2);
-  if (!streamedText) console.log(finalOutput);
-  else if (streamedText !== end.output) console.log(`output ${finalOutput}`);
+  console.log(finalOutput);
   console.log(`runId ${end.runId}`);
   console.log(`duration ${Math.round(end.durationMs)}ms`);
   console.log(`iterations ${end.iterations}`);

@@ -1,6 +1,6 @@
 {
   "name": "@harnestai/studio",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "type": "module",
   "files": [
     "app",
@@ -28,13 +28,13 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
-    "@harnestai/adapter-anthropic": "0.2.0-beta.2",
-    "@harnestai/adapter-gemini": "0.2.0-beta.2",
-    "@harnestai/adapter-local": "0.2.0-beta.2",
-    "@harnestai/adapter-openai": "0.2.0-beta.2",
-    "@harnestai/core": "0.2.0-beta.2",
-    "@harnestai/protocol": "0.2.0-beta.2",
-    "@harnestai/sdk": "0.2.0-beta.2",
+    "@harnestai/adapter-anthropic": "0.2.0-beta.3",
+    "@harnestai/adapter-gemini": "0.2.0-beta.3",
+    "@harnestai/adapter-local": "0.2.0-beta.3",
+    "@harnestai/adapter-openai": "0.2.0-beta.3",
+    "@harnestai/core": "0.2.0-beta.3",
+    "@harnestai/protocol": "0.2.0-beta.3",
+    "@harnestai/sdk": "0.2.0-beta.3",
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",

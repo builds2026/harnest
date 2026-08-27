@@ -26,13 +26,13 @@ node /absolute/path/to/harnest/packages/cli/dist/index.js \
   --transport http --host 127.0.0.1 --port 8790
 ```
 
-After `0.2.0-beta.2` is published, the equivalent package command will be:
+Published package:
 
 ```bash
-npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project
+npx --yes @harnestai/cli@0.2.0-beta.3 mcp serve /absolute/path/to/harness-project
 ```
 
-The registry currently contains only `0.2.0-beta.1`; it is not the current authoring MCP documented here. Use the source checkout until `0.2.0-beta.2` is published.
+Pin `0.2.0-beta.3` so prerelease dist-tag changes cannot silently switch the authoring contract.
 
 ChatGPT web requires a remotely reachable HTTPS Streamable HTTP endpoint such as `https://mcp.example.com/mcp`; it cannot reach the loopback listener. Harnest does not deploy that endpoint or provide its production TLS, authentication, authorization, tenant isolation, or secret management. Keep Harnest behind a controlled, authenticating edge, scope each server to the narrowest workspace, and let the user configure the names returned in `setupRequired` after validation. `--allowed-host` mitigates DNS-rebinding/Host-header attacks. Browser requests with an `Origin` header must match a repeatable hostname-only `--allowed-origin`; server clients without `Origin` pass that check. Neither allowlist authenticates callers.
 

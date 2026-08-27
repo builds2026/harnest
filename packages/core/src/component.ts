@@ -1492,7 +1492,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
       if (toolCalls > maxToolCalls) throw new ComponentExecutionError("AGENT_TOOL_CALL_LIMIT", `Agent exceeded ${maxToolCalls} Tool calls`);
       const binding = names.get(call.name);
       if (!binding) throw new ComponentExecutionError("TOOL_NOT_CONNECTED", `Tool '${call.name}' is not connected to this Agent`);
-      const validateInput = new Ajv2020({ allErrors: true, strict: false }).compile(binding.inputSchema);
+      const validateInput = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(binding.inputSchema);
       const superseded = await applyControlUpdates(deferredControlMessages);
       const inputError = superseded ? `Tool '${binding.id}' was superseded by a newer instruction or plan revision`
         : validateInput(call.input) ? undefined
@@ -1586,7 +1586,7 @@ const agentExecutor: ComponentExecutor = async (component, inputs, context) => {
             );
           }
           if (binding.outputSchema) {
-            const validateOutput = new Ajv2020({ allErrors: true, strict: false }).compile(binding.outputSchema);
+            const validateOutput = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(binding.outputSchema);
             if (!validateOutput(result)) throw new Error(`Tool output is invalid: ${new Ajv2020().errorsText(validateOutput.errors)}`);
           }
           result = context.redact(result);
@@ -1692,7 +1692,7 @@ const outputExecutor: ComponentExecutor = (component, inputs) => {
     }
   }
   if (schema) {
-    const validate = new Ajv2020({ allErrors: true, strict: false }).compile(schema);
+    const validate = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(schema);
     if (!validate(value)) {
       throw new ComponentExecutionError(
         "OUTPUT_SCHEMA_INVALID",
@@ -1976,7 +1976,7 @@ const localToolExecutor: ComponentExecutor = async (component, inputs, context) 
       `Tool '${toolId}' requires a Connection and must use the Agent Tool attachment component`,
     );
   }
-  const validate = new Ajv2020({ allErrors: true, strict: false }).compile(tool.inputSchema);
+  const validate = new Ajv2020({ allErrors: true, strict: false, validateFormats: false }).compile(tool.inputSchema);
   const toolInput = snapshotToolInput(inputs.arguments ?? context.runInput);
   if (!validate(toolInput)) {
     throw new ComponentExecutionError("TOOL_INPUT_INVALID", `Tool input is invalid: ${new Ajv2020().errorsText(validate.errors)}`);
@@ -2115,7 +2115,7 @@ function evaluatorResult(component: ComponentSpec, value: unknown, context: Comp
   else if (type === "output-schema") {
     const schema = asRecord(component.config.schema);
     if (!schema) message = "Evaluator requires schema";
-    else passed = Boolean(new Ajv2020({ strict: false }).compile(schema)(value));
+    else passed = Boolean(new Ajv2020({ strict: false, validateFormats: false }).compile(schema)(value));
   } else if (type === "tool-called") {
     const tool = typeof component.config.tool === "string" ? component.config.tool : "";
     const calls = context.metrics.toolCalls.get(tool) ?? 0;

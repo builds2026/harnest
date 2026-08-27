@@ -40,6 +40,7 @@
     "example": "examples"
   },
   "dependencies": {
+    "@harnestai/cli": "^0.2.0-beta.3",
     "acorn": "^8.18.0",
     "acorn-jsx": "^5.3.2",
     "ajv": "^6.15.0",

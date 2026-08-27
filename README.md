@@ -118,7 +118,7 @@ node /absolute/path/to/harnest/packages/cli/dist/index.js \
   --transport http --host 127.0.0.1 --port 8790
 ```
 
-After `0.2.0-beta.2` is published, the equivalent package command will be `npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project`. The registry currently contains only `0.2.0-beta.1`, so use the source-checkout commands for the current authoring MCP.
+The published package command is `npx --yes @harnestai/cli@0.2.0-beta.3 mcp serve /absolute/path/to/harness-project`. Pin the version so a prerelease dist-tag change cannot silently switch the authoring contract.
 
 The only authoring Tool is `validate_harness_project`; clients edit files with their own workspace tools. A valid result can still list later user setup in `setupRequired.environmentVariables`, `connections`, `adapters`, and `modules`. Do not invent or collect those values: users add secrets later through the host vault, environment, or Connection/OAuth UI and run credentialed tests separately.
 

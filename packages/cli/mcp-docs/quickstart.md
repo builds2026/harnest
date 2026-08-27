@@ -48,7 +48,7 @@ The example illustrates document shape and a valid model-to-agent topology, not 
 
 ## 3. Keep credentials unresolved
 
-Declare a connection reference or an environment variable name where supported. Add the name to `.env.example`, never the value. Use obvious placeholders such as `USER_CONFIGURES_MODEL`; do not invent a working secret or paste one into a test.
+Declare a connection reference or an environment variable name where supported. Add the name to `.env.example`, never the value. An obvious placeholder such as `USER_CONFIGURES_MODEL` is allowed during authoring but produces an `AUTHORING_CONFIGURATION_REQUIRED` warning and must be replaced before runtime execution. Do not invent a working secret or paste one into a test.
 
 ## 4. Validate
 
@@ -68,5 +68,7 @@ Report:
 - required connection IDs and environment variable names;
 - capabilities that need user approval;
 - live checks not performed because credentials/services were absent.
+
+Preserve each required Connection ID exactly in setup commands. Do not claim the Harness is ready or tested while warnings, placeholders, setup requirements, or unexecuted live checks remain.
 
 Stop there. Report the unresolved names without asking for their values. Deployment, hosted MCP exposure, account provisioning, secret entry, credentialed runtime tests, and Harness execution belong to the user or application host.

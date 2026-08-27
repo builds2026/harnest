@@ -2,9 +2,9 @@
 
 Only work that cannot be completed safely from the repository is listed here.
 
-## Registry ownership and publication
+## Stable registry promotion
 
-The repository can build and verify npm tarballs and a Python wheel, but it cannot reserve new names, configure organization policy, or publish without the release owner's npm/PyPI accounts and OIDC configuration. npm already contains `@harnestai/cli@0.2.0-beta.1`; the next external release must use the current prerelease version (`0.2.0-beta.2`). Stable `0.2.0` follows only after clean-install cross-language E2E.
+The `0.2.0-beta.3` npm prerelease, including the authoring MCP, is published. Stable `0.2.0` and npm `latest` promotion remain release-owner actions after clean-install cross-language E2E and any follow-up prerelease fixes.
 
 ## Credentialed integration checks
 
@@ -12,7 +12,7 @@ The following final smoke checks require credentials or services that are intent
 
 - an AI Studio Gemini test key with multimodal and context-cache quota
 - a Supabase project with the supplied migration, private Storage, Vault, pgvector, and RLS enabled
-- Firecrawl and/or SearXNG, plus an OAuth-capable MCP server
+- hosted Firecrawl or remote SearXNG, plus an OAuth-capable MCP server; loopback SearXNG is verified
 
 Secrets must be supplied through the documented environment/provider boundary and removed after the check. No test should copy a credential into a HarnessSpec, event, snapshot, trace, browser payload, or cache key.
 

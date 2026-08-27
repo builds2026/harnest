@@ -455,10 +455,10 @@ describe("harnest CLI", () => {
     const initialized = await import("@harnestai/core/node").then(({ loadSpecFile }) => loadSpecFile(join(directory, "harnest.yaml")));
     expect(initialized).toMatchObject({
       ok: true,
-      spec: expect.objectContaining({ version: "0.2", entrypoint: "output" }),
+      spec: expect.objectContaining({ version: "0.3", entrypoint: "output" }),
     });
     const openedAsProject = await import("@harnestai/core/node").then(({ loadSpecFile }) => loadSpecFile(directory));
-    expect(openedAsProject).toMatchObject({ ok: true, spec: expect.objectContaining({ version: "0.2" }) });
+    expect(openedAsProject).toMatchObject({ ok: true, spec: expect.objectContaining({ version: "0.3" }) });
     await expect(readFile(join(directory, ".harnest", "project.json"), "utf8")).resolves.toContain('"version": 1');
     await expect(readFile(join(directory, ".harnest", "prompts", "main.md"), "utf8")).resolves.toContain("{{input}}");
     await expect(exec(process.execPath, [cli, "init", directory], { cwd: root })).rejects.toMatchObject({
@@ -471,7 +471,7 @@ describe("harnest CLI", () => {
     const directory = join(testRoot, "initialized");
     const result = await exec(process.execPath, [cli, "contract", join(directory, "harnest.yaml"), "--json"], { cwd: root });
     const contract = JSON.parse(result.stdout) as { specVersion: string; capabilities: string[]; integrationSurfaces: Array<{ id: string }> };
-    expect(contract).toMatchObject({ specVersion: "0.2", capabilities: ["conversation"] });
+    expect(contract).toMatchObject({ specVersion: "0.3", capabilities: ["conversation"] });
     expect(contract.integrationSurfaces.map(({ id }) => id)).toEqual(["sdk", "cli", "http"]);
   });
 
@@ -890,6 +890,55 @@ entrypoint: output
     expect(JSON.parse(traced.stdout)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "run-end", runId }),
     ]));
+  }, 15_000);
+
+  it("prints only the final public output, not intermediate model deltas", async () => {
+    const directory = await project("cli-public-output");
+    await writeFile(join(directory, "adapter.mjs"), `
+      let calls = 0;
+      export default {
+        id: "privacy-fixture",
+        capabilities: { streaming: true, json: true, cancellation: true },
+        async *run() {
+          const text = calls++ === 0
+            ? '{"route":"other","confidence":1}'
+            : '{"answer":"public"}';
+          yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+          yield { type: "text-delta", text };
+          yield { type: "finish", reason: "stop" };
+        }
+      };
+    `, "utf8");
+    await writeFile(join(directory, "harnest.yaml"), `
+version: "0.3"
+components:
+  - { id: model, type: model, config: { adapter: privacy-fixture, model: fixture } }
+  - { id: classify_prompt, type: prompt, config: { template: "Classify {{input}}" } }
+  - { id: classifier, type: classifier, config: { routes: [other], fallback: other } }
+  - { id: answer_prompt, type: prompt, config: { template: "Answer {{input}}" } }
+  - { id: agent, type: agent, config: {} }
+  - id: output
+    type: output
+    config:
+      format: json
+      schema: { type: object, required: [answer], properties: { answer: { type: string } } }
+connections:
+  - { from: { component: model, port: model }, to: { component: classifier, port: model } }
+  - { from: { component: classify_prompt, port: prompt }, to: { component: classifier, port: prompt } }
+  - { from: { component: model, port: model }, to: { component: agent, port: model } }
+  - { from: { component: answer_prompt, port: prompt }, to: { component: agent, port: prompt } }
+  - { from: { component: classifier, port: decision }, to: { component: agent, port: toolResults } }
+  - { from: { component: agent, port: response }, to: { component: output, port: value } }
+entrypoint: output
+runtime: { adapters: [./adapter.mjs] }
+    `, "utf8");
+
+    const executed = await exec(process.execPath, [
+      cli, "run", join(directory, "harnest.yaml"), "--input", "hello", "--allow-modules",
+    ], { cwd: root });
+    expect(executed.stdout).toContain('"answer": "public"');
+    expect(executed.stdout).not.toContain('"route"');
+    expect(executed.stdout).not.toContain('"confidence"');
   }, 15_000);
 
   it("runs the RAG, safe custom Tool, and evaluation Loop examples and rejects unisolated legacy MCP", async () => {

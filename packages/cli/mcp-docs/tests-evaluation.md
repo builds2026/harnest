@@ -31,6 +31,8 @@ The built-in Evaluator supports only the deterministic assertion families listed
 
 Include negative cases: denied permission, missing context, malformed provider output, Tool failure, budget exhaustion, and citation labels that were not supplied. External services should be replaced by deterministic fixtures for routine tests; label credentialed live checks separately.
 
+Declarative Harness tests do not inject host interaction responses. Never simulate `allow_once`, `allow_for_run`, `allow_always`, or `deny` by writing that decision into the test input and then claim the interaction was tested. Verify permission decisions through a host/runtime E2E flow that submits the real Interaction response.
+
 ## Validation versus execution
 
 Authoring MCP validation proves structure, references, schemas, policy, and test definitions; it does not run the declared tests. Running tests proves runtime behavior in the tested environment. Live provider/MCP success additionally requires user-owned credentials and available services. Report these three results separately, preserve non-empty `setupRequired` as later setup, and never convert “not configured” into a pass.

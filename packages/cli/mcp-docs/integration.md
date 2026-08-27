@@ -22,10 +22,10 @@ Then use this executable and argument list:
 node /absolute/path/to/harnest/packages/cli/dist/index.js mcp serve /absolute/path/to/harness-project
 ```
 
-The registry currently contains only `@harnestai/cli@0.2.0-beta.1`, not the current `0.2.0-beta.2` implementation documented here. Use the source checkout above. After this release is published, the equivalent package command will be:
+The published package command is:
 
 ```text
-npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project
+npx --yes @harnestai/cli@0.2.0-beta.3 mcp serve /absolute/path/to/harness-project
 ```
 
 Use the narrowest workspace root that contains the project the agent may validate. Do not use a home directory, repository collection, or filesystem root.
@@ -42,11 +42,11 @@ claude mcp add --transport stdio --scope project harnest-authoring -- \
   mcp serve /absolute/path/to/harness-project
 ```
 
-After `0.2.0-beta.2` is published, the package form will be:
+Published package:
 
 ```bash
 claude mcp add --transport stdio --scope project harnest-authoring -- \
-  npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project
+  npx --yes @harnestai/cli@0.2.0-beta.3 mcp serve /absolute/path/to/harness-project
 ```
 
 Use `claude mcp list` to inspect the saved server and `/mcp` inside Claude Code to check its connection. Project scope writes `.mcp.json` and is appropriate only when the command contains paths that every collaborator can resolve; otherwise use `--scope local` or `--scope user` and keep the machine-specific configuration out of version control.
@@ -63,11 +63,11 @@ codex mcp add harnest-authoring -- \
   mcp serve /absolute/path/to/harness-project
 ```
 
-After `0.2.0-beta.2` is published, the package form will be:
+Published package:
 
 ```bash
 codex mcp add harnest-authoring -- \
-  npx --yes @harnestai/cli@0.2.0-beta.2 mcp serve /absolute/path/to/harness-project
+  npx --yes @harnestai/cli@0.2.0-beta.3 mcp serve /absolute/path/to/harness-project
 ```
 
 The source-checkout entry in `~/.codex/config.toml`, or in `.codex/config.toml` for a trusted project, is:
@@ -83,12 +83,12 @@ args = [
 ]
 ```
 
-After `0.2.0-beta.2` is published, the equivalent package entry will be:
+The equivalent published-package entry is:
 
 ```toml
 [mcp_servers.harnest-authoring]
 command = "npx"
-args = ["--yes", "@harnestai/cli@0.2.0-beta.2", "mcp", "serve", "/absolute/path/to/harness-project"]
+args = ["--yes", "@harnestai/cli@0.2.0-beta.3", "mcp", "serve", "/absolute/path/to/harness-project"]
 ```
 
 Run `codex mcp list` to inspect configured servers and use `/mcp` in the Codex TUI to see the active connection. Codex CLI, the IDE extension, and the ChatGPT desktop app on the same host share this configuration; ChatGPT **web** does not read it.
@@ -154,7 +154,7 @@ A valid project may still have non-empty `setupRequired` arrays. That means its 
 
 ## Troubleshooting
 
-- **Server disconnected:** run the exact configured command in a terminal. Protocol messages must use stdout; diagnostics must use stderr. With the current unpublished `0.2.0-beta.2`, configure the source-checkout `node .../dist/index.js` command. After publication, if a package runner injects stdout, install the pinned package and configure the resolved `harnest` executable directly.
+- **Server disconnected:** run the exact configured command in a terminal. Protocol messages must use stdout; diagnostics must use stderr. If a package runner injects stdout, install the pinned package and configure the resolved `harnest` executable directly.
 - **No resources or Tools:** verify that the command is `mcp serve`, not runtime `serve`, and that the client supports the negotiated MCP version.
 - **Project denied:** pass the intended absolute workspace path and keep validation targets inside it. Symlink escapes are rejected.
 - **ChatGPT cannot connect:** first verify the public HTTPS `/mcp` endpoint and authentication from outside the host. `127.0.0.1` is not reachable from ChatGPT web.
