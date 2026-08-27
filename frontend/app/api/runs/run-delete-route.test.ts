@@ -5,11 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileRunStore } from "@harnestai/core/node";
 
 vi.mock("server-only", () => ({}));
-vi.mock("@/lib/api-server", async () => import("../../../../lib/api-server"));
-vi.mock("@/lib/run-registry", async () => import("../../../../lib/run-registry"));
-vi.mock("@/lib/server", async () => import("../../../../lib/server"));
+vi.mock("@/lib/api-server", async () => import("../../../lib/api-server"));
+vi.mock("@/lib/run-registry", async () => import("../../../lib/run-registry"));
+vi.mock("@/lib/server", async () => import("../../../lib/server"));
 
-import { DELETE } from "./route";
+import { DELETE } from "./[runId]/route";
 
 const roots: string[] = [];
 const originalFile = process.env.HARNEST_FILE;
