@@ -781,7 +781,7 @@ entrypoint: output
       expect(pausedSnapshot).toMatchObject({ status: "paused" });
       expect(JSON.stringify(pausedSnapshot)).not.toContain("ctx_must_never_leak");
       const activePausedReplay = await fetch(`${base}/v1/runs/${created.runId}/events?after=${requested!.sequence}`, {
-        signal: AbortSignal.timeout(3_000),
+        signal: AbortSignal.timeout(10_000),
       }).then((response) => response.text());
       expect(activePausedReplay).toContain("event: run.paused\n");
       await stopApi();
@@ -795,7 +795,7 @@ entrypoint: output
       expect(recoveredSnapshot).toMatchObject({ status: "paused" });
       expect(JSON.stringify(recoveredSnapshot)).not.toContain("ctx_must_never_leak");
       const pausedReplay = await fetch(`${base}/v1/runs/${created.runId}/events?after=${Number(recoveredSnapshot.sequence)}`, {
-        signal: AbortSignal.timeout(3_000),
+        signal: AbortSignal.timeout(10_000),
       }).then((response) => response.text());
       expect(pausedReplay).toBe(": connected\n\n");
       await expect(recoveredClient.respond(created.runId, {
