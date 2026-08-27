@@ -9,6 +9,11 @@ on:
         type: choice
         options: [next, latest]
         default: next
+      publish_python:
+        description: Publish the verified Python package to PyPI
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -340,10 +345,11 @@ jobs:
           for package in protocol core adapter-anthropic adapter-gemini adapter-local adapter-openai sdk studio cli; do
             archive=(packages/harnestai-$package-*.tgz)
             test "${#archive[@]}" -eq 1 && test -f "${archive[0]}"
-            npm publish "${archive[0]}" --access public --provenance --tag "$CHANNEL"
+            npm publish "./${archive[0]}" --access public --provenance --tag "$CHANNEL"
           done
 
   publish-python:
+    if: ${{ inputs.publish_python }}
     needs: [verify-npm, verify-python]
     environment: release
     runs-on: ubuntu-latest
